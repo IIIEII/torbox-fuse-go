@@ -1,0 +1,38 @@
+version: "3.8"
+
+services:
+  torbox-media-center:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: torbox-media-center
+    restart: unless-stopped
+    environment:
+      TORBOX_API_KEY: ${TORBOX_API_KEY:?TORBOX_API_KEY is required}
+      TORBOX_API_BASE_URL: https://api.torbox.app
+      FUSE_MOUNT_PATH: /mnt/torbox
+      FUSE_CACHE_BUDGET_MB: "256"
+      FUSE_PREFETCH_WINDOW_MB: "16"
+      FUSE_STREAM_MAX_INFLIGHT: "2"
+      FUSE_STREAM_CONCURRENCY: "8"
+      FUSE_ATTR_TIMEOUT_SEC: "1"
+      FUSE_ENTRY_TIMEOUT_SEC: "1"
+      CATALOG_REFRESH_INTERVAL: 3h
+      METRICS_LISTEN_ADDR: "0.0.0.0:9080"
+      STATE_DB_PATH: /config/state.db
+      LOG_LEVEL: info
+    volumes:
+      - torbox-config:/config
+      - torbox-mount:/mnt/torbox:rshared
+    devices:
+      - /dev/fuse:/dev/fuse
+    cap_add:
+      - SYS_ADMIN
+    security_opt:
+      - apparmor:unconfined
+    ports:
+      - "9080:9080"
+
+volumes:
+  torbox-config:
+  torbox-mount:
