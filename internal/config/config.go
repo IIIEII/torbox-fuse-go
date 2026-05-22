@@ -50,6 +50,24 @@ func envDuration(key string, def time.Duration) time.Duration {
 	return def
 }
 
+// TorboxConfig returns a torbox.Config implementation backed by this Config.
+// This is needed because Config has exported struct fields (accessed directly
+// by other packages) that would conflict with method names required by the
+// torbox.Config interface.
+func (c *Config) TorboxConfig() torboxConfig {
+	return torboxConfig{c}
+}
+
+// torboxConfig adapts *Config to implement the torbox.Config interface
+// without introducing field/method name conflicts on the Config struct itself.
+type torboxConfig struct {
+	*Config
+}
+
+func (t torboxConfig) APIKey() string     { return t.Config.APIKey }
+func (t torboxConfig) APIBaseURL() string  { return t.Config.APIBaseURL }
+func (t torboxConfig) APITimeout() time.Duration { return 60 * time.Second }
+
 func Load() (*Config, error) {
 	apiKey := os.Getenv("TORBOX_API_KEY")
 	if apiKey == "" {
