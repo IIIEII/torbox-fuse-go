@@ -1,0 +1,18 @@
+{
+  "planPath": "docs/superpowers/plans/2026-05-21-torbox-fuse-go.md",
+  "tasks": [
+    {"id": 0, "subject": "Task 1: Go module init + config package", "status": "pending", "description": "Initialize Go module and implement config parsing with all env vars. Files: go.mod, internal/config/config.go, internal/config/config_test.go"},
+    {"id": 1, "subject": "Task 2: Catalog types + classification", "status": "pending", "blockedBy": [0], "description": "Define app-owned data types and implement media type classification. Files: internal/catalog/types.go, internal/catalog/classify.go, internal/catalog/classify_test.go"},
+    {"id": 2, "subject": "Task 3: TorBox API client", "status": "pending", "blockedBy": [1], "description": "Hand-written TorBox API client with rate limiting, caching, and retry. Files: internal/torbox/types.go, internal/torbox/client.go, internal/torbox/client_test.go"},
+    {"id": 3, "subject": "Task 4: Virtual tree builder", "status": "pending", "blockedBy": [1], "description": "Build virtual filesystem tree from catalog.Downloads. Files: internal/catalog/tree.go, internal/catalog/tree_test.go"},
+    {"id": 4, "subject": "Task 5: SQLite state DB", "status": "pending", "blockedBy": [1], "description": "Persistent SQLite database for stable inode assignments. Files: internal/state/db.go, internal/state/db_test.go"},
+    {"id": 5, "subject": "Task 6: Sharded range cache", "status": "pending", "blockedBy": [0], "description": "Sharded RangeCache for zero-alloc cache-hit reads. Files: internal/cache/range.go, internal/cache/range_test.go"},
+    {"id": 6, "subject": "Task 7: CDN stream client + StreamReader", "status": "pending", "blockedBy": [5], "description": "CDN range HTTP client and StreamReader with inflight windows. Files: internal/stream/cdn.go, internal/stream/reader.go, internal/stream/cdn_test.go"},
+    {"id": 7, "subject": "Task 8: FUSE filesystem", "status": "pending", "blockedBy": [3, 4, 6], "description": "go-fuse/v2 filesystem with DirNode/FileNode and stream Read. Files: internal/fusefs/fs.go, internal/fusefs/mount.go"},
+    {"id": 8, "subject": "Task 9: Metrics HTTP server + catalog refresh", "status": "pending", "blockedBy": [2, 3, 4], "description": "Metrics server with /metrics, /healthz, /refresh and periodic catalog refresh. Files: internal/metrics/metrics.go, internal/metrics/server.go, internal/catalog/catalog.go"},
+    {"id": 9, "subject": "Task 10: Entrypoint + wiring + Docker", "status": "pending", "blockedBy": [7, 8], "description": "Wire everything in main.go, add Dockerfile and docker-compose.yaml. Files: cmd/torbox-media-center/main.go, Dockerfile, docker-compose.yaml"},
+    {"id": 10, "subject": "Task 11: Integration test", "status": "pending", "blockedBy": [9], "description": "End-to-end FUSE mount test with mock CDN. Files: tests/integration/mount_test.go"},
+    {"id": 11, "subject": "Task 12: Structured logging + graceful shutdown", "status": "pending", "blockedBy": [9], "description": "LOG_LEVEL parsing, slog everywhere, graceful shutdown. Files: cmd/torbox-media-center/main.go, internal/config/config.go"}
+  ],
+  "lastUpdated": "2026-05-21T00:00:00Z"
+}
