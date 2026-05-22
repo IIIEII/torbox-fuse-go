@@ -29,41 +29,6 @@ func TestNewRangeCache_ZeroBudget(t *testing.T) {
 
 // --- CopyTo ---
 
-func TestCopyTo_HitExactOffset(t *testing.T) {
-	rc := NewRangeCache(4096)
-	rc.Put("file1", 0, []byte("hello world"))
-
-	dst := make([]byte, 11)
-	n, ok := rc.CopyTo("file1", 0, dst)
-	if !ok {
-		t.Fatal("CopyTo: expected cache hit")
-	}
-	if n != 11 {
-		t.Errorf("CopyTo n: got %d, want 11", n)
-	}
-	if string(dst) != "hello world" {
-		t.Errorf("CopyTo dst: got %q, want %q", string(dst), "hello world")
-	}
-}
-
-func TestCopyTo_HitPartialOverlap(t *testing.T) {
-	rc := NewRangeCache(4096)
-	rc.Put("file1", 0, []byte("hello world"))
-
-	// Read from offset 6 within the block that starts at 0
-	dst := make([]byte, 5)
-	n, ok := rc.CopyTo("file1", 6, dst)
-	if !ok {
-		t.Fatal("CopyTo: expected cache hit")
-	}
-	if n != 5 {
-		t.Errorf("CopyTo n: got %d, want 5", n)
-	}
-	if string(dst[:n]) != "world" {
-		t.Errorf("CopyTo dst: got %q, want %q", string(dst[:n]), "world")
-	}
-}
-
 func TestCopyTo_Miss(t *testing.T) {
 	rc := NewRangeCache(4096)
 	dst := make([]byte, 10)
@@ -73,74 +38,6 @@ func TestCopyTo_Miss(t *testing.T) {
 	}
 	if n != 0 {
 		t.Errorf("CopyTo n on miss: got %d, want 0", n)
-	}
-}
-
-func TestCopyTo_OffsetOutOfRange(t *testing.T) {
-	rc := NewRangeCache(4096)
-	rc.Put("file1", 0, []byte("hello"))
-
-	// Request offset beyond block
-	dst := make([]byte, 5)
-	n, ok := rc.CopyTo("file1", 100, dst)
-	if ok {
-		t.Error("CopyTo: expected miss for offset beyond block")
-	}
-	if n != 0 {
-		t.Errorf("CopyTo n: got %d, want 0", n)
-	}
-}
-
-func TestCopyTo_OffsetBeforeBlock(t *testing.T) {
-	rc := NewRangeCache(4096)
-	rc.Put("file1", 100, []byte("hello"))
-
-	// Request offset before the block starts
-	dst := make([]byte, 5)
-	n, ok := rc.CopyTo("file1", 0, dst)
-	if ok {
-		t.Error("CopyTo: expected miss for offset before block")
-	}
-	if n != 0 {
-		t.Errorf("CopyTo n: got %d, want 0", n)
-	}
-}
-
-func TestCopyTo_PartialCopyAtEnd(t *testing.T) {
-	rc := NewRangeCache(4096)
-	rc.Put("file1", 0, []byte("hello"))
-
-	// Request a large buffer but block only has 5 bytes from offset 3
-	dst := make([]byte, 20)
-	n, ok := rc.CopyTo("file1", 3, dst)
-	if !ok {
-		t.Fatal("CopyTo: expected cache hit")
-	}
-	if n != 2 {
-		t.Errorf("CopyTo n: got %d, want 2", n)
-	}
-	if string(dst[:n]) != "lo" {
-		t.Errorf("CopyTo dst: got %q, want %q", string(dst[:n]), "lo")
-	}
-}
-
-func TestCopyTo_MultipleBlocks(t *testing.T) {
-	rc := NewRangeCache(4096)
-	rc.Put("file1", 0, []byte("hello "))
-	rc.Put("file1", 6, []byte("world"))
-
-	// First block
-	dst := make([]byte, 6)
-	n, ok := rc.CopyTo("file1", 0, dst)
-	if !ok || n != 6 || string(dst) != "hello " {
-		t.Errorf("CopyTo first block: ok=%v n=%d dst=%q", ok, n, string(dst))
-	}
-
-	// Second block
-	dst2 := make([]byte, 5)
-	n2, ok2 := rc.CopyTo("file1", 6, dst2)
-	if !ok2 || n2 != 5 || string(dst2) != "world" {
-		t.Errorf("CopyTo second block: ok=%v n=%d dst=%q", ok2, n2, string(dst2))
 	}
 }
 
@@ -400,6 +297,19 @@ func TestEvictStale_OnlyAffectsTargetFileKey(t *testing.T) {
 	}
 }
 
+func TestEvictStale_CurrentSessionEqualsBlockSession(t *testing.T) {
+	rc := NewRangeCache(4096)
+	rc.PutWithSession("file1", 0, []byte("data"), 5)
+
+	rc.EvictStale("file1", 5)
+
+	dst := make([]byte, 4)
+	n, ok := rc.CopyTo("file1", 0, dst)
+	if !ok || n != 4 {
+		t.Errorf("Block with sessionID == currentSession should NOT be evicted: ok=%v n=%d", ok, n)
+	}
+}
+
 // --- Sharding ---
 
 func TestShard_DifferentFileKeysDistributeAcrossShards(t *testing.T) {
@@ -544,16 +454,6 @@ func TestCopyTo_UpdatesLastAccess(t *testing.T) {
 
 // --- Edge cases ---
 
-func TestCopyTo_EmptyDst(t *testing.T) {
-	rc := NewRangeCache(4096)
-	rc.Put("file1", 0, []byte("hello"))
-
-	n, ok := rc.CopyTo("file1", 0, nil)
-	if ok || n != 0 {
-		t.Errorf("Empty dst: ok=%v n=%d, want ok=false n=0", ok, n)
-	}
-}
-
 func TestPut_EmptyData(t *testing.T) {
 	rc := NewRangeCache(4096)
 	rc.Put("file1", 0, []byte{})
@@ -565,15 +465,240 @@ func TestPut_EmptyData(t *testing.T) {
 	}
 }
 
-func TestEvictStale_CurrentSessionEqualsBlockSession(t *testing.T) {
-	rc := NewRangeCache(4096)
-	rc.PutWithSession("file1", 0, []byte("data"), 5)
+// ============================================================
+// Phase 1: Range logic unit tests (spec §1)
+// ============================================================
 
-	rc.EvictStale("file1", 5)
+// 1.1 Exact range match: request exactly the block that was stored.
+func TestCopyTo_ExactRangeMatch(t *testing.T) {
+	rc := NewRangeCache(1 << 20)
+	data := []byte("ABCDEFGHIJ") // 10 bytes at offset 0
+	rc.Put("f1", 0, data)
 
+	dst := make([]byte, 10)
+	n, ok := rc.CopyTo("f1", 0, dst)
+	if !ok {
+		t.Fatal("expected cache hit")
+	}
+	if n != 10 {
+		t.Errorf("got %d bytes, want 10", n)
+	}
+	if string(dst) != "ABCDEFGHIJ" {
+		t.Errorf("got %q, want %q", string(dst), "ABCDEFGHIJ")
+	}
+}
+
+// 1.2 Full cover: request a range fully contained within a larger block.
+func TestCopyTo_FullCover_SubrangeWithinLargerBlock(t *testing.T) {
+	rc := NewRangeCache(1 << 20)
+	rc.Put("f1", 0, []byte("ABCDEFGHIJ")) // 10 bytes
+
+	// Request bytes 3–6 ("DEFG"), fully inside the block
 	dst := make([]byte, 4)
-	n, ok := rc.CopyTo("file1", 0, dst)
-	if !ok || n != 4 {
-		t.Errorf("Block with sessionID == currentSession should NOT be evicted: ok=%v n=%d", ok, n)
+	n, ok := rc.CopyTo("f1", 3, dst)
+	if !ok {
+		t.Fatal("expected cache hit")
+	}
+	if n != 4 {
+		t.Errorf("got %d bytes, want 4", n)
+	}
+	if string(dst[:n]) != "DEFG" {
+		t.Errorf("got %q, want %q", string(dst[:n]), "DEFG")
+	}
+}
+
+// 1.3 Partial overlap left: request starts before block, overlaps left portion.
+func TestCopyTo_PartialOverlapLeft_MissBeforeBlock(t *testing.T) {
+	rc := NewRangeCache(1 << 20)
+	rc.Put("f1", 100, []byte("HELLO")) // block at [100, 105)
+
+	// Request from offset 98 — starts before the block, so this is a miss.
+	// CopyTo only matches blocks where off >= block.start && off < block.end.
+	dst := make([]byte, 10)
+	n, ok := rc.CopyTo("f1", 98, dst)
+	if ok {
+		t.Errorf("expected miss for offset before block start, got hit n=%d data=%q", n, string(dst[:n]))
+	}
+}
+
+// 1.4 Partial overlap right: request extends beyond block end, gets partial data.
+func TestCopyTo_PartialOverlapRight_ClippedAtBlockEnd(t *testing.T) {
+	rc := NewRangeCache(1 << 20)
+	rc.Put("f1", 0, []byte("HELLO")) // 5 bytes at offset 0
+
+	// Request 10 bytes from offset 0 — block only has 5 bytes
+	dst := make([]byte, 10)
+	n, ok := rc.CopyTo("f1", 0, dst)
+	if !ok {
+		t.Fatal("expected cache hit")
+	}
+	if n != 5 {
+		t.Errorf("got %d bytes, want 5 (block size)", n)
+	}
+	if string(dst[:n]) != "HELLO" {
+		t.Errorf("got %q, want %q", string(dst[:n]), "HELLO")
+	}
+}
+
+// 1.5 No overlap: request at offset completely outside any block → miss.
+func TestCopyTo_NoOverlap_DistantOffset(t *testing.T) {
+	rc := NewRangeCache(1 << 20)
+	rc.Put("f1", 0, []byte("data")) // block at [0, 4)
+
+	dst := make([]byte, 10)
+	n, ok := rc.CopyTo("f1", 1000, dst)
+	if ok {
+		t.Errorf("expected miss for offset far from block, got hit n=%d", n)
+	}
+	if n != 0 {
+		t.Errorf("expected 0 bytes on miss, got %d", n)
+	}
+}
+
+// 1.6 Adjacent ranges: two blocks at consecutive offsets, read each independently.
+func TestCopyTo_AdjacentRanges(t *testing.T) {
+	rc := NewRangeCache(1 << 20)
+	rc.Put("f1", 0, []byte("AAAA"))
+	rc.Put("f1", 4, []byte("BBBB"))
+
+	dst1 := make([]byte, 4)
+	n1, ok1 := rc.CopyTo("f1", 0, dst1)
+	if !ok1 || n1 != 4 || string(dst1) != "AAAA" {
+		t.Errorf("first block: ok=%v n=%d data=%q", ok1, n1, string(dst1))
+	}
+
+	dst2 := make([]byte, 4)
+	n2, ok2 := rc.CopyTo("f1", 4, dst2)
+	if !ok2 || n2 != 4 || string(dst2) != "BBBB" {
+		t.Errorf("second block: ok=%v n=%d data=%q", ok2, n2, string(dst2))
+	}
+}
+
+// 1.7 Request clipped by EOF: block at end of file, request past block end
+// returns available bytes only.
+func TestCopyTo_ClippedByEOF(t *testing.T) {
+	rc := NewRangeCache(1 << 20)
+	rc.Put("f1", 0, []byte("ABC")) // 3 bytes at offset 0
+
+	// Request 10 bytes from offset 1 — block only has 2 bytes from offset 1
+	dst := make([]byte, 10)
+	n, ok := rc.CopyTo("f1", 1, dst)
+	if !ok {
+		t.Fatal("expected cache hit")
+	}
+	if n != 2 {
+		t.Errorf("got %d bytes, want 2 (remaining in block from offset 1)", n)
+	}
+	if string(dst[:n]) != "BC" {
+		t.Errorf("got %q, want %q", string(dst[:n]), "BC")
+	}
+}
+
+// 1.8 Request exactly at EOF: offset equals block end → miss.
+func TestCopyTo_RequestAtBlockEnd(t *testing.T) {
+	rc := NewRangeCache(1 << 20)
+	rc.Put("f1", 0, []byte("ABC")) // block covers [0, 3)
+
+	// Offset 3 is exactly at the end of the block — should be a miss
+	dst := make([]byte, 10)
+	n, ok := rc.CopyTo("f1", 3, dst)
+	if ok {
+		t.Errorf("expected miss at block end offset, got hit n=%d data=%q", n, string(dst[:n]))
+	}
+}
+
+// 1.9 Zero-length range: empty destination buffer → returns 0, false.
+func TestCopyTo_ZeroLengthRange(t *testing.T) {
+	rc := NewRangeCache(1 << 20)
+	rc.Put("f1", 0, []byte("ABC"))
+
+	n, ok := rc.CopyTo("f1", 0, []byte{})
+	if ok {
+		t.Errorf("expected miss for empty buffer, got hit n=%d", n)
+	}
+	if n != 0 {
+		t.Errorf("expected 0 bytes, got %d", n)
+	}
+}
+
+// 1.10 Invalid range: negative offset → miss (verify no panic).
+func TestCopyTo_NegativeOffset_NoPanic(t *testing.T) {
+	rc := NewRangeCache(1 << 20)
+	rc.Put("f1", 0, []byte("ABC"))
+
+	dst := make([]byte, 10)
+	n, ok := rc.CopyTo("f1", -1, dst)
+	if ok {
+		t.Errorf("expected miss for negative offset, got hit n=%d", n)
+	}
+	if n != 0 {
+		t.Errorf("expected 0 bytes, got %d", n)
+	}
+}
+
+// ============================================================
+// Phase 2: Cache lookup/store gaps (spec §2)
+// ============================================================
+
+// 2.1 Full coverage lookup by non-exact start: verify that
+// CopyTo(fileKey, offset_within_block, dst) hits the block stored at aligned
+// start, including prefetch-window key alignment (offset 17 MiB hitting block
+// starting at 16 MiB).
+func TestCopyTo_PrefetchWindowKeyAlignment(t *testing.T) {
+	rc := NewRangeCache(10 << 20) // 10 MiB budget
+
+	// Store a 4 MiB block at offset 16 MiB (aligned to prefetchWindowSize)
+	blockSize := 4 * 1024 * 1024
+	data := make([]byte, blockSize)
+	for i := range data {
+		data[i] = byte((i + 0xAB) & 0xFF)
+	}
+	rc.Put("f1", 16*1024*1024, data)
+
+	// Read from offset 17 MiB — within the block that starts at 16 MiB
+	off := int64(17 * 1024 * 1024)
+	dst := make([]byte, 1024)
+	n, ok := rc.CopyTo("f1", off, dst)
+	if !ok {
+		t.Fatal("expected cache hit for offset within block at aligned start")
+	}
+	if n != len(dst) {
+		t.Errorf("got %d bytes, want %d", n, len(dst))
+	}
+	// Verify data correctness: offset 17 MiB is 1 MiB into the block
+	expectedOff := off - 16*1024*1024
+	for i := 0; i < n; i++ {
+		if dst[i] != data[expectedOff+int64(i)] {
+			t.Errorf("byte mismatch at index %d: got %d, want %d", i, dst[i], data[expectedOff+int64(i)])
+			break
+		}
+	}
+}
+
+// 2.2 Overlapping block replacement: Put block at (fileKey, 0) with "old",
+// then Put at (fileKey, 0) with "new". Verify other blocks are still intact.
+func TestPut_OverwritePreservesOtherBlocks(t *testing.T) {
+	rc := NewRangeCache(4096)
+	rc.Put("f1", 0, []byte("old_data_at_0"))
+	rc.Put("f1", 100, []byte("neighbor_at_100"))
+
+	// Overwrite the block at offset 0
+	rc.Put("f1", 0, []byte("new_0"))
+
+	// Verify overwritten block has new data
+	dst := make([]byte, 20)
+	n, ok := rc.CopyTo("f1", 0, dst)
+	if !ok || string(dst[:n]) != "new_0" {
+		t.Errorf("overwritten block: ok=%v data=%q, want %q", ok, string(dst[:n]), "new_0")
+	}
+
+	// Verify neighbor block is still intact
+	dst2 := make([]byte, 20)
+	n2, ok2 := rc.CopyTo("f1", 100, dst2)
+	if !ok2 {
+		t.Error("neighbor block should still be cached")
+	}
+	if string(dst2[:n2]) != "neighbor_at_100" {
+		t.Errorf("neighbor block: got %q, want %q", string(dst2[:n2]), "neighbor_at_100")
 	}
 }
