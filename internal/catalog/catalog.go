@@ -5,6 +5,7 @@ package catalog
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync/atomic"
 
@@ -69,7 +70,7 @@ func (c *Catalog) Refresh(ctx context.Context) error {
 		downloads, err := c.client.ListDownloads(ctx, kind)
 		if err != nil {
 			slog.Error("fetch downloads", "kind", kind, "err", err)
-			return err
+			return fmt.Errorf("upsert file records: %w", err)
 		}
 		c.metrics.APICallCount.Add(1)
 		slog.Info("fetched downloads", "kind", kind, "count", len(downloads))
@@ -111,7 +112,7 @@ func (c *Catalog) Refresh(ctx context.Context) error {
 
 	if err := c.stateDB.UpsertFiles(files); err != nil {
 		slog.Error("upsert file records", "err", err)
-		return err
+		return fmt.Errorf("upsert file records: %w", err)
 	}
 
 	// Swap tree atomically.
