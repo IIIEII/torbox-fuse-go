@@ -4,6 +4,7 @@ package fusefs
 
 import (
 	"context"
+	"io"
 	"log/slog"
 	"sync"
 	"syscall"
@@ -277,8 +278,8 @@ func (f *FileNode) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, fu
 // destination buffer. On cache hits this is zero-alloc (cache.CopyTo
 // writes straight into dest).
 func (f *FileNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
-	n, err := f.streamer.ReadAt(ctx, f.fileKey, off, dest)
-	if err != nil {
+	n, err := f.streamer.ReadAt(ctx, f.fileKey, off, dest, int64(f.size))
+	if err != nil && err != io.EOF {
 		return nil, syscall.EIO
 	}
 	return fuse.ReadResultData(dest[:n]), 0

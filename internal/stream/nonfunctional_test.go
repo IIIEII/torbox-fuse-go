@@ -56,7 +56,7 @@ func TestNonFunctional_NoGoroutineLeak(t *testing.T) {
 	for i := 0; i < 100; i++ {
 		off := int64(i * 4096)
 		buf := make([]byte, 4096)
-		_, err := sr.ReadAt(context.Background(), "f1", off, buf)
+		_, err := sr.ReadAt(context.Background(), "f1", off, buf, int64(4*1024*1024))
 		if err != nil {
 			t.Fatalf("ReadAt(%d): %v", off, err)
 		}
@@ -116,7 +116,7 @@ func TestNonFunctional_CancelledOpsReleaseResources(t *testing.T) {
 	for i := 0; i < 3; i++ {
 		ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
 		buf := make([]byte, 1024)
-		_, err := sr.ReadAt(ctx, fmt.Sprintf("f%d", i), 0, buf)
+		_, err := sr.ReadAt(ctx, fmt.Sprintf("f%d", i), 0, buf, int64(4*1024*1024))
 		if err == nil {
 			t.Error("expected error from cancelled context")
 		}
@@ -140,7 +140,7 @@ func TestNonFunctional_CancelledOpsReleaseResources(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	buf := make([]byte, 1024)
-	n, err := sr.ReadAt(ctx, "fresh_file", 0, buf)
+	n, err := sr.ReadAt(ctx, "fresh_file", 0, buf, int64(4*1024*1024))
 	if err != nil {
 		t.Fatalf("fresh read after cancellation: %v", err)
 	}
@@ -162,7 +162,7 @@ func TestNonFunctional_MetricsCounts(t *testing.T) {
 
 	// First read should be a cache miss (CDN fetch)
 	buf := make([]byte, 256)
-	n, err := sr.ReadAt(context.Background(), "f1", 0, buf)
+	n, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(1024))
 	if err != nil {
 		t.Fatalf("first ReadAt: %v", err)
 	}
@@ -179,7 +179,7 @@ func TestNonFunctional_MetricsCounts(t *testing.T) {
 
 	// Second read at different offset within same window should be a cache hit
 	buf2 := make([]byte, 128)
-	n2, err := sr.ReadAt(context.Background(), "f1", 128, buf2)
+	n2, err := sr.ReadAt(context.Background(), "f1", 128, buf2, int64(1024))
 	if err != nil {
 		t.Fatalf("second ReadAt: %v", err)
 	}
@@ -237,7 +237,7 @@ func TestNonFunctional_ConcurrentRacePaths(t *testing.T) {
 		go func(idx int) {
 			off := int64(idx * 128 * 1024)
 			buf := make([]byte, 1024)
-			_, err := sr.ReadAt(context.Background(), "f1", off, buf)
+			_, err := sr.ReadAt(context.Background(), "f1", off, buf, int64(8*1024*1024))
 			results <- result{err: err}
 		}(i)
 	}

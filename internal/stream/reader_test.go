@@ -3,6 +3,7 @@ package stream
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -33,7 +34,7 @@ func TestReadAt_CacheHit(t *testing.T) {
 	rc.Put("f1", 0, testData)
 
 	buf := make([]byte, len(testData))
-	n, err := sr.ReadAt(context.Background(), "f1", 0, buf)
+	n, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(len(testData)))
 	if err != nil {
 		t.Fatalf("ReadAt: %v", err)
 	}
@@ -86,7 +87,7 @@ func TestReadAt_CacheMissFetchesFromCDN(t *testing.T) {
 	}
 
 	buf := make([]byte, 5)
-	n, err := sr.ReadAt(context.Background(), "f1", 0, buf)
+	n, err := sr.ReadAt(context.Background(), "f1", 0, buf, 10)
 	if err != nil {
 		t.Fatalf("ReadAt: %v", err)
 	}
@@ -160,7 +161,7 @@ func TestReadAt_MultipleReadersJoinInflightWindow(t *testing.T) {
 			defer wg.Done()
 			buf := make([]byte, 4)
 			off := int64(idx * 2) // offsets 0, 2, 4 — all within same window
-			n, err := sr.ReadAt(context.Background(), "f1", off, buf)
+			n, err := sr.ReadAt(context.Background(), "f1", off, buf, 26)
 			results[idx].n = n
 			results[idx].err = err
 			results[idx].buf = buf
@@ -232,7 +233,7 @@ func TestReadAt_TwoReadersOneFetch(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			buf := make([]byte, 4)
-			sr.ReadAt(context.Background(), "f1", 0, buf)
+			sr.ReadAt(context.Background(), "f1", 0, buf, 26)
 		}()
 	}
 	wg.Wait()
@@ -293,7 +294,7 @@ func TestReadAt_SubrangeJoinsInflight(t *testing.T) {
 	// Start first read
 	go func() {
 		buf := make([]byte, 100)
-		sr.ReadAt(context.Background(), "f1", 0, buf)
+		sr.ReadAt(context.Background(), "f1", 0, buf, int64(4<<20))
 	}()
 
 	// Wait for CDN fetch to start
@@ -301,7 +302,7 @@ func TestReadAt_SubrangeJoinsInflight(t *testing.T) {
 
 	// Second read at offset 100 within same window
 	buf2 := make([]byte, 10)
-	n, err := sr.ReadAt(context.Background(), "f1", 100, buf2)
+	n, err := sr.ReadAt(context.Background(), "f1", 100, buf2, int64(4<<20))
 	if err != nil {
 		t.Fatalf("second ReadAt: %v", err)
 	}
@@ -335,7 +336,7 @@ func TestReadAt_InflightCleanedAfterSuccess(t *testing.T) {
 	}
 
 	buf := make([]byte, 10)
-	_, err := sr.ReadAt(context.Background(), "f1", 0, buf)
+	_, err := sr.ReadAt(context.Background(), "f1", 0, buf, 100)
 	if err != nil {
 		t.Fatalf("ReadAt: %v", err)
 	}
@@ -387,7 +388,7 @@ func TestReadAt_InflightCleanedAfterError(t *testing.T) {
 
 	// First read should fail
 	buf := make([]byte, 10)
-	_, err := sr.ReadAt(context.Background(), "f1", 0, buf)
+	_, err := sr.ReadAt(context.Background(), "f1", 0, buf, 10)
 	if err == nil {
 		t.Fatal("expected error from first ReadAt")
 	}
@@ -396,10 +397,10 @@ func TestReadAt_InflightCleanedAfterError(t *testing.T) {
 	// Give a brief moment for cleanup
 	time.Sleep(50 * time.Millisecond)
 
-	// Second read should succeed
+	// Second read should succeed (use large fileSize to avoid EOF)
 	buf2 := make([]byte, 10)
-	n, err := sr.ReadAt(context.Background(), "f1", 0, buf2)
-	if err != nil {
+	n, err := sr.ReadAt(context.Background(), "f1", 0, buf2, 1<<20)
+	if err != nil && err != io.EOF {
 		t.Fatalf("expected second ReadAt to succeed after error, got: %v", err)
 	}
 	if n != 10 {
@@ -435,7 +436,7 @@ func TestReadAt_InflightCleanedAfterCancel(t *testing.T) {
 	defer cancel()
 
 	buf := make([]byte, 10)
-	_, err := sr.ReadAt(ctx, "f1", 0, buf)
+	_, err := sr.ReadAt(ctx, "f1", 0, buf, 10)
 	if err == nil {
 		t.Fatal("expected error from cancelled context")
 	}
@@ -450,7 +451,7 @@ func TestReadAt_InflightCleanedAfterCancel(t *testing.T) {
 	defer retryCancel()
 
 	buf2 := make([]byte, 10)
-	n, retryErr := sr.ReadAt(retryCtx, "f1", 0, buf2)
+	n, retryErr := sr.ReadAt(retryCtx, "f1", 0, buf2, 10)
 	if retryErr != nil {
 		t.Fatalf("expected retry to succeed, got: %v", retryErr)
 	}
@@ -529,7 +530,7 @@ func TestReadAt_EarlyReturnFromInflight(t *testing.T) {
 
 	// Read only 5 bytes from offset 0 — should return before window is fully processed.
 	buf := make([]byte, 5)
-	n, err := sr.ReadAt(context.Background(), "f1", 0, buf)
+	n, err := sr.ReadAt(context.Background(), "f1", 0, buf, 26)
 	if err != nil {
 		t.Fatalf("ReadAt: %v", err)
 	}
@@ -565,8 +566,8 @@ func TestReadAt_ShortReadNearEOF(t *testing.T) {
 
 	// Read 5 bytes from offset 5 — near end of the short response
 	buf := make([]byte, 5)
-	n, err := sr.ReadAt(context.Background(), "f1", 5, buf)
-	if err != nil {
+	n, err := sr.ReadAt(context.Background(), "f1", 5, buf, 10)
+	if err != nil && err != io.EOF {
 		t.Fatalf("ReadAt: %v", err)
 	}
 	if n != 5 {
@@ -576,10 +577,10 @@ func TestReadAt_ShortReadNearEOF(t *testing.T) {
 		t.Errorf("got %q, want %q", string(buf), "FGHIJ")
 	}
 
-	// Read at the very end — should get short data
+	// Read at the very end — should get short data and io.EOF
 	buf2 := make([]byte, 10)
-	n2, err2 := sr.ReadAt(context.Background(), "f1", 8, buf2)
-	if err2 != nil {
+	n2, err2 := sr.ReadAt(context.Background(), "f1", 8, buf2, 10)
+	if err2 != nil && err2 != io.EOF {
 		t.Fatalf("ReadAt near EOF: %v", err2)
 	}
 	if n2 != 2 {
@@ -630,7 +631,7 @@ func TestReadAt_ExactByteCorrectness(t *testing.T) {
 	// Read at various offsets and verify exact byte correctness
 	for _, offset := range []int64{0, 10, 50, 100, 200, 250} {
 		buf := make([]byte, 5)
-		n, err := sr.ReadAt(context.Background(), "f1", offset, buf)
+		n, err := sr.ReadAt(context.Background(), "f1", offset, buf, 256)
 		if err != nil {
 			t.Errorf("ReadAt(offset=%d): %v", offset, err)
 			continue
@@ -711,7 +712,7 @@ func TestReadAt_OffByOneAtBoundaries(t *testing.T) {
 
 	for _, pos := range positions {
 		buf := make([]byte, 1)
-		n, err := sr.ReadAt(context.Background(), "f1", pos.off, buf)
+		n, err := sr.ReadAt(context.Background(), "f1", pos.off, buf, int64(12*1024*1024))
 		if err != nil {
 			t.Errorf("ReadAt(%s=%d): %v", pos.name, pos.off, err)
 			continue

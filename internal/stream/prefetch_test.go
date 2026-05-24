@@ -64,7 +64,7 @@ func TestPrefetch_SkippedWhenAlreadyCached(t *testing.T) {
 
 	// Read the first window
 	buf := make([]byte, 4*1024*1024)
-	_, err := sr.ReadAt(context.Background(), "f1", 0, buf)
+	_, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(8*1024*1024))
 	if err != nil {
 		t.Fatalf("ReadAt(0): %v", err)
 	}
@@ -116,7 +116,7 @@ func TestPrefetch_SkippedWhenAlreadyInflight(t *testing.T) {
 	// Start a read at offset 4 MiB (second window) to create an inflight entry
 	go func() {
 		buf := make([]byte, 1024)
-		sr.ReadAt(context.Background(), "f1", 4*1024*1024, buf)
+		sr.ReadAt(context.Background(), "f1", 4*1024*1024, buf, int64(8*1024*1024))
 	}()
 
 	// Wait for the second window fetch to start
@@ -124,7 +124,7 @@ func TestPrefetch_SkippedWhenAlreadyInflight(t *testing.T) {
 
 	// Now read the first window — the next window is already inflight
 	buf := make([]byte, 4*1024*1024)
-	_, err := sr.ReadAt(context.Background(), "f1", 0, buf)
+	_, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(8*1024*1024))
 	if err != nil {
 		t.Fatalf("ReadAt(0): %v", err)
 	}
@@ -174,7 +174,7 @@ func TestPrefetch_SuppressionNoDuplicateFetches(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		off := int64(i * 100 * 1024) // 100 KiB intervals
 		buf := make([]byte, 1024)
-		_, err := sr.ReadAt(context.Background(), "f1", off, buf)
+		_, err := sr.ReadAt(context.Background(), "f1", off, buf, int64(8*1024*1024))
 		if err != nil {
 			t.Fatalf("ReadAt(%d): %v", off, err)
 		}
@@ -225,7 +225,7 @@ func TestPrefetch_PerFileInflightLimit(t *testing.T) {
 
 	// Read from offset 0 — creates 1 inflight window
 	buf := make([]byte, 4*1024*1024)
-	_, err := sr.ReadAt(context.Background(), "f1", 0, buf)
+	_, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(8*1024*1024))
 	if err != nil {
 		t.Fatalf("ReadAt(0): %v", err)
 	}
@@ -274,7 +274,7 @@ func TestPrefetch_SkippedAfterFarSeek(t *testing.T) {
 
 	// Read from offset 0
 	buf := make([]byte, 1024)
-	_, err := sr.ReadAt(context.Background(), "f1", 0, buf)
+	_, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(8*1024*1024))
 	if err != nil {
 		t.Fatalf("ReadAt(0): %v", err)
 	}
@@ -282,7 +282,7 @@ func TestPrefetch_SkippedAfterFarSeek(t *testing.T) {
 	// Seek far away (> 16 MiB)
 	farOffset := int64(20 * 1024 * 1024)
 	buf2 := make([]byte, 1024)
-	_, err = sr.ReadAt(context.Background(), "f1", farOffset, buf2)
+	_, err = sr.ReadAt(context.Background(), "f1", farOffset, buf2, int64(32*1024*1024))
 	if err != nil {
 		t.Fatalf("ReadAt(%d): %v", farOffset, err)
 	}

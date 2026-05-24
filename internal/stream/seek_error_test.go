@@ -3,6 +3,7 @@ package stream
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -30,7 +31,7 @@ func TestSeek_BackToStart(t *testing.T) {
 	// Read from middle first (offset 16 MiB — triggers far seek from 0)
 	midOffset := int64(16 * 1024 * 1024)
 	buf := make([]byte, 4096)
-	n, err := sr.ReadAt(context.Background(), "f1", midOffset, buf)
+	n, err := sr.ReadAt(context.Background(), "f1", midOffset, buf, int64(32*1024*1024))
 	if err != nil {
 		t.Fatalf("mid ReadAt: %v", err)
 	}
@@ -45,7 +46,7 @@ func TestSeek_BackToStart(t *testing.T) {
 
 	// Seek back to start
 	buf2 := make([]byte, 4096)
-	n2, err := sr.ReadAt(context.Background(), "f1", 0, buf2)
+	n2, err := sr.ReadAt(context.Background(), "f1", 0, buf2, int64(32*1024*1024))
 	if err != nil {
 		t.Fatalf("start ReadAt: %v", err)
 	}
@@ -71,7 +72,7 @@ func TestSeek_ToMiddle(t *testing.T) {
 
 	// Read from start
 	buf := make([]byte, 4096)
-	n, err := sr.ReadAt(context.Background(), "f1", 0, buf)
+	n, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(32*1024*1024))
 	if err != nil {
 		t.Fatalf("start ReadAt: %v", err)
 	}
@@ -82,7 +83,7 @@ func TestSeek_ToMiddle(t *testing.T) {
 	// Seek to middle (offset 20 MiB — far seek from offset 0)
 	midOffset := int64(20 * 1024 * 1024)
 	buf2 := make([]byte, 4096)
-	n2, err := sr.ReadAt(context.Background(), "f1", midOffset, buf2)
+	n2, err := sr.ReadAt(context.Background(), "f1", midOffset, buf2, int64(32*1024*1024))
 	if err != nil {
 		t.Fatalf("mid ReadAt: %v", err)
 	}
@@ -109,8 +110,8 @@ func TestSeek_NearEOF(t *testing.T) {
 	// Read near EOF
 	eofOffset := int64(len(testData) - 100)
 	buf := make([]byte, 200) // request more than available
-	n, err := sr.ReadAt(context.Background(), "f1", eofOffset, buf)
-	if err != nil {
+	n, err := sr.ReadAt(context.Background(), "f1", eofOffset, buf, int64(4*1024*1024+12345))
+	if err != nil && err != io.EOF {
 		t.Fatalf("EOF ReadAt: %v", err)
 	}
 	// Should get only 100 bytes (remaining in file)
@@ -144,7 +145,7 @@ func TestSeek_RepeatedSeesksNoStaleData(t *testing.T) {
 
 	for _, off := range offsets {
 		buf := make([]byte, 256)
-		n, err := sr.ReadAt(context.Background(), "f1", off, buf)
+		n, err := sr.ReadAt(context.Background(), "f1", off, buf, int64(48*1024*1024))
 		if err != nil {
 			t.Errorf("ReadAt(%d): %v", off, err)
 			continue
@@ -189,7 +190,7 @@ func TestSeek_BackendTimeout(t *testing.T) {
 	defer cancel()
 
 	buf := make([]byte, 10)
-	_, err := sr.ReadAt(ctx, "f1", 0, buf)
+	_, err := sr.ReadAt(ctx, "f1", 0, buf, int64(10))
 	if err == nil {
 		t.Error("expected error from timeout")
 	}
@@ -209,7 +210,7 @@ func TestSeek_InvalidRangeResponse(t *testing.T) {
 	})
 
 	buf := make([]byte, 10)
-	_, err := sr.ReadAt(context.Background(), "f1", 0, buf)
+	_, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(10))
 	if err == nil {
 		t.Error("expected error from 416 response")
 	}
@@ -253,13 +254,13 @@ func TestSeek_TemporaryBackendError(t *testing.T) {
 
 	// First read should fail
 	buf := make([]byte, 10)
-	_, err := sr.ReadAt(context.Background(), "f1", 0, buf)
+	_, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(1024))
 	if err == nil {
 		t.Error("expected first read to fail")
 	}
 
 	// Retry should succeed
-	n, err := sr.ReadAt(context.Background(), "f1", 0, buf)
+	n, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(1024))
 	if err != nil {
 		t.Fatalf("expected retry to succeed, got: %v", err)
 	}
@@ -306,13 +307,13 @@ func TestSeek_StateUsableAfterError(t *testing.T) {
 
 	// First read fails
 	buf := make([]byte, 10)
-	_, err := sr.ReadAt(context.Background(), "f1", 0, buf)
+	_, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(4*1024*1024))
 	if err == nil {
 		t.Error("expected error on first read")
 	}
 
 	// Second read succeeds
-	n, err := sr.ReadAt(context.Background(), "f1", 0, buf)
+	n, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(4*1024*1024))
 	if err != nil {
 		t.Fatalf("expected second read to succeed, got: %v", err)
 	}
@@ -322,7 +323,7 @@ func TestSeek_StateUsableAfterError(t *testing.T) {
 
 	// Third read at different offset also works
 	buf2 := make([]byte, 256)
-	n2, err := sr.ReadAt(context.Background(), "f1", 512, buf2)
+	n2, err := sr.ReadAt(context.Background(), "f1", 512, buf2, int64(4*1024*1024))
 	if err != nil {
 		t.Fatalf("expected third read to succeed, got: %v", err)
 	}

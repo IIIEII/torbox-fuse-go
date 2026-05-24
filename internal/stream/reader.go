@@ -6,6 +6,7 @@ package stream
 import (
 	"context"
 	"fmt"
+	"io"
 	"log/slog"
 	"sync"
 	"sync/atomic"
@@ -86,7 +87,8 @@ func NewStreamReader(rc *cache.RangeCache, cdn *CDNClient, maxInflight int, pref
 // It first checks the cache (zero-alloc hit via CopyTo). On miss, it finds or
 // creates an inflight window, waits for the requested bytes to be ready
 // (early return), and copies them into p.
-func (sr *StreamReader) ReadAt(ctx context.Context, fileKey string, off int64, p []byte) (int, error) {
+// Returns io.EOF when the read reaches or exceeds fileSize.
+func (sr *StreamReader) ReadAt(ctx context.Context, fileKey string, off int64, p []byte, fileSize int64) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
 	}
@@ -117,6 +119,10 @@ func (sr *StreamReader) ReadAt(ctx context.Context, fileKey string, off int64, p
 	// Trigger read-ahead if conditions are met.
 	sr.maybeReadAhead(fileKey, off, ws, sess)
 
+	// Return EOF if we've reached the end of the file.
+	if off+int64(n) >= fileSize {
+		return n, io.EOF
+	}
 	return n, nil
 }
 

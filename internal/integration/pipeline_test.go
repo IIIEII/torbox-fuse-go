@@ -142,7 +142,7 @@ func TestFullPipeline_CatalogToStreamRead(t *testing.T) {
 
 	// Read from stream.
 	buf := make([]byte, 1024)
-	n, err := streamer.ReadAt(ctx, movieFile.ContentKey(), 0, buf)
+	n, err := streamer.ReadAt(ctx, movieFile.ContentKey(), 0, buf, movieFile.Size)
 	if err != nil {
 		t.Fatalf("ReadAt: %v", err)
 	}
@@ -160,7 +160,7 @@ func TestFullPipeline_CatalogToStreamRead(t *testing.T) {
 
 	// Second read should be a cache hit.
 	buf2 := make([]byte, 512)
-	n2, err := streamer.ReadAt(ctx, movieFile.ContentKey(), 0, buf2)
+	n2, err := streamer.ReadAt(ctx, movieFile.ContentKey(), 0, buf2, movieFile.Size)
 	if err != nil {
 		t.Fatalf("ReadAt (cached): %v", err)
 	}

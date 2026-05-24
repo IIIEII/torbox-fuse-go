@@ -3,6 +3,7 @@ package stream
 import (
 	"context"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -74,8 +75,8 @@ func TestIntegration_SequentialPlaybackFromStart(t *testing.T) {
 	offset := int64(0)
 
 	for offset < int64(len(testData)) {
-		n, err := sr.ReadAt(context.Background(), "f1", offset, buf)
-		if err != nil {
+		n, err := sr.ReadAt(context.Background(), "f1", offset, buf, int64(4*1024*1024))
+		if err != nil && err != io.EOF {
 			t.Fatalf("ReadAt(offset=%d): %v", offset, err)
 		}
 		if n > len(buf) {
@@ -110,7 +111,7 @@ func TestIntegration_MidFilePlaybackStart(t *testing.T) {
 	// Seek to 50%
 	midOffset := int64(len(testData) / 2)
 	buf := make([]byte, 128*1024)
-	n, err := sr.ReadAt(context.Background(), "f1", midOffset, buf)
+	n, err := sr.ReadAt(context.Background(), "f1", midOffset, buf, int64(8*1024*1024))
 	if err != nil {
 		t.Fatalf("ReadAt(mid=%d): %v", midOffset, err)
 	}
@@ -125,7 +126,7 @@ func TestIntegration_MidFilePlaybackStart(t *testing.T) {
 
 	// Subsequent reads in same window should not need another CDN request
 	firstCount := requestCount.Load()
-	n2, err := sr.ReadAt(context.Background(), "f1", midOffset+int64(len(buf)), buf)
+	n2, err := sr.ReadAt(context.Background(), "f1", midOffset+int64(len(buf)), buf, int64(8*1024*1024))
 	if err != nil {
 		t.Fatalf("second ReadAt: %v", err)
 	}
@@ -151,8 +152,8 @@ func TestIntegration_EOFProbeThenPlayback(t *testing.T) {
 	// Read last 1 KiB (EOF probe)
 	eofOffset := int64(len(testData) - 1024)
 	buf := make([]byte, 1024)
-	n, err := sr.ReadAt(context.Background(), "f1", eofOffset, buf)
-	if err != nil {
+	n, err := sr.ReadAt(context.Background(), "f1", eofOffset, buf, int64(4*1024*1024+12345))
+	if err != nil && err != io.EOF {
 		t.Fatalf("EOF probe ReadAt(%d): %v", eofOffset, err)
 	}
 	for i := 0; i < n; i++ {
@@ -163,7 +164,7 @@ func TestIntegration_EOFProbeThenPlayback(t *testing.T) {
 
 	// Now read from start — should work fine
 	buf2 := make([]byte, 4096)
-	n2, err := sr.ReadAt(context.Background(), "f1", 0, buf2)
+	n2, err := sr.ReadAt(context.Background(), "f1", 0, buf2, int64(4*1024*1024+12345))
 	if err != nil {
 		t.Fatalf("playback ReadAt(0): %v", err)
 	}
@@ -194,7 +195,7 @@ func TestIntegration_RepeatedSmallReadsInOneWindow(t *testing.T) {
 	for i := 0; i < numReads; i++ {
 		off := int64(i * readSize)
 		buf := make([]byte, readSize)
-		n, err := sr.ReadAt(context.Background(), "f1", off, buf)
+		n, err := sr.ReadAt(context.Background(), "f1", off, buf, int64(4*1024*1024))
 		if err != nil {
 			t.Fatalf("ReadAt(%d): %v", off, err)
 		}
@@ -239,7 +240,7 @@ func TestIntegration_ConcurrentReadersSameFile(t *testing.T) {
 		go func(idx int) {
 			off := int64(idx * 64 * 1024) // different offsets within same window
 			buf := make([]byte, 1024)
-			n, err := sr.ReadAt(context.Background(), "f1", off, buf)
+			n, err := sr.ReadAt(context.Background(), "f1", off, buf, int64(4*1024*1024))
 			if err != nil {
 				results <- result{err: err}
 				return
@@ -322,7 +323,7 @@ func TestIntegration_ConcurrentReadersDifferentFiles(t *testing.T) {
 	for key := range fileData {
 		go func(k string) {
 			buf := make([]byte, 1)
-			n, err := sr.ReadAt(context.Background(), k, 0, buf)
+			n, err := sr.ReadAt(context.Background(), k, 0, buf, 1024)
 			if err != nil {
 				results <- result{err: err}
 				return
@@ -384,19 +385,19 @@ func TestIntegration_BackendFailureRecovery(t *testing.T) {
 
 	// First read should fail (error window is removed after error, allowing retry)
 	buf := make([]byte, 1024)
-	_, err := sr.ReadAt(context.Background(), "f1", 0, buf)
+	_, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(4*1024*1024))
 	if err == nil {
 		t.Error("expected first read to fail")
 	}
 
 	// Second read should also fail
-	_, err = sr.ReadAt(context.Background(), "f1", 0, buf)
+	_, err = sr.ReadAt(context.Background(), "f1", 0, buf, int64(4*1024*1024))
 	if err == nil {
 		t.Error("expected second read to fail")
 	}
 
 	// Third read should succeed
-	n, err := sr.ReadAt(context.Background(), "f1", 0, buf)
+	n, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(4*1024*1024))
 	if err != nil {
 		t.Fatalf("expected third read to succeed, got: %v", err)
 	}
