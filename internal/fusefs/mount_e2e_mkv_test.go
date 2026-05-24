@@ -327,3 +327,19 @@ func verifyMKV(t *testing.T, mountPath string, expectedDuration float64, seekOff
 		}
 	}
 }
+
+func TestE2E_MKVPlaybackQuick(t *testing.T) {
+	mkvPath := generateMKV(t)
+	mountDir, cleanup := mountFUSEForMKV(t, mkvPath)
+	defer cleanup()
+
+	filePath := filepath.Join(mountDir, "movies", "Test Movie 2024", "Test.Movie.2024.mkv")
+
+	info, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatalf("stat %s: %v", filePath, err)
+	}
+	t.Logf("file size: %d bytes", info.Size())
+
+	verifyMKV(t, filePath, 5.0, []float64{0, 2.5})
+}
