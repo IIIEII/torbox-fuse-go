@@ -184,6 +184,19 @@ func (sr *StreamReader) maybeCancelOnSeek(fileKey string, off int64) {
 
 	// Evict stale cache data.
 	sr.cache.EvictStale(fileKey, newID)
+
+	// Clean up session if no inflight windows remain for this file.
+	hasInflight := false
+	sr.inflight.Range(func(key, value any) bool {
+		if key.(inflightKey).fileKey == fileKey {
+			hasInflight = true
+			return false
+		}
+		return true
+	})
+	if !hasInflight {
+		sr.sessions.Delete(fileKey)
+	}
 }
 
 // getOrCreateSession returns the file session for the given fileKey,
@@ -312,7 +325,22 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 	// The window data is already in the cache for future reads.
 	go func() {
 		time.Sleep(100 * time.Millisecond)
-		sr.inflight.Delete(win.key)
+		// Only delete if this window is still registered (not already replaced).
+		if v, ok := sr.inflight.Load(win.key); ok && v.(*inflightWindow) == win {
+			sr.inflight.Delete(win.key)
+		}
+		// Clean up session if no inflight windows remain for this file.
+		hasInflight := false
+		sr.inflight.Range(func(key, value any) bool {
+			if key.(inflightKey).fileKey == win.key.fileKey {
+				hasInflight = true
+				return false
+			}
+			return true
+		})
+		if !hasInflight {
+			sr.sessions.Delete(win.key.fileKey)
+		}
 	}()
 }
 
