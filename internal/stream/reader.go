@@ -54,6 +54,11 @@ type inflightKey struct {
 
 // inflightWindow tracks an in-progress CDN fetch for a single 4 MiB window.
 // Readers wait on readyCond until their requested bytes are available (early return).
+//
+// Synchronization guarantee: err is written by fetchWindow before done.Broadcast()
+// and read by waitForBytes after done.Wait() returns, establishing a happens-before.
+// No additional locking is needed for err because the Broadcast/Wait pair provides
+// the necessary memory ordering.
 type inflightWindow struct {
 	key        inflightKey
 	sessionID  int64
