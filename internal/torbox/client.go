@@ -8,12 +8,16 @@ import (
 	"log/slog"
 	"math/rand"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
 
 	"github.com/iiieii/torbox-fuse-go/internal/catalog"
 )
+
+// maxCacheEntries limits the number of API response entries cached in memory.
+const maxCacheEntries = 100
 
 type Config interface {
 	APIKey() string
@@ -29,7 +33,6 @@ type Client struct {
 	cache      map[string]cacheEntry
 	cacheMu    sync.RWMutex
 	cacheTTL   time.Duration
-	rng        *rand.Rand
 }
 
 type cacheEntry struct {
@@ -52,7 +55,6 @@ func NewClient(cfg Config) *Client {
 		apiSem:   make(chan struct{}, 1),
 		cache:    make(map[string]cacheEntry),
 		cacheTTL: 5 * time.Minute,
-		rng:      rand.New(rand.NewSource(time.Now().UnixNano())),
 	}
 }
 
@@ -176,9 +178,15 @@ func PermalinkURL(token string, kind catalog.DownloadKind, downloadID, fileID st
 }
 
 func (c *Client) apiGet(ctx context.Context, path string, params map[string]string) ([]byte, error) {
+	// Build deterministic cache key from sorted parameters.
+	keys := make([]string, 0, len(params))
+	for k := range params {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
 	cacheKey := path
-	for k, v := range params {
-		cacheKey += "?" + k + "=" + v
+	for _, k := range keys {
+		cacheKey += "?" + k + "=" + params[k]
 	}
 
 	c.cacheMu.RLock()
@@ -209,14 +217,14 @@ func (c *Client) apiGet(ctx context.Context, path string, params map[string]stri
 		resp, err := c.httpClient.Do(req)
 		if err != nil {
 			if attempt < maxRetries-1 {
-				c.backoff(attempt)
+				c.backoff(ctx, attempt)
 				continue
 			}
 			return nil, fmt.Errorf("request failed after %d attempts: %w", maxRetries, err)
 		}
+		defer resp.Body.Close()
 
 		body, err := io.ReadAll(resp.Body)
-		resp.Body.Close()
 		if err != nil {
 			return nil, fmt.Errorf("read response: %w", err)
 		}
@@ -226,10 +234,14 @@ func (c *Client) apiGet(ctx context.Context, path string, params map[string]stri
 				retryAfter := resp.Header.Get("Retry-After")
 				if retryAfter != "" {
 					if secs, err := time.ParseDuration(retryAfter + "s"); err == nil {
-						time.Sleep(secs)
+						select {
+						case <-ctx.Done():
+							return nil, ctx.Err()
+						case <-time.After(secs):
+						}
 					}
 				}
-				c.backoff(attempt)
+				c.backoff(ctx, attempt)
 				continue
 			}
 			return nil, fmt.Errorf("rate limited after %d retries: %s", maxRetries, resp.Status)
@@ -237,7 +249,7 @@ func (c *Client) apiGet(ctx context.Context, path string, params map[string]stri
 
 		if resp.StatusCode >= 500 {
 			if attempt < maxRetries-1 {
-				c.backoff(attempt)
+				c.backoff(ctx, attempt)
 				continue
 			}
 			return nil, fmt.Errorf("server error after %d retries: %s", maxRetries, resp.Status)
@@ -249,6 +261,20 @@ func (c *Client) apiGet(ctx context.Context, path string, params map[string]stri
 
 		c.cacheMu.Lock()
 		c.cache[cacheKey] = cacheEntry{data: body, createdAt: time.Now()}
+		// Evict oldest entries if cache exceeds limit.
+		if len(c.cache) > maxCacheEntries {
+			oldest := ""
+			oldestTime := time.Now()
+			for k, v := range c.cache {
+				if v.createdAt.Before(oldestTime) {
+					oldestTime = v.createdAt
+					oldest = k
+				}
+			}
+			if oldest != "" {
+				delete(c.cache, oldest)
+			}
+		}
 		c.cacheMu.Unlock()
 
 		return body, nil
@@ -257,8 +283,11 @@ func (c *Client) apiGet(ctx context.Context, path string, params map[string]stri
 	return nil, fmt.Errorf("unreachable")
 }
 
-func (c *Client) backoff(attempt int) {
-	delay := time.Duration(100*1<<uint(attempt))*time.Millisecond + time.Duration(c.rng.Intn(100))*time.Millisecond
+func (c *Client) backoff(ctx context.Context, attempt int) {
+	delay := time.Duration(100*1<<uint(attempt))*time.Millisecond + time.Duration(rand.Intn(100))*time.Millisecond
 	slog.Debug("backoff", "attempt", attempt, "delay", delay)
-	time.Sleep(delay)
+	select {
+	case <-ctx.Done():
+	case <-time.After(delay):
+	}
 }
