@@ -345,24 +345,28 @@ func TestE2E_MKVPlaybackQuick(t *testing.T) {
 	verifyMKV(t, filePath, 5.0, []float64{0, 2.5})
 }
 
-// generateLargeMKV generates a large (~100MB) MKV file using ffmpeg with a
-// high bitrate. The test is skipped if ffmpeg is not available.
+// generateLargeMKV generates a large (~100MB) MKV file using ffmpeg.
+// It uses mandelbrot (poorly compressible fractal) at 1080p to ensure the file
+// reaches ~100MB regardless of codec efficiency. The test is skipped if ffmpeg
+// is not available.
 func generateLargeMKV(t *testing.T) string {
 	t.Helper()
 	ffmpeg := checkTool(t, "ffmpeg")
 
 	output := filepath.Join(t.TempDir(), "test_large.mkv")
 
+	// mandelbrot produces high-entropy frames that resist compression.
+	// 20 seconds at 1080p/30fps with ultrafast produces ~120MB.
 	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancel()
 
 	cmd := exec.CommandContext(ctx, ffmpeg,
 		"-y",
+		"-t", "20",
 		"-f", "lavfi",
-		"-i", "testsrc=duration=5:size=1920x1080:rate=30",
+		"-i", "mandelbrot=size=1920x1080:rate=30",
 		"-c:v", "libx264",
 		"-preset", "ultrafast",
-		"-b:v", "160M",
 		"-f", "matroska",
 		output,
 	)
@@ -392,7 +396,7 @@ func sha256OfFile(t *testing.T, path string) [32]byte {
 	return sha256.Sum256(data)
 }
 
-// TestE2E_MKVPlaybackLarge generates a large (~100MB) MKV, mounts it via FUSE,
+// TestE2E_MKVPlaybackLarge generates a large (~120MB) MKV, mounts it via FUSE,
 // verifies playback with ffprobe/ffmpeg seek, and checks full SHA256 integrity.
 func TestE2E_MKVPlaybackLarge(t *testing.T) {
 	if testing.Short() {
@@ -415,7 +419,7 @@ func TestE2E_MKVPlaybackLarge(t *testing.T) {
 	}
 	t.Logf("mounted file size: %d bytes (%.1f MB)", fi.Size(), float64(fi.Size())/1024/1024)
 
-	verifyMKV(t, filePath, 5.0, []float64{0, 2.5, 4})
+	verifyMKV(t, filePath, 20.0, []float64{0, 5, 18})
 
 	mountedHash := sha256OfFile(t, filePath)
 	if mountedHash != originalHash {
