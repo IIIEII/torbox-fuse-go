@@ -115,10 +115,10 @@ func (rc *RangeCache) putBlock(fileKey string, start int64, data []byte, session
 	copy(buf, data)
 
 	blk := &RangeBlock{
-		start:     start,
-		end:       start + int64(len(data)),
-		data:      buf,
-		sessionID: sessionID,
+		start:      start,
+		end:        start + int64(len(data)),
+		data:       buf,
+		sessionID:  sessionID,
 	}
 	blk.lastAccess.Store(nowNano())
 
@@ -150,8 +150,14 @@ func (rc *RangeCache) EvictStale(fileKey string, currentSession int64) {
 		sh.mu.Lock()
 		for key, blk := range sh.blocks {
 			if key.fileKey == fileKey && blk.sessionID > 0 && blk.sessionID < currentSession {
-				rc.used.Add(-int64(len(blk.data)))
+				size := int64(len(blk.data))
 				delete(sh.blocks, key)
+				current := rc.used.Load()
+				if current >= size {
+					rc.used.Add(-size)
+				} else {
+					rc.used.Store(0)
+				}
 			}
 		}
 		sh.mu.Unlock()
@@ -198,8 +204,15 @@ func (rc *RangeCache) evictOne() {
 	// Re-verify the block is still present (a concurrent writer may have
 	// replaced or removed it).
 	if blk, ok := sh.blocks[oldestKey]; ok {
-		rc.used.Add(-int64(len(blk.data)))
+		size := int64(len(blk.data))
 		delete(sh.blocks, oldestKey)
+		// Prevent underflow: if used has drifted below size, reset to 0.
+		current := rc.used.Load()
+		if current >= size {
+			rc.used.Add(-size)
+		} else {
+			rc.used.Store(0)
+		}
 	}
 	sh.mu.Unlock()
 }
@@ -209,8 +222,13 @@ func (rc *RangeCache) Used() int64 {
 	return rc.used.Load()
 }
 
+// cacheEpoch is the monotonic time reference for LRU comparisons.
+var cacheEpoch = time.Now()
+
 // nowNano returns a nanosecond timestamp for LRU comparisons.
+// It uses time.Since to guarantee monotonic progression even if the
+// wall clock is adjusted (NTP, leap seconds, etc.).
 // It is a variable so tests can override it to control time progression.
 var nowNano = func() int64 {
-	return time.Now().UnixNano()
+	return time.Since(cacheEpoch).Nanoseconds()
 }
