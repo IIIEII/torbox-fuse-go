@@ -18,8 +18,8 @@ func TestConfigDefaults(t *testing.T) {
 	if cfg.APIKey != "test-key-123" {
 		t.Errorf("APIKey = %q, want test-key-123", cfg.APIKey)
 	}
-	if cfg.APIBaseURL != "https://api.torbox.app" {
-		t.Errorf("APIBaseURL = %q, want https://api.torbox.app", cfg.APIBaseURL)
+	if cfg.APIBaseURL != "https://api.torbox.app/v1/api" {
+		t.Errorf("APIBaseURL = %q, want https://api.torbox.app/v1/api", cfg.APIBaseURL)
 	}
 	if cfg.MountPath != "/mnt/torbox" {
 		t.Errorf("MountPath = %q, want /mnt/torbox", cfg.MountPath)

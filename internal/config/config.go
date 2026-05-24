@@ -76,7 +76,7 @@ func Load() (*Config, error) {
 
 	return &Config{
 		APIKey:                 apiKey,
-		APIBaseURL:             env("TORBOX_API_BASE_URL", "https://api.torbox.app"),
+		APIBaseURL:             env("TORBOX_API_BASE_URL", "https://api.torbox.app/v1/api"),
 		MountPath:              env("FUSE_MOUNT_PATH", "/mnt/torbox"),
 		CacheBudgetMB:          envInt("FUSE_CACHE_BUDGET_MB", 256),
 		PrefetchWindowMB:       envInt("FUSE_PREFETCH_WINDOW_MB", 16),
