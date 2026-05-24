@@ -10,6 +10,10 @@ import (
 	"time"
 )
 
+// maxResponseSize is the maximum CDN response body size (8 MiB).
+// This prevents unbounded memory if the CDN returns 200 OK instead of 206.
+const maxResponseSize = 8 * 1024 * 1024
+
 // CDNClient performs HTTP range requests to TorBox CDN URLs with a concurrency
 // semaphore that limits the number of in-flight requests.
 type CDNClient struct {
@@ -72,9 +76,12 @@ func (c *CDNClient) FetchRange(ctx context.Context, url string, start, end int64
 		return nil, fmt.Errorf("cdn returned status %d", resp.StatusCode)
 	}
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 	if err != nil {
 		return nil, fmt.Errorf("read cdn response: %w", err)
+	}
+	if len(body) >= int(maxResponseSize) {
+		return nil, fmt.Errorf("cdn response too large (exceeded %d bytes)", maxResponseSize)
 	}
 	return body, nil
 }
