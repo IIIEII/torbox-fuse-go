@@ -4,6 +4,7 @@ package fusefs
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -342,4 +343,84 @@ func TestE2E_MKVPlaybackQuick(t *testing.T) {
 	t.Logf("file size: %d bytes", info.Size())
 
 	verifyMKV(t, filePath, 5.0, []float64{0, 2.5})
+}
+
+// generateLargeMKV generates a large (~100MB) MKV file using ffmpeg with a
+// high bitrate. The test is skipped if ffmpeg is not available.
+func generateLargeMKV(t *testing.T) string {
+	t.Helper()
+	ffmpeg := checkTool(t, "ffmpeg")
+
+	output := filepath.Join(t.TempDir(), "test_large.mkv")
+
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctx, ffmpeg,
+		"-y",
+		"-f", "lavfi",
+		"-i", "testsrc=duration=5:size=1920x1080:rate=30",
+		"-c:v", "libx264",
+		"-preset", "ultrafast",
+		"-b:v", "160M",
+		"-f", "matroska",
+		output,
+	)
+	cmd.Stdout = os.Stderr
+	cmd.Stderr = os.Stderr
+
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("ffmpeg large MKV generation failed: %v", err)
+	}
+
+	fi, err := os.Stat(output)
+	if err != nil {
+		t.Fatalf("stat generated MKV: %v", err)
+	}
+	t.Logf("large MKV size: %d bytes (%.1f MB)", fi.Size(), float64(fi.Size())/1024/1024)
+
+	return output
+}
+
+// sha256OfFile computes the SHA256 hash of the file at the given path.
+func sha256OfFile(t *testing.T, path string) [32]byte {
+	t.Helper()
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read file for SHA256 (%s): %v", path, err)
+	}
+	return sha256.Sum256(data)
+}
+
+// TestE2E_MKVPlaybackLarge generates a large (~100MB) MKV, mounts it via FUSE,
+// verifies playback with ffprobe/ffmpeg seek, and checks full SHA256 integrity.
+func TestE2E_MKVPlaybackLarge(t *testing.T) {
+	if testing.Short() {
+		t.Skip("skipping large MKV playback test in short mode")
+	}
+
+	mkvPath := generateLargeMKV(t)
+
+	originalHash := sha256OfFile(t, mkvPath)
+	t.Logf("original SHA256: %x", originalHash)
+
+	mountDir, cleanup := mountFUSEForMKV(t, mkvPath)
+	defer cleanup()
+
+	filePath := filepath.Join(mountDir, "movies", "Test Movie 2024", "Test.Movie.2024.mkv")
+
+	fi, err := os.Stat(filePath)
+	if err != nil {
+		t.Fatalf("Stat(%s): %v", filePath, err)
+	}
+	t.Logf("mounted file size: %d bytes (%.1f MB)", fi.Size(), float64(fi.Size())/1024/1024)
+
+	verifyMKV(t, filePath, 5.0, []float64{0, 2.5, 4})
+
+	mountedHash := sha256OfFile(t, filePath)
+	if mountedHash != originalHash {
+		t.Errorf("SHA256 mismatch\noriginal: %x\nmounted: %x", originalHash, mountedHash)
+	} else {
+		t.Logf("SHA256 integrity verified: %x", mountedHash)
+	}
 }
