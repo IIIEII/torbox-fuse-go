@@ -161,7 +161,7 @@ func (r *RootNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrO
 
 // Getxattr returns ENOATTR for extended attributes on the root node.
 func (r *RootNode) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
-	return 0, syscall.ENOATTR
+	return 0, errNoAttr
 }
 
 // Listxattr returns an empty xattr list for the root node.
@@ -248,7 +248,7 @@ func (d *DirNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttr
 // Getxattr returns ENOATTR for all xattr queries. This silences the macOS
 // "Unimplemented opcode OPCODE-60" spam for com.apple.FinderInfo etc.
 func (d *DirNode) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
-	return 0, syscall.ENOATTR
+	return 0, errNoAttr
 }
 
 // Listxattr returns an empty xattr list.
@@ -328,7 +328,7 @@ func (f *FileNode) Fsync(ctx context.Context, fh fs.FileHandle, flags uint32) sy
 // Getxattr returns ENOATTR for all xattr queries. This silences the macOS
 // "Unimplemented opcode OPCODE-60" spam for com.apple.FinderInfo etc.
 func (f *FileNode) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
-	return 0, syscall.ENOATTR
+	return 0, errNoAttr
 }
 
 // Listxattr returns an empty xattr list.
