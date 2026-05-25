@@ -15,6 +15,7 @@ func TestMetricsPrometheusOutput(t *testing.T) {
 	m := New()
 	m.CatalogItems.Add(42)
 	m.APICallCount.Add(5)
+	m.CDNRequestCount.Add(3)
 	m.IncCDNStatusCode(200)
 	m.IncCDNStatusCode(200)
 	m.IncCDNStatusCode(404)
@@ -59,6 +60,14 @@ func TestMetricsPrometheusOutput(t *testing.T) {
 	}
 	if !strings.Contains(text, "torbox_goroutine_count") {
 		t.Error("missing torbox_goroutine_count metric")
+	}
+
+	// Verify CDN request count.
+	if !strings.Contains(text, "# TYPE torbox_cdn_request_count_total counter") {
+		t.Error("missing torbox_cdn_request_count_total counter TYPE declaration")
+	}
+	if !strings.Contains(text, "torbox_cdn_request_count_total 3") {
+		t.Error("missing torbox_cdn_request_count_total value line")
 	}
 
 	// Verify CDN status code labels.

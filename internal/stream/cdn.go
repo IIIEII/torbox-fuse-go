@@ -6,9 +6,12 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"net/url"
 	"time"
+
+	"github.com/iiieii/torbox-fuse-go/internal/metrics"
 )
 
 // maxResponseSize is the maximum CDN response body size (8 MiB).
@@ -21,8 +24,9 @@ const maxRedirects = 5
 // CDNClient performs HTTP range requests to TorBox CDN URLs with a concurrency
 // semaphore that limits the number of in-flight requests.
 type CDNClient struct {
-	client *http.Client
-	sem    chan struct{}
+	client  *http.Client
+	sem     chan struct{}
+	metrics *metrics.Metrics
 }
 
 // NewCDNClient creates a CDNClient that allows at most maxConns concurrent
@@ -31,7 +35,7 @@ type CDNClient struct {
 //
 // The client handles redirects manually to preserve the Range header across
 // redirects. Go's default http.Client drops Range on cross-origin 301/302.
-func NewCDNClient(maxConns int) *CDNClient {
+func NewCDNClient(maxConns int, m *metrics.Metrics) *CDNClient {
 	return &CDNClient{
 		client: &http.Client{
 			CheckRedirect: func(req *http.Request, via []*http.Request) error {
@@ -45,7 +49,8 @@ func NewCDNClient(maxConns int) *CDNClient {
 				DisableCompression: true,
 			},
 		},
-		sem: make(chan struct{}, maxConns),
+		sem:     make(chan struct{}, maxConns),
+		metrics: m,
 	}
 }
 
@@ -63,6 +68,12 @@ func (c *CDNClient) FetchRange(ctx context.Context, rawURL string, start, end in
 	c.sem <- struct{}{}
 	defer func() { <-c.sem }()
 
+	if c.metrics != nil {
+		c.metrics.CDNRequestCount.Add(1)
+	}
+
+	slog.Debug("cdn fetch range request", "url", rawURL, "start", start, "end", end)
+
 	currentURL := rawURL
 	for redirects := 0; redirects < maxRedirects; redirects++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodGet, currentURL, nil)
@@ -74,7 +85,12 @@ func (c *CDNClient) FetchRange(ctx context.Context, rawURL string, start, end in
 
 		resp, err := c.client.Do(req)
 		if err != nil {
+			slog.Warn("cdn request error", "url", currentURL, "err", err)
 			return nil, fmt.Errorf("cdn request: %w", err)
+		}
+
+		if c.metrics != nil {
+			c.metrics.IncCDNStatusCode(resp.StatusCode)
 		}
 
 		// Handle redirects by following the Location header manually.
@@ -103,19 +119,25 @@ func (c *CDNClient) FetchRange(ctx context.Context, rawURL string, start, end in
 			// expected
 		case http.StatusOK:
 			if start != 0 {
+				slog.Warn("cdn returned 200 for non-zero offset", "url", currentURL, "start", start)
 				return nil, fmt.Errorf("server returned 200 OK for non-zero offset %d", start)
 			}
 		default:
+			slog.Warn("cdn returned unexpected status", "url", currentURL, "status", resp.StatusCode)
 			return nil, fmt.Errorf("cdn returned status %d", resp.StatusCode)
 		}
 
 		body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
 		if err != nil {
+			slog.Warn("cdn read error", "url", currentURL, "err", err)
 			return nil, fmt.Errorf("read cdn response: %w", err)
 		}
 		if len(body) >= int(maxResponseSize) {
+			slog.Warn("cdn response too large", "url", currentURL, "size", len(body))
 			return nil, fmt.Errorf("cdn response too large (exceeded %d bytes)", maxResponseSize)
 		}
+
+		slog.Debug("cdn fetch range response", "url", currentURL, "status", resp.StatusCode, "bodySize", len(body))
 		return body, nil
 	}
 

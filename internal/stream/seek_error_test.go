@@ -181,7 +181,7 @@ func TestSeek_BackendTimeout(t *testing.T) {
 	defer server.Close()
 
 	rc := cache.NewRangeCache(256 << 20, nil)
-	cdn := NewCDNClient(8)
+	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	})
@@ -204,7 +204,7 @@ func TestSeek_InvalidRangeResponse(t *testing.T) {
 	defer server.Close()
 
 	rc := cache.NewRangeCache(256 << 20, nil)
-	cdn := NewCDNClient(8)
+	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	})
@@ -247,7 +247,7 @@ func TestSeek_TemporaryBackendError(t *testing.T) {
 	defer server.Close()
 
 	rc := cache.NewRangeCache(256 << 20, nil)
-	cdn := NewCDNClient(8)
+	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	})
@@ -300,7 +300,7 @@ func TestSeek_StateUsableAfterError(t *testing.T) {
 	defer server.Close()
 
 	rc := cache.NewRangeCache(256 << 20, nil)
-	cdn := NewCDNClient(8)
+	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	})

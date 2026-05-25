@@ -24,7 +24,7 @@ func newMockCDNServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 // is already in the RangeCache without touching the CDN.
 func TestReadAt_CacheHit(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
-	sr := NewStreamReader(rc, NewCDNClient(4), 2, 4<<20, func(fileKey string) string {
+	sr := NewStreamReader(rc, NewCDNClient(4, nil), 2, 4<<20, func(fileKey string) string {
 		t.Fatal("permalinkFor should not be called on cache hit")
 		return ""
 	})
@@ -51,7 +51,7 @@ func TestReadAt_CacheHit(t *testing.T) {
 // the result is returned to the caller and stored in the cache.
 func TestReadAt_CacheMissFetchesFromCDN(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
-	cdn := NewCDNClient(4)
+	cdn := NewCDNClient(4, nil)
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	})
@@ -114,7 +114,7 @@ func TestReadAt_CacheMissFetchesFromCDN(t *testing.T) {
 // creating separate CDN requests.
 func TestReadAt_MultipleReadersJoinInflightWindow(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
-	cdn := NewCDNClient(4)
+	cdn := NewCDNClient(4, nil)
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	})
@@ -193,7 +193,7 @@ func TestReadAt_MultipleReadersJoinInflightWindow(t *testing.T) {
 // assert requestCount == 1 (currently allows <=2).
 func TestReadAt_TwoReadersOneFetch(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
-	cdn := NewCDNClient(4)
+	cdn := NewCDNClient(4, nil)
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	})
@@ -249,7 +249,7 @@ func TestReadAt_TwoReadersOneFetch(t *testing.T) {
 // Both should succeed without a second CDN request.
 func TestReadAt_SubrangeJoinsInflight(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
-	cdn := NewCDNClient(4)
+	cdn := NewCDNClient(4, nil)
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	})
@@ -319,7 +319,7 @@ func TestReadAt_SubrangeJoinsInflight(t *testing.T) {
 // inflight map has no entry for the key.
 func TestReadAt_InflightCleanedAfterSuccess(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
-	cdn := NewCDNClient(4)
+	cdn := NewCDNClient(4, nil)
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	})
@@ -361,7 +361,7 @@ func TestReadAt_InflightCleanedAfterSuccess(t *testing.T) {
 // entry is removed and subsequent reads can retry (not stuck on a failed entry).
 func TestReadAt_InflightCleanedAfterError(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
-	cdn := NewCDNClient(4)
+	cdn := NewCDNClient(4, nil)
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	})
@@ -412,7 +412,7 @@ func TestReadAt_InflightCleanedAfterError(t *testing.T) {
 // verify inflight entry is removed and subsequent reads can retry.
 func TestReadAt_InflightCleanedAfterCancel(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
-	cdn := NewCDNClient(4)
+	cdn := NewCDNClient(4, nil)
 
 	var callCount atomic.Int32
 
@@ -464,7 +464,7 @@ func TestReadAt_InflightCleanedAfterCancel(t *testing.T) {
 // (increment sessionID), call EvictStale, verify old session blocks are gone.
 func TestReadAt_SeekEvictsStaleSession(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
-	cdn := NewCDNClient(4)
+	cdn := NewCDNClient(4, nil)
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	})
@@ -506,7 +506,7 @@ func TestReadAt_SeekEvictsStaleSession(t *testing.T) {
 // before the done channel closes (early-return via readyTo).
 func TestReadAt_EarlyReturnFromInflight(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
-	cdn := NewCDNClient(4)
+	cdn := NewCDNClient(4, nil)
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	})
@@ -546,7 +546,7 @@ func TestReadAt_EarlyReturnFromInflight(t *testing.T) {
 // verify reader handles it correctly.
 func TestReadAt_ShortReadNearEOF(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
-	cdn := NewCDNClient(4)
+	cdn := NewCDNClient(4, nil)
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	})
@@ -595,7 +595,7 @@ func TestReadAt_ShortReadNearEOF(t *testing.T) {
 // various offsets within known data, verify each byte matches.
 func TestReadAt_ExactByteCorrectness(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
-	cdn := NewCDNClient(4)
+	cdn := NewCDNClient(4, nil)
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	})
@@ -663,7 +663,7 @@ func TestReadAt_ExactByteCorrectness(t *testing.T) {
 // windowStart+1, windowEnd-1, windowEnd, windowEnd+1.
 func TestReadAt_OffByOneAtBoundaries(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
-	cdn := NewCDNClient(4)
+	cdn := NewCDNClient(4, nil)
 	// Use a small window size for easier boundary testing
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey

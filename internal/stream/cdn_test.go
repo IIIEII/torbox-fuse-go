@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/iiieii/torbox-fuse-go/internal/metrics"
 )
 
 func TestFetchRange_206PartialContent(t *testing.T) {
@@ -43,7 +45,7 @@ func TestFetchRange_206PartialContent(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	cdn := NewCDNClient(4)
+	cdn := NewCDNClient(4, nil)
 	data, err := cdn.FetchRange(context.Background(), ts.URL, 100, 199)
 	if err != nil {
 		t.Fatalf("FetchRange returned error: %v", err)
@@ -77,7 +79,7 @@ func TestFetchRange_200OK_ZeroOffset(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	cdn := NewCDNClient(4)
+	cdn := NewCDNClient(4, nil)
 	data, err := cdn.FetchRange(context.Background(), ts.URL, 0, int64(len(body)-1))
 	if err != nil {
 		t.Fatalf("FetchRange returned error: %v", err)
@@ -95,7 +97,7 @@ func TestFetchRange_200OK_NonZeroOffset(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	cdn := NewCDNClient(4)
+	cdn := NewCDNClient(4, nil)
 	_, err := cdn.FetchRange(context.Background(), ts.URL, 100, 199)
 	if err == nil {
 		t.Fatal("expected error for 200 OK at non-zero offset, got nil")
@@ -127,7 +129,7 @@ func TestFetchRange_ConcurrencyLimit(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	cdn := NewCDNClient(maxConns)
+	cdn := NewCDNClient(maxConns, nil)
 
 	const totalReqs = 6
 	errCh := make(chan error, totalReqs)
@@ -183,7 +185,7 @@ func TestFetchRange_FollowsRedirect(t *testing.T) {
 	}))
 	defer redirect.Close()
 
-	client := NewCDNClient(4)
+	client := NewCDNClient(4, nil)
 	result, err := client.FetchRange(context.Background(), redirect.URL, 0, 99)
 	if err != nil {
 		t.Fatalf("FetchRange after redirect: %v", err)
@@ -207,10 +209,85 @@ func TestFetchRange_TooManyRedirects(t *testing.T) {
 	}))
 	defer redirect.Close()
 
-	client := NewCDNClient(4)
+	client := NewCDNClient(4, nil)
 	_, err := client.FetchRange(context.Background(), redirect.URL, 0, 99)
 	if err == nil {
 		t.Fatal("expected error for redirect loop, got nil")
+	}
+}
+
+func TestFetchRange_IncrementsCDNRequestCount(t *testing.T) {
+	m := &metrics.Metrics{}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-0/*")
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write([]byte{0x00})
+	}))
+	defer ts.Close()
+
+	cdn := NewCDNClient(4, m)
+
+	_, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0)
+	if err != nil {
+		t.Fatalf("FetchRange returned error: %v", err)
+	}
+
+	if got := m.CDNRequestCount.Load(); got != 1 {
+		t.Errorf("CDNRequestCount = %d, want 1", got)
+	}
+
+	// Second call should increment to 2.
+	_, err = cdn.FetchRange(context.Background(), ts.URL, 0, 0)
+	if err != nil {
+		t.Fatalf("second FetchRange returned error: %v", err)
+	}
+
+	if got := m.CDNRequestCount.Load(); got != 2 {
+		t.Errorf("CDNRequestCount = %d after second call, want 2", got)
+	}
+}
+
+func TestFetchRange_IncCDNStatusCode(t *testing.T) {
+	m := &metrics.Metrics{}
+
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-0/*")
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write([]byte{0x00})
+	}))
+	defer ts.Close()
+
+	cdn := NewCDNClient(4, m)
+
+	_, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0)
+	if err != nil {
+		t.Fatalf("FetchRange returned error: %v", err)
+	}
+
+	// Verify the 206 status code was recorded.
+	counter, ok := m.CDNStatusCodes.Load(206)
+	if !ok {
+		t.Fatal("no CDNStatusCodes entry for 206")
+	}
+	if counter.(*atomic.Int64).Load() != 1 {
+		t.Errorf("CDNStatusCodes[206] = %d, want 1", counter.(*atomic.Int64).Load())
+	}
+}
+
+func TestFetchRange_NilMetricsNoPanic(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-0/*")
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write([]byte{0x00})
+	}))
+	defer ts.Close()
+
+	cdn := NewCDNClient(4, nil)
+
+	_, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0)
+	if err != nil {
+		t.Fatalf("FetchRange with nil metrics returned error: %v", err)
 	}
 }
 

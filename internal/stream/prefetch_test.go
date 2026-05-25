@@ -53,7 +53,7 @@ func TestPrefetch_SkippedWhenAlreadyCached(t *testing.T) {
 	defer server.Close()
 
 	rc := cache.NewRangeCache(256 << 20, nil)
-	cdn := NewCDNClient(8)
+	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	})
@@ -108,7 +108,7 @@ func TestPrefetch_SkippedWhenAlreadyInflight(t *testing.T) {
 	defer server.Close()
 
 	rc := cache.NewRangeCache(256 << 20, nil)
-	cdn := NewCDNClient(8)
+	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	})
@@ -165,7 +165,7 @@ func TestPrefetch_SuppressionNoDuplicateFetches(t *testing.T) {
 	defer server.Close()
 
 	rc := cache.NewRangeCache(256 << 20, nil)
-	cdn := NewCDNClient(8)
+	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	})
@@ -217,7 +217,7 @@ func TestPrefetch_PerFileInflightLimit(t *testing.T) {
 	defer server.Close()
 
 	rc := cache.NewRangeCache(256 << 20, nil)
-	cdn := NewCDNClient(8)
+	cdn := NewCDNClient(8, nil)
 	// maxInflight=1 means at most 1 inflight window per file
 	sr := NewStreamReader(rc, cdn, 1, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
@@ -267,7 +267,7 @@ func TestPrefetch_SkippedAfterFarSeek(t *testing.T) {
 	defer server.Close()
 
 	rc := cache.NewRangeCache(256 << 20, nil)
-	cdn := NewCDNClient(8)
+	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	})

@@ -160,7 +160,7 @@ func mountFUSEForMKV(t *testing.T, mkvPath string) (string, func()) {
 	}
 
 	rc := cache.NewRangeCache(256 * 1024 * 1024, nil)
-	cdnClient := stream.NewCDNClient(8)
+	cdnClient := stream.NewCDNClient(8, nil)
 	permalinkBuilder := func(fileKey string) string {
 		return cdnServer.URL
 	}

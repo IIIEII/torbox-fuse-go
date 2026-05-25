@@ -51,7 +51,7 @@ func newStreamReaderWithMock(t *testing.T, testData []byte) (*StreamReader, *htt
 	}))
 
 	rc := cache.NewRangeCache(256 << 20, nil)
-	cdn := NewCDNClient(8)
+	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	})
@@ -308,7 +308,7 @@ func TestIntegration_ConcurrentReadersDifferentFiles(t *testing.T) {
 	defer server.Close()
 
 	rc := cache.NewRangeCache(256 << 20, nil)
-	cdn := NewCDNClient(8)
+	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	})
@@ -378,7 +378,7 @@ func TestIntegration_BackendFailureRecovery(t *testing.T) {
 	defer server.Close()
 
 	rc := cache.NewRangeCache(256 << 20, nil)
-	cdn := NewCDNClient(8)
+	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	})

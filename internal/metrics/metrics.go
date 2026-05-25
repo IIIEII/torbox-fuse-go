@@ -26,6 +26,7 @@ type Metrics struct {
 	CancelledStreamCount atomic.Int64
 	APICallCount         atomic.Int64
 	RefreshCount         atomic.Int64
+	CDNRequestCount      atomic.Int64
 	CDNStatusCodes       sync.Map // map[int]*atomic.Int64
 }
 
@@ -56,6 +57,7 @@ func (m *Metrics) WritePrometheus(w io.Writer) {
 	writeCounter(w, "torbox_cancelled_stream_count_total", m.CancelledStreamCount.Load())
 	writeCounter(w, "torbox_api_call_count_total", m.APICallCount.Load())
 	writeCounter(w, "torbox_refresh_count_total", m.RefreshCount.Load())
+	writeCounter(w, "torbox_cdn_request_count_total", m.CDNRequestCount.Load())
 	writeGauge(w, "torbox_goroutine_count", int64(runtime.NumGoroutine()))
 
 	m.CDNStatusCodes.Range(func(key, value interface{}) bool {
