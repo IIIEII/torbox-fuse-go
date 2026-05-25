@@ -2,11 +2,9 @@ package metrics
 
 import (
 	"context"
-	"encoding/json"
 	"log/slog"
 	"net"
 	"net/http"
-	"runtime"
 )
 
 // Server exposes operational metrics and control endpoints over HTTP.
@@ -98,20 +96,16 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	return s.httpServer.Shutdown(ctx)
 }
 
-// handleMetrics returns a JSON snapshot of all metric counters.
+// handleMetrics returns all metric counters in Prometheus exposition format.
 func (s *Server) handleMetrics(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	snapshot := s.metrics.Snapshot()
-	snapshot["goroutine_count"] = int64(runtime.NumGoroutine())
+	w.Header().Set("Content-Type", "text/plain; version=0.0.4; charset=utf-8")
 
-	w.Header().Set("Content-Type", "application/json")
-	if err := json.NewEncoder(w).Encode(snapshot); err != nil {
-		slog.Error("encode metrics snapshot", "err", err)
-	}
+	s.metrics.WritePrometheus(w)
 }
 
 // handleHealthz returns a simple health check.

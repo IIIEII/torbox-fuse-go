@@ -3,6 +3,8 @@
 package metrics
 
 import (
+	"fmt"
+	"io"
 	"runtime"
 	"sync"
 	"sync/atomic"
@@ -47,45 +49,42 @@ func (m *Metrics) IncCDNStatusCode(code int) {
 	}
 }
 
-// Snapshot returns a JSON-serializable map of all current metric values,
-// including GoroutineCount from runtime.NumGoroutine().
-func (m *Metrics) Snapshot() map[string]interface{} {
-	snapshot := map[string]interface{}{
-		"catalog_items":          m.CatalogItems.Load(),
-		"cache_bytes_total":      m.CacheBytesTotal.Load(),
-		"cache_bytes_active":     m.CacheBytesActive.Load(),
-		"cache_bytes_stale":      m.CacheBytesStale.Load(),
-		"cache_entries":          m.CacheEntries.Load(),
-		"inflight_windows":       m.InflightWindows.Load(),
-		"read_count":             m.ReadCount.Load(),
-		"cache_hit_count":        m.CacheHitCount.Load(),
-		"stream_miss_count":      m.StreamMissCount.Load(),
-		"stream_join_count":      m.StreamJoinCount.Load(),
-		"cancelled_stream_count": m.CancelledStreamCount.Load(),
-		"api_call_count":         m.APICallCount.Load(),
-		"refresh_count":          m.RefreshCount.Load(),
-		"goroutine_count":       int64(runtime.NumGoroutine()),
-	}
+// WritePrometheus writes all metric values in Prometheus exposition text format
+// to w. Labels are not used — each metric is a simple untyped gauge or counter.
+func (m *Metrics) WritePrometheus(w io.Writer) {
+	writeCounter(w, "torbox_catalog_items", m.CatalogItems.Load())
+	writeCounter(w, "torbox_cache_bytes_total", m.CacheBytesTotal.Load())
+	writeGauge(w, "torbox_cache_bytes_active", m.CacheBytesActive.Load())
+	writeGauge(w, "torbox_cache_bytes_stale", m.CacheBytesStale.Load())
+	writeCounter(w, "torbox_cache_entries", m.CacheEntries.Load())
+	writeGauge(w, "torbox_inflight_windows", m.InflightWindows.Load())
+	writeCounter(w, "torbox_read_count_total", m.ReadCount.Load())
+	writeCounter(w, "torbox_cache_hit_count_total", m.CacheHitCount.Load())
+	writeCounter(w, "torbox_stream_miss_count_total", m.StreamMissCount.Load())
+	writeCounter(w, "torbox_stream_join_count_total", m.StreamJoinCount.Load())
+	writeCounter(w, "torbox_cancelled_stream_count_total", m.CancelledStreamCount.Load())
+	writeCounter(w, "torbox_api_call_count_total", m.APICallCount.Load())
+	writeCounter(w, "torbox_refresh_count_total", m.RefreshCount.Load())
+	writeGauge(w, "torbox_goroutine_count", int64(runtime.NumGoroutine()))
 
-	// Collect CDN status code counts.
-	cdnCodes := make(map[string]int64)
 	m.CDNStatusCodes.Range(func(key, value interface{}) bool {
 		code := key.(int)
 		counter := value.(*atomic.Int64)
-		cdnCodes[statusCodeFieldName(code)] = counter.Load()
+		fmt.Fprintf(w, "torbox_cdn_response_count_total{code=%q} %d\n", statusCodeLabel(code), counter.Load())
 		return true
 	})
-	if len(cdnCodes) > 0 {
-		snapshot["cdn_status_codes"] = cdnCodes
-	}
-
-	return snapshot
 }
 
-// statusCodeFieldName converts an HTTP status code to a field name like
-// "cdn_200", "cdn_403", etc.
-func statusCodeFieldName(code int) string {
-	return "cdn_" + intToStr(code)
+func writeCounter(w io.Writer, name string, value int64) {
+	fmt.Fprintf(w, "# TYPE %s counter\n%s %d\n", name, name, value)
+}
+
+func writeGauge(w io.Writer, name string, value int64) {
+	fmt.Fprintf(w, "# TYPE %s gauge\n%s %d\n", name, name, value)
+}
+
+func statusCodeLabel(code int) string {
+	return intToStr(code)
 }
 
 func intToStr(n int) string {
