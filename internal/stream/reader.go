@@ -104,6 +104,12 @@ func (sr *StreamReader) ReadAt(ctx context.Context, fileKey string, off int64, p
 		sr.metrics.ReadCount.Add(1)
 	}
 
+	// Check for seek cancellation once at the start — not inside the loop.
+	// This avoids triggering panicky cancellation when ReadAt loops across
+	// window boundaries or when multiple FUSE reads access different regions
+	// of the same file concurrently (e.g. Plex reading header + EOF probe).
+	sr.maybeCancelOnSeek(fileKey, off)
+
 	var totalN int
 	curOff := off
 	rem := p
@@ -158,9 +164,6 @@ func (sr *StreamReader) readWindow(ctx context.Context, fileKey string, off int6
 	// Determine which window this read falls in.
 	ws := windowStart(off)
 
-	// Check for seek cancellation — if the read is far from inflight windows.
-	sr.maybeCancelOnSeek(fileKey, off)
-
 	// Get or create the file session.
 	sess := sr.getOrCreateSession(fileKey)
 
@@ -194,12 +197,14 @@ func windowStart(off int64) int64 {
 }
 
 // maybeCancelOnSeek checks if this read represents a far seek (>16 MiB away
-// from any inflight window for the same file). If so, it increments the
-// session ID, cancels stale windows, and evicts stale cache data.
+// from ALL inflight windows for the same file). If so, it cancels inflight
+// windows that are far from the new read position to save bandwidth.
+// It does NOT evict cached data — other concurrent readers may still need it.
 func (sr *StreamReader) maybeCancelOnSeek(fileKey string, off int64) {
-	farSeek := false
+	farSeek := true
 
-	// Check distance from all inflight windows for this file.
+	// Check if this offset is close to ANY inflight window for this file.
+	// If it's near an existing window, this is not a seek — it's a parallel read.
 	sr.inflight.Range(func(key, value any) bool {
 		ik := key.(inflightKey)
 		if ik.fileKey != fileKey {
@@ -209,9 +214,9 @@ func (sr *StreamReader) maybeCancelOnSeek(fileKey string, off int64) {
 		if distance < 0 {
 			distance = -distance
 		}
-		if distance > seekThreshold {
-			farSeek = true
-			return false // stop iterating
+		if distance <= seekThreshold {
+			farSeek = false
+			return false // stop iterating — close window found
 		}
 		return true
 	})
@@ -224,7 +229,6 @@ func (sr *StreamReader) maybeCancelOnSeek(fileKey string, off int64) {
 		sr.metrics.CancelledStreamCount.Add(1)
 	}
 
-	// Increment session to invalidate stale windows.
 	sess := sr.getOrCreateSession(fileKey)
 	newID := sess.id.Add(1)
 	sess.lastSeek.Store(time.Now().UnixNano())
@@ -235,14 +239,19 @@ func (sr *StreamReader) maybeCancelOnSeek(fileKey string, off int64) {
 		"offset", off,
 	)
 
-	// Cancel stale inflight windows (session ID < newID).
+	// Cancel inflight windows far from the new read position.
+	// Only cancel windows whose start is > seekThreshold away from off.
 	sr.inflight.Range(func(key, value any) bool {
 		ik := key.(inflightKey)
 		if ik.fileKey != fileKey {
 			return true
 		}
 		win := value.(*inflightWindow)
-		if win.sessionID < newID {
+		distance := off - ik.start
+		if distance < 0 {
+			distance = -distance
+		}
+		if distance > seekThreshold && win.sessionID < newID {
 			win.cancelFunc()
 			if sr.metrics != nil {
 				sr.metrics.InflightWindows.Add(-1)
@@ -251,21 +260,8 @@ func (sr *StreamReader) maybeCancelOnSeek(fileKey string, off int64) {
 		return true
 	})
 
-	// Evict stale cache data.
-	sr.cache.EvictStale(fileKey, newID)
-
-	// Clean up session if no inflight windows remain for this file.
-	hasInflight := false
-	sr.inflight.Range(func(key, value any) bool {
-		if key.(inflightKey).fileKey == fileKey {
-			hasInflight = true
-			return false
-		}
-		return true
-	})
-	if !hasInflight {
-		sr.sessions.Delete(fileKey)
-	}
+	// Do NOT evict cached data — concurrent readers may still need it.
+	// Cache eviction is handled by the LRU budget mechanism.
 }
 
 // getOrCreateSession returns the file session for the given fileKey,
@@ -398,8 +394,9 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 	copy(win.buf, data)
 	win.readyTo.Store(win.total)
 
-	// Store in cache with session tag.
-	sr.cache.PutWithSession(fileKey, winStart, data, win.sessionID)
+	// Store in cache (no session tag — cache data is never evicted by seek cancellation,
+	// only by LRU budget eviction).
+	sr.cache.Put(fileKey, winStart, data)
 
 	// Remove from inflight map after a short delay to allow late joiners.
 	// The window data is already in the cache for future reads.
