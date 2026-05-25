@@ -135,21 +135,22 @@ func TestRetryOn429(t *testing.T) {
 }
 
 func TestPermalinkURL(t *testing.T) {
+	baseURL := "https://api.torbox.app/v1/api"
 	tests := []struct {
 		kind     catalog.DownloadKind
 		id       string
 		fileID   string
-		wantPath string
+		wantURL  string
 	}{
-		{catalog.KindTorrent, "100", "200", "/api/torrents/requestdl?token=testkey&torrent_id=100&file_id=200&redirect=true"},
-		{catalog.KindUsenet, "100", "200", "/api/usenet/requestdl?token=testkey&usenet_id=100&file_id=200&redirect=true"},
-		{catalog.KindWebDL, "100", "200", "/api/webdl/requestdl?token=testkey&web_id=100&file_id=200&redirect=true"},
+		{catalog.KindTorrent, "100", "200", "https://api.torbox.app/v1/api/torrents/requestdl?token=testkey&torrent_id=100&file_id=200&redirect=true"},
+		{catalog.KindUsenet, "100", "200", "https://api.torbox.app/v1/api/usenet/requestdl?token=testkey&usenet_id=100&file_id=200&redirect=true"},
+		{catalog.KindWebDL, "100", "200", "https://api.torbox.app/v1/api/webdl/requestdl?token=testkey&web_id=100&file_id=200&redirect=true"},
 	}
 	for _, tt := range tests {
-		got := PermalinkURL("testkey", tt.kind, tt.id, tt.fileID)
-		if got != tt.wantPath {
-			t.Errorf("PermalinkURL(%v, %q, %q, %q) = %q, want %q",
-				tt.kind, "testkey", tt.id, tt.fileID, got, tt.wantPath)
+		got := PermalinkURL(baseURL, "testkey", tt.kind, tt.id, tt.fileID)
+		if got != tt.wantURL {
+			t.Errorf("PermalinkURL(%q, %v, %q, %q, %q) = %q, want %q",
+				baseURL, tt.kind, "testkey", tt.id, tt.fileID, got, tt.wantURL)
 		}
 	}
 }

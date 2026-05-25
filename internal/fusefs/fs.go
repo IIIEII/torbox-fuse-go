@@ -131,6 +131,7 @@ func (r *RootNode) addFileNode(ctx context.Context, parent *fs.Inode, name, cata
 
 	// Build the permalink URL for this file using the TorBox client.
 	permalinkURL := torbox.PermalinkURL(
+		r.cfg.APIBaseURL,
 		r.cfg.APIKey,
 		f.DownloadKind,
 		f.DownloadID,
@@ -340,7 +341,7 @@ func PermalinkBuilderFromClient(cfg *config.Config, tbClient *torbox.Client) str
 	return func(fileKey string) string {
 		// fileKey is "kind:downloadID:fileID" — parse it.
 		kind, downloadID, fileID := parseContentKey(fileKey)
-		return torbox.PermalinkURL(cfg.APIKey, kind, downloadID, fileID)
+		return torbox.PermalinkURL(cfg.TorboxConfig().APIBaseURL(), cfg.APIKey, kind, downloadID, fileID)
 	}
 }
 

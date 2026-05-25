@@ -162,7 +162,7 @@ func extractTags(raw interface{}) []string {
 	}
 }
 
-func PermalinkURL(token string, kind catalog.DownloadKind, downloadID, fileID string) string {
+func PermalinkURL(baseURL, token string, kind catalog.DownloadKind, downloadID, fileID string) string {
 	idParam := "torrent_id"
 	apiPath := "torrents"
 	switch kind {
@@ -173,8 +173,8 @@ func PermalinkURL(token string, kind catalog.DownloadKind, downloadID, fileID st
 		idParam = "web_id"
 		apiPath = "webdl"
 	}
-	return fmt.Sprintf("/api/%s/requestdl?token=%s&%s=%s&file_id=%s&redirect=true",
-		apiPath, token, idParam, downloadID, fileID)
+	return fmt.Sprintf("%s/%s/requestdl?token=%s&%s=%s&file_id=%s&redirect=true",
+		baseURL, apiPath, token, idParam, downloadID, fileID)
 }
 
 func (c *Client) apiGet(ctx context.Context, path string, params map[string]string) ([]byte, error) {
