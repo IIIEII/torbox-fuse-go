@@ -46,7 +46,7 @@ func TestNonFunctional_NoGoroutineLeak(t *testing.T) {
 	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
-	})
+	}, nil)
 
 	runtime.GC()
 	runtime.GC()
@@ -110,7 +110,7 @@ func TestNonFunctional_CancelledOpsReleaseResources(t *testing.T) {
 	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
-	})
+	}, nil)
 
 	// Start reads with short timeouts — they should fail
 	for i := 0; i < 3; i++ {
@@ -224,7 +224,7 @@ func TestNonFunctional_ConcurrentRacePaths(t *testing.T) {
 	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
-	})
+	}, nil)
 
 	// Concurrent reads from different goroutines at different offsets
 	const numGoroutines = 20

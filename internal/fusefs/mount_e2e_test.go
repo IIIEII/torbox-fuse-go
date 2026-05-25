@@ -132,7 +132,7 @@ func TestMountE2E(t *testing.T) {
 	permalinkBuilder := func(fileKey string) string {
 		return cdnServer.URL
 	}
-	streamer := stream.NewStreamReader(rc, cdnClient, 2, int64(16*1024*1024), permalinkBuilder)
+	streamer := stream.NewStreamReader(rc, cdnClient, 2, int64(16*1024*1024), permalinkBuilder, nil)
 
 	// ── Config ────────────────────────────────────────────────────────
 	cfg := &config.Config{

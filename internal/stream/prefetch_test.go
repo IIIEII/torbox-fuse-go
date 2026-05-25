@@ -56,7 +56,7 @@ func TestPrefetch_SkippedWhenAlreadyCached(t *testing.T) {
 	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
-	})
+	}, nil)
 
 	// Pre-populate the next window in cache
 	nextWindowData := testData[4*1024*1024 : 8*1024*1024]
@@ -111,7 +111,7 @@ func TestPrefetch_SkippedWhenAlreadyInflight(t *testing.T) {
 	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
-	})
+	}, nil)
 
 	// Start a read at offset 4 MiB (second window) to create an inflight entry
 	go func() {
@@ -168,7 +168,7 @@ func TestPrefetch_SuppressionNoDuplicateFetches(t *testing.T) {
 	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
-	})
+	}, nil)
 
 	// Rapid sequential reads in the first window
 	for i := 0; i < 10; i++ {
@@ -221,7 +221,7 @@ func TestPrefetch_PerFileInflightLimit(t *testing.T) {
 	// maxInflight=1 means at most 1 inflight window per file
 	sr := NewStreamReader(rc, cdn, 1, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
-	})
+	}, nil)
 
 	// Read from offset 0 — creates 1 inflight window
 	buf := make([]byte, 4*1024*1024)
@@ -270,7 +270,7 @@ func TestPrefetch_SkippedAfterFarSeek(t *testing.T) {
 	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
-	})
+	}, nil)
 
 	// Read from offset 0
 	buf := make([]byte, 1024)

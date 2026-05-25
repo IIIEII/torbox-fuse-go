@@ -54,7 +54,7 @@ func newStreamReaderWithMock(t *testing.T, testData []byte) (*StreamReader, *htt
 	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
-	})
+	}, nil)
 
 	return sr, server, &requestCount
 }
@@ -311,7 +311,7 @@ func TestIntegration_ConcurrentReadersDifferentFiles(t *testing.T) {
 	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
-	})
+	}, nil)
 
 	type result struct {
 		fileKey string
@@ -381,7 +381,7 @@ func TestIntegration_BackendFailureRecovery(t *testing.T) {
 	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
-	})
+	}, nil)
 
 	// First read should fail (error window is removed after error, allowing retry)
 	buf := make([]byte, 1024)

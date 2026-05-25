@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/iiieii/torbox-fuse-go/internal/cache"
+	"github.com/iiieii/torbox-fuse-go/internal/metrics"
 )
 
 // newMockCDNServer creates an httptest.Server that delegates to handler.
@@ -27,7 +28,7 @@ func TestReadAt_CacheHit(t *testing.T) {
 	sr := NewStreamReader(rc, NewCDNClient(4, nil), 2, 4<<20, func(fileKey string) string {
 		t.Fatal("permalinkFor should not be called on cache hit")
 		return ""
-	})
+	}, nil)
 
 	// Pre-populate the cache with data at offset 0 for file "f1"
 	testData := []byte("hello world")
@@ -54,7 +55,7 @@ func TestReadAt_CacheMissFetchesFromCDN(t *testing.T) {
 	cdn := NewCDNClient(4, nil)
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
-	})
+	}, nil)
 
 	// Start a mock HTTP server that serves range requests
 	server := newMockCDNServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -117,7 +118,7 @@ func TestReadAt_MultipleReadersJoinInflightWindow(t *testing.T) {
 	cdn := NewCDNClient(4, nil)
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
-	})
+	}, nil)
 
 	var requestCount atomic.Int32
 
@@ -196,7 +197,7 @@ func TestReadAt_TwoReadersOneFetch(t *testing.T) {
 	cdn := NewCDNClient(4, nil)
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
-	})
+	}, nil)
 
 	var requestCount atomic.Int32
 
@@ -252,7 +253,7 @@ func TestReadAt_SubrangeJoinsInflight(t *testing.T) {
 	cdn := NewCDNClient(4, nil)
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
-	})
+	}, nil)
 
 	var requestCount atomic.Int32
 	readStarted := make(chan struct{})
@@ -322,7 +323,7 @@ func TestReadAt_InflightCleanedAfterSuccess(t *testing.T) {
 	cdn := NewCDNClient(4, nil)
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
-	})
+	}, nil)
 
 	server := newMockCDNServer(t, func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Range", "bytes 0-9/10")
@@ -364,7 +365,7 @@ func TestReadAt_InflightCleanedAfterError(t *testing.T) {
 	cdn := NewCDNClient(4, nil)
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
-	})
+	}, nil)
 
 	var callCount atomic.Int32
 
@@ -430,7 +431,7 @@ func TestReadAt_InflightCleanedAfterCancel(t *testing.T) {
 
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return server.URL + "/" + fileKey
-	})
+	}, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -467,7 +468,7 @@ func TestReadAt_SeekEvictsStaleSession(t *testing.T) {
 	cdn := NewCDNClient(4, nil)
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
-	})
+	}, nil)
 
 	// Pre-populate cache with session 1 data
 	rc.PutWithSession("f1", 0, []byte("session1_data"), 1)
@@ -509,7 +510,7 @@ func TestReadAt_EarlyReturnFromInflight(t *testing.T) {
 	cdn := NewCDNClient(4, nil)
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
-	})
+	}, nil)
 
 	// Create a slow server that writes data in chunks with delays.
 	// This allows us to verify early return — reader gets data before window completes.
@@ -549,7 +550,7 @@ func TestReadAt_ShortReadNearEOF(t *testing.T) {
 	cdn := NewCDNClient(4, nil)
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
-	})
+	}, nil)
 
 	// Server returns only 10 bytes (simulating a short file near EOF)
 	server := newMockCDNServer(t, func(w http.ResponseWriter, r *http.Request) {
@@ -598,7 +599,7 @@ func TestReadAt_ExactByteCorrectness(t *testing.T) {
 	cdn := NewCDNClient(4, nil)
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
-	})
+	}, nil)
 
 	// Generate known data: 256 bytes with predictable pattern
 	testData := make([]byte, 256)
@@ -667,7 +668,7 @@ func TestReadAt_OffByOneAtBoundaries(t *testing.T) {
 	// Use a small window size for easier boundary testing
 	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
-	})
+	}, nil)
 
 	// Generate data that spans multiple windows (12 MiB covers 3 windows)
 	testData := make([]byte, 12*1024*1024)
@@ -725,5 +726,68 @@ func TestReadAt_OffByOneAtBoundaries(t *testing.T) {
 		if buf[0] != expected {
 			t.Errorf("ReadAt(%s=%d): got 0x%02x, want 0x%02x", pos.name, pos.off, buf[0], expected)
 		}
+	}
+}
+// TestReadAt_MetricsReadCount verifies that ReadAt increments the correct
+// metrics counters for read count, cache hits, stream misses, and stream joins.
+func TestReadAt_MetricsReadCount(t *testing.T) {
+	m := metrics.New()
+	testData := make([]byte, windowSize)
+	for i := range testData {
+		testData[i] = byte(i % 256)
+	}
+
+	server := newMockCDNServer(t, func(w http.ResponseWriter, r *http.Request) {
+		rangeHdr := r.Header.Get("Range")
+		var start, end int64
+		fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end)
+		if start >= int64(len(testData)) {
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		if end >= int64(len(testData)) {
+			end = int64(len(testData) - 1)
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(testData)))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(testData[start : end+1])
+	})
+	defer server.Close()
+
+	rc := cache.NewRangeCache(8<<20, nil)
+	cdn := NewCDNClient(4, nil)
+	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+		return server.URL + "/" + fileKey
+	}, m)
+
+	buf := make([]byte, 100)
+	_, _ = sr.ReadAt(context.Background(), "file1", 0, buf, windowSize)
+
+	if m.ReadCount.Load() != 1 {
+		t.Errorf("ReadCount should be 1, got %d", m.ReadCount.Load())
+	}
+	if m.StreamMissCount.Load() != 1 {
+		t.Errorf("StreamMissCount should be 1, got %d", m.StreamMissCount.Load())
+	}
+
+	// Wait for the background goroutine to store data in the cache.
+	time.Sleep(200 * time.Millisecond)
+
+	// Second read should be a cache hit.
+	_, _ = sr.ReadAt(context.Background(), "file1", 0, buf, windowSize)
+	if m.CacheHitCount.Load() != 1 {
+		t.Errorf("CacheHitCount should be 1, got %d", m.CacheHitCount.Load())
+	}
+	if m.ReadCount.Load() != 2 {
+		t.Errorf("ReadCount should be 2, got %d", m.ReadCount.Load())
+	}
+
+	// Read at a different offset within the same window should also be a cache hit.
+	_, _ = sr.ReadAt(context.Background(), "file1", 50, buf, windowSize)
+	if m.ReadCount.Load() != 3 {
+		t.Errorf("ReadCount should be 3, got %d", m.ReadCount.Load())
+	}
+	if m.CacheHitCount.Load() != 2 {
+		t.Errorf("CacheHitCount should be 2, got %d", m.CacheHitCount.Load())
 	}
 }

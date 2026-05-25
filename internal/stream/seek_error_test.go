@@ -184,7 +184,7 @@ func TestSeek_BackendTimeout(t *testing.T) {
 	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
-	})
+	}, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
@@ -207,7 +207,7 @@ func TestSeek_InvalidRangeResponse(t *testing.T) {
 	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
-	})
+	}, nil)
 
 	buf := make([]byte, 10)
 	_, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(10))
@@ -250,7 +250,7 @@ func TestSeek_TemporaryBackendError(t *testing.T) {
 	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
-	})
+	}, nil)
 
 	// First read should fail
 	buf := make([]byte, 10)
@@ -303,7 +303,7 @@ func TestSeek_StateUsableAfterError(t *testing.T) {
 	cdn := NewCDNClient(8, nil)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
-	})
+	}, nil)
 
 	// First read fails
 	buf := make([]byte, 10)
