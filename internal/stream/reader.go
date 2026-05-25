@@ -21,8 +21,8 @@ const (
 	windowSize int64 = 4 * 1024 * 1024
 
 	// seekThreshold is the distance in bytes that triggers seek cancellation.
-	// A read more than 16 MiB away from any inflight window for the same file
-	// increments the session ID and cancels stale windows.
+	// A read more than 16 MiB away from all inflight windows for the same file
+	// cancels orphaned (waiters == 0) inflight windows.
 	seekThreshold int64 = 16 * 1024 * 1024
 
 	// readAheadThreshold is how far into the current window the read offset
@@ -63,7 +63,6 @@ type inflightKey struct {
 // the necessary memory ordering.
 type inflightWindow struct {
 	key        inflightKey
-	sessionID  int64
 	buf        []byte
 	readyTo    atomic.Int64
 	total      int64
@@ -71,11 +70,11 @@ type inflightWindow struct {
 	done       atomic.Bool
 	readyCond  *sync.Cond
 	cancelFunc context.CancelFunc
+	waiters    atomic.Int32
 }
 
-// fileSession tracks per-file session state for seek cancellation.
+// fileSession tracks per-file read-ahead state.
 type fileSession struct {
-	id       atomic.Int64
 	lastSeek atomic.Int64
 }
 
@@ -164,11 +163,11 @@ func (sr *StreamReader) readWindow(ctx context.Context, fileKey string, off int6
 	// Determine which window this read falls in.
 	ws := windowStart(off)
 
-	// Get or create the file session.
+	// Get or create the file session (for lastSeek tracking).
 	sess := sr.getOrCreateSession(fileKey)
 
 	// Find or create an inflight window.
-	win, created := sr.getOrCreateWindow(fileKey, ws, sess.id.Load())
+	win, created := sr.getOrCreateWindow(fileKey, ws)
 
 	if sr.metrics != nil {
 		if created {
@@ -178,8 +177,15 @@ func (sr *StreamReader) readWindow(ctx context.Context, fileKey string, off int6
 		}
 	}
 
+	// Register as a waiter so seek cancellation won't cancel this window
+	// while we're using it.
+	win.waiters.Add(1)
+
 	// Wait until the requested bytes are ready (early return).
 	n, err := sr.waitForBytes(ctx, win, off, p)
+
+	win.waiters.Add(-1)
+
 	if err != nil {
 		slog.Debug("stream read error", "fileKey", fileKey, "offset", off, "err", err)
 		return n, err
@@ -230,17 +236,16 @@ func (sr *StreamReader) maybeCancelOnSeek(fileKey string, off int64) {
 	}
 
 	sess := sr.getOrCreateSession(fileKey)
-	newID := sess.id.Add(1)
 	sess.lastSeek.Store(time.Now().UnixNano())
 
 	slog.Debug("seek cancellation",
 		"fileKey", fileKey,
-		"newSession", newID,
 		"offset", off,
 	)
 
-	// Cancel inflight windows far from the new read position.
-	// Only cancel windows whose start is > seekThreshold away from off.
+	// Cancel orphaned inflight windows far from the new read position.
+	// Only cancel windows with waiters == 0 — these have no active readers
+	// (e.g. read-ahead prefetch data that no one asked for).
 	sr.inflight.Range(func(key, value any) bool {
 		ik := key.(inflightKey)
 		if ik.fileKey != fileKey {
@@ -251,7 +256,7 @@ func (sr *StreamReader) maybeCancelOnSeek(fileKey string, off int64) {
 		if distance < 0 {
 			distance = -distance
 		}
-		if distance > seekThreshold && win.sessionID < newID {
+		if distance > seekThreshold && win.waiters.Load() == 0 {
 			win.cancelFunc()
 			if sr.metrics != nil {
 				sr.metrics.InflightWindows.Add(-1)
@@ -265,13 +270,13 @@ func (sr *StreamReader) maybeCancelOnSeek(fileKey string, off int64) {
 }
 
 // getOrCreateSession returns the file session for the given fileKey,
-// creating one if it doesn't exist.
+// creating one if it doesn't exist. The session tracks lastSeek for
+// read-ahead suppression.
 func (sr *StreamReader) getOrCreateSession(fileKey string) *fileSession {
 	if v, ok := sr.sessions.Load(fileKey); ok {
 		return v.(*fileSession)
 	}
 	sess := &fileSession{}
-	sess.id.Store(1) // start at 1 so 0 means "no session"
 	actual, _ := sr.sessions.LoadOrStore(fileKey, sess)
 	return actual.(*fileSession)
 }
@@ -279,7 +284,7 @@ func (sr *StreamReader) getOrCreateSession(fileKey string) *fileSession {
 // getOrCreateWindow finds an existing inflight window or creates a new one.
 // It returns the window and whether a new one was created (true) or an
 // existing one was found (false).
-func (sr *StreamReader) getOrCreateWindow(fileKey string, ws, sessionID int64) (*inflightWindow, bool) {
+func (sr *StreamReader) getOrCreateWindow(fileKey string, ws int64) (*inflightWindow, bool) {
 	ik := inflightKey{fileKey: fileKey, start: ws}
 
 	if v, ok := sr.inflight.Load(ik); ok {
@@ -300,7 +305,6 @@ func (sr *StreamReader) getOrCreateWindow(fileKey string, ws, sessionID int64) (
 	wctx, cancel := context.WithCancel(context.Background())
 	win := &inflightWindow{
 		key:        ik,
-		sessionID:  sessionID,
 		buf:        make([]byte, windowSize),
 		readyCond:  sync.NewCond(&sync.Mutex{}),
 		cancelFunc: cancel,
@@ -468,5 +472,5 @@ func (sr *StreamReader) maybeReadAhead(fileKey string, off, winStart int64, sess
 	}
 
 	// Create read-ahead window.
-	_, _ = sr.getOrCreateWindow(fileKey, nextStart, sess.id.Load())
+	_, _ = sr.getOrCreateWindow(fileKey, nextStart)
 }
