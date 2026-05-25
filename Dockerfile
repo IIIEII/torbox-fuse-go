@@ -1,5 +1,5 @@
 # ---- Builder ----
-FROM golang:1.22-alpine AS builder
+FROM golang:1.26-alpine AS builder
 
 RUN apk add --no-cache gcc musl-dev
 
@@ -12,7 +12,7 @@ COPY . .
 RUN CGO_ENABLED=1 go build -ldflags="-s -w" -o /torbox-media-center ./cmd/torbox-media-center
 
 # ---- Runtime ----
-FROM alpine:3.19
+FROM alpine:3.21
 
 RUN apk add --no-cache fuse3 ca-certificates
 
