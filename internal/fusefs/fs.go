@@ -287,8 +287,9 @@ func (f *FileNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.Attr
 
 // Open rejects non-readonly opens.
 func (f *FileNode) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
-	// Allow O_RDONLY (0) and read-only combinations.
+	slog.Debug("fuse open", "fileKey", f.fileKey, "flags", flags)
 	if flags&syscall.O_ACCMODE != syscall.O_RDONLY {
+		slog.Warn("fuse open rejected: not read-only", "fileKey", f.fileKey, "flags", flags)
 		return nil, 0, syscall.EACCES
 	}
 	return nil, fuse.FOPEN_KEEP_CACHE, 0
@@ -300,8 +301,10 @@ func (f *FileNode) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, fu
 func (f *FileNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off int64) (fuse.ReadResult, syscall.Errno) {
 	n, err := f.streamer.ReadAt(ctx, f.fileKey, off, dest, int64(f.size))
 	if err != nil && err != io.EOF {
+		slog.Warn("fuse read error", "fileKey", f.fileKey, "offset", off, "reqSize", len(dest), "err", err)
 		return nil, syscall.EIO
 	}
+	slog.Debug("fuse read", "fileKey", f.fileKey, "offset", off, "reqSize", len(dest), "n", n, "eof", err == io.EOF)
 	return fuse.ReadResultData(dest[:n]), 0
 }
 
