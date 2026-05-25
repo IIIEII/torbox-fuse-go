@@ -36,7 +36,7 @@ func TestReadAt_CacheHit(t *testing.T) {
 
 	buf := make([]byte, len(testData))
 	n, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(len(testData)))
-	if err != nil {
+	if err != nil && err != io.EOF {
 		t.Fatalf("ReadAt: %v", err)
 	}
 	if n != len(testData) {
@@ -453,7 +453,7 @@ func TestReadAt_InflightCleanedAfterCancel(t *testing.T) {
 
 	buf2 := make([]byte, 10)
 	n, retryErr := sr.ReadAt(retryCtx, "f1", 0, buf2, 10)
-	if retryErr != nil {
+	if retryErr != nil && retryErr != io.EOF {
 		t.Fatalf("expected retry to succeed, got: %v", retryErr)
 	}
 	if n != 10 {
@@ -910,7 +910,7 @@ func TestReadAt_MetricsCancelledStreamCount(t *testing.T) {
 		for i := range data {
 			data[i] = byte((start + int64(i)) % 256)
 		}
-		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, 20*1024*1024))
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, 24*1024*1024))
 		w.WriteHeader(http.StatusPartialContent)
 		w.Write(data)
 	})
@@ -929,19 +929,94 @@ func TestReadAt_MetricsCancelledStreamCount(t *testing.T) {
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
-		sr.ReadAt(context.Background(), "file1", 0, buf, 20*1024*1024)
+		sr.ReadAt(context.Background(), "file1", 0, buf, 24*1024*1024)
 	}()
 
 	// Give the first read time to create the inflight window.
 	time.Sleep(100 * time.Millisecond)
 
 	// Seek far away (>16 MiB) to trigger seek cancellation.
-	sr.ReadAt(context.Background(), "file1", 20*1024*1024, buf, 20*1024*1024)
+	// fileSize must be larger than the read offset so the read actually happens.
+	sr.ReadAt(context.Background(), "file1", 20*1024*1024, buf, 24*1024*1024)
 
 	// Wait for the first read to complete (it was cancelled and will get an error or succeed).
 	wg.Wait()
 
 	if m.CancelledStreamCount.Load() < 1 {
 		t.Errorf("CancelledStreamCount should be >= 1, got %d", m.CancelledStreamCount.Load())
+	}
+}
+
+// TestReadAt_CrossWindowBoundary verifies that a read spanning a 4 MiB window
+// boundary returns the full requested number of bytes rather than a short read.
+// A short read at a window boundary would cause FUSE to treat it as EOF.
+func TestReadAt_CrossWindowBoundary(t *testing.T) {
+	rc := cache.NewRangeCache(16<<20, nil)
+	cdn := NewCDNClient(4, nil)
+
+	// Create test data that spans 3 windows (12 MiB).
+	testData := make([]byte, 3*int(windowSize))
+	for i := range testData {
+		testData[i] = byte(i % 256)
+	}
+
+	server := newMockCDNServer(t, func(w http.ResponseWriter, r *http.Request) {
+		rangeHdr := r.Header.Get("Range")
+		var start, end int64
+		fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end)
+
+		if start >= int64(len(testData)) {
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		if end >= int64(len(testData)) {
+			end = int64(len(testData) - 1)
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(testData)))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(testData[start : end+1])
+	})
+	defer server.Close()
+
+	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+		return server.URL + "/" + fileKey
+	}, nil)
+
+	// Pre-populate the first window in the cache so we get a cache hit that
+	// returns a short read at the boundary.
+	// First, do a full read of the first window to fill the cache.
+	firstWindow := make([]byte, windowSize)
+	n, err := sr.ReadAt(context.Background(), "f1", 0, firstWindow, int64(len(testData)))
+	if err != nil && err != io.EOF {
+		t.Fatalf("filling first window: %v", err)
+	}
+	if n != int(windowSize) {
+		t.Fatalf("first window: got %d bytes, want %d", n, windowSize)
+	}
+
+	// Now read 131072 bytes starting 16384 bytes before the window boundary.
+	// The cache hit for the first window will only return 16384 bytes (the
+	// remainder of the window). The loop in ReadAt must then fetch the next
+	// window and fill the rest of the buffer.
+	off := windowSize - 16384 // 4 MiB - 16 KiB
+	buf := make([]byte, 131072) // 128 KiB request
+	n, err = sr.ReadAt(context.Background(), "f1", off, buf, int64(len(testData)))
+	if err != nil && err != io.EOF {
+		t.Fatalf("cross-window read: %v", err)
+	}
+	if n != 131072 {
+		t.Fatalf("cross-window read: got %d bytes, want 131072 (short reads at window boundaries cause FUSE EOF)", n)
+	}
+
+	// Verify byte-for-byte correctness at the boundary.
+	for i := 0; i < 16384; i++ {
+		if buf[i] != byte(int(off)+i%256) {
+			t.Fatalf("byte %d from window 1: got 0x%02x, want 0x%02x", i, buf[i], byte(int(off)+i%256))
+		}
+	}
+	for i := 16384; i < 131072; i++ {
+		if buf[i] != byte(int(off)+i%256) {
+			t.Fatalf("byte %d from window 2: got 0x%02x, want 0x%02x", i, buf[i], byte(int(off)+i%256))
+		}
 	}
 }

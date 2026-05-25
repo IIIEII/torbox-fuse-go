@@ -92,10 +92,9 @@ func NewStreamReader(rc *cache.RangeCache, cdn *CDNClient, maxInflight int, pref
 }
 
 // ReadAt reads len(p) bytes from offset off for the given fileKey.
-// It first checks the cache (zero-alloc hit via CopyTo). On miss, it finds or
-// creates an inflight window, waits for the requested bytes to be ready
-// (early return), and copies them into p.
-// Returns io.EOF when the read reaches or exceeds fileSize.
+// It loops across window boundaries to fill p completely, avoiding short reads
+// that FUSE interprets as EOF. Returns io.EOF only when the read reaches or
+// exceeds fileSize.
 func (sr *StreamReader) ReadAt(ctx context.Context, fileKey string, off int64, p []byte, fileSize int64) (int, error) {
 	if len(p) == 0 {
 		return 0, nil
@@ -105,6 +104,46 @@ func (sr *StreamReader) ReadAt(ctx context.Context, fileKey string, off int64, p
 		sr.metrics.ReadCount.Add(1)
 	}
 
+	var totalN int
+	curOff := off
+	rem := p
+
+	for len(rem) > 0 {
+		// Don't read past the file end.
+		if curOff >= fileSize {
+			return totalN, io.EOF
+		}
+
+		// Clamp the read size to the file size to avoid requesting bytes past EOF.
+		maxRead := int(fileSize - curOff)
+		if len(rem) > maxRead {
+			rem = rem[:maxRead]
+		}
+
+		n, err := sr.readWindow(ctx, fileKey, curOff, rem)
+		totalN += n
+		if err != nil {
+			return totalN, err
+		}
+		if n == 0 {
+			// No progress — shouldn't happen, but bail to avoid infinite loop.
+			break
+		}
+		curOff += int64(n)
+		rem = rem[n:]
+	}
+
+	if curOff >= fileSize {
+		return totalN, io.EOF
+	}
+	return totalN, nil
+}
+
+// readWindow reads up to len(p) bytes from a single window at the given offset.
+// It may return fewer bytes than requested if the available data in the current
+// window is less than len(p). The caller (ReadAt) handles spanning multiple
+// windows.
+func (sr *StreamReader) readWindow(ctx context.Context, fileKey string, off int64, p []byte) (int, error) {
 	// Try cache first — zero-alloc hot path.
 	if n, ok := sr.cache.CopyTo(fileKey, off, p); ok {
 		slog.Debug("stream read cache hit", "fileKey", fileKey, "offset", off, "size", len(p), "n", n)
@@ -146,10 +185,6 @@ func (sr *StreamReader) ReadAt(ctx context.Context, fileKey string, off int64, p
 	// Trigger read-ahead if conditions are met.
 	sr.maybeReadAhead(fileKey, off, ws, sess)
 
-	// Return EOF if we've reached the end of the file.
-	if off+int64(n) >= fileSize {
-		return n, io.EOF
-	}
 	return n, nil
 }
 
