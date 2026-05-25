@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/iiieii/torbox-fuse-go/internal/cache"
+	"github.com/iiieii/torbox-fuse-go/internal/metrics"
 )
 
 const (
@@ -44,6 +45,7 @@ type StreamReader struct {
 	maxInflight   int
 	prefetchBytes int64
 	permalinkFor  PermalinkBuilder
+	metrics       *metrics.Metrics
 }
 
 // inflightKey identifies an inflight window by file key and window start offset.
@@ -78,13 +80,14 @@ type fileSession struct {
 }
 
 // NewStreamReader creates a StreamReader with the given dependencies.
-func NewStreamReader(rc *cache.RangeCache, cdn *CDNClient, maxInflight int, prefetchBytes int64, permalinkFor PermalinkBuilder) *StreamReader {
+func NewStreamReader(rc *cache.RangeCache, cdn *CDNClient, maxInflight int, prefetchBytes int64, permalinkFor PermalinkBuilder, m *metrics.Metrics) *StreamReader {
 	return &StreamReader{
 		cache:         rc,
 		cdn:           cdn,
 		maxInflight:   maxInflight,
 		prefetchBytes: prefetchBytes,
 		permalinkFor:  permalinkFor,
+		metrics:       m,
 	}
 }
 
@@ -98,10 +101,20 @@ func (sr *StreamReader) ReadAt(ctx context.Context, fileKey string, off int64, p
 		return 0, nil
 	}
 
+	if sr.metrics != nil {
+		sr.metrics.ReadCount.Add(1)
+	}
+
 	// Try cache first — zero-alloc hot path.
 	if n, ok := sr.cache.CopyTo(fileKey, off, p); ok {
+		slog.Debug("stream read cache hit", "fileKey", fileKey, "offset", off, "size", len(p), "n", n)
+		if sr.metrics != nil {
+			sr.metrics.CacheHitCount.Add(1)
+		}
 		return n, nil
 	}
+
+	slog.Debug("stream read cache miss", "fileKey", fileKey, "offset", off, "size", len(p))
 
 	// Determine which window this read falls in.
 	ws := windowStart(off)
@@ -113,11 +126,20 @@ func (sr *StreamReader) ReadAt(ctx context.Context, fileKey string, off int64, p
 	sess := sr.getOrCreateSession(fileKey)
 
 	// Find or create an inflight window.
-	win := sr.getOrCreateWindow(fileKey, ws, sess.id.Load())
+	win, created := sr.getOrCreateWindow(fileKey, ws, sess.id.Load())
+
+	if sr.metrics != nil {
+		if created {
+			sr.metrics.StreamMissCount.Add(1)
+		} else {
+			sr.metrics.StreamJoinCount.Add(1)
+		}
+	}
 
 	// Wait until the requested bytes are ready (early return).
 	n, err := sr.waitForBytes(ctx, win, off, p)
 	if err != nil {
+		slog.Debug("stream read error", "fileKey", fileKey, "offset", off, "err", err)
 		return n, err
 	}
 
@@ -217,20 +239,22 @@ func (sr *StreamReader) getOrCreateSession(fileKey string) *fileSession {
 }
 
 // getOrCreateWindow finds an existing inflight window or creates a new one.
-func (sr *StreamReader) getOrCreateWindow(fileKey string, ws, sessionID int64) *inflightWindow {
+// It returns the window and whether a new one was created (true) or an
+// existing one was found (false).
+func (sr *StreamReader) getOrCreateWindow(fileKey string, ws, sessionID int64) (*inflightWindow, bool) {
 	ik := inflightKey{fileKey: fileKey, start: ws}
 
 	if v, ok := sr.inflight.Load(ik); ok {
 		win := v.(*inflightWindow)
 		if !win.done.Load() {
-			return win
+			return win, false
 		}
 		// Window completed with error — allow retry by removing it.
 		if win.err != nil {
 			sr.inflight.Delete(ik)
 			// fall through to create new window
 		} else {
-			return win
+			return win, false
 		}
 	}
 
@@ -248,13 +272,17 @@ func (sr *StreamReader) getOrCreateWindow(fileKey string, ws, sessionID int64) *
 	if loaded {
 		// Another goroutine created the window first.
 		cancel() // cancel our unused context
-		return actual.(*inflightWindow)
+		return actual.(*inflightWindow), false
 	}
 
 	// Start the CDN fetch in a goroutine.
 	go sr.fetchWindow(wctx, fileKey, ws, win)
 
-	return win
+	if sr.metrics != nil {
+		sr.metrics.InflightWindows.Add(1)
+	}
+
+	return win, true
 }
 
 // waitForBytes waits until the requested bytes are available in the window
@@ -313,11 +341,16 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 	url := sr.permalinkFor(fileKey)
 	winEnd := winStart + windowSize - 1
 
+	slog.Debug("fetching window", "fileKey", fileKey, "start", winStart, "end", winEnd, "url", url)
+
 	data, err := sr.cdn.FetchRange(ctx, url, winStart, winEnd)
 	if err != nil {
+		slog.Warn("fetch window error", "fileKey", fileKey, "start", winStart, "err", err)
 		win.err = err
 		return
 	}
+
+	slog.Debug("fetch window complete", "fileKey", fileKey, "start", winStart, "bytes", len(data))
 
 	win.total = int64(len(data))
 	copy(win.buf, data)
@@ -333,6 +366,9 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 		// Only delete if this window is still registered (not already replaced).
 		if v, ok := sr.inflight.Load(win.key); ok && v.(*inflightWindow) == win {
 			sr.inflight.Delete(win.key)
+			if sr.metrics != nil {
+				sr.metrics.InflightWindows.Add(-1)
+			}
 		}
 		// Clean up session if no inflight windows remain for this file.
 		hasInflight := false
@@ -393,5 +429,5 @@ func (sr *StreamReader) maybeReadAhead(fileKey string, off, winStart int64, sess
 	}
 
 	// Create read-ahead window.
-	sr.getOrCreateWindow(fileKey, nextStart, sess.id.Load())
+	_, _ = sr.getOrCreateWindow(fileKey, nextStart, sess.id.Load())
 }
