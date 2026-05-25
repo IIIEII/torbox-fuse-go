@@ -1,2 +1,28 @@
+# Build output
 /torbox-media-center
+
+# Environment
+.env
+.env.*
+
+# State database
+*.db
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Go
+vendor/
+
+# Internal docs (not for publication)
+docs/
+
+# Claude Code
 /.claude/
