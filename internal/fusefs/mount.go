@@ -58,7 +58,7 @@ func Mount(ctx context.Context, mountPath string, root *RootNode, cfg *config.Co
 
 	go func() {
 		<-ctx.Done()
-		server.Unmount()
+		_ = server.Unmount()
 	}()
 
 	server.Wait()

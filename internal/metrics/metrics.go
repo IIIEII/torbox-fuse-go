@@ -36,17 +36,8 @@ func New() *Metrics {
 
 // IncCDNStatusCode increments the counter for the given HTTP status code.
 func (m *Metrics) IncCDNStatusCode(code int) {
-	for {
-		v, loaded := m.CDNStatusCodes.LoadOrStore(code, new(atomic.Int64))
-		counter := v.(*atomic.Int64)
-		if loaded {
-			counter.Add(1)
-			return
-		}
-		// We just stored a new counter; increment from 0 to 1.
-		counter.Add(1)
-		return
-	}
+	counter, _ := m.CDNStatusCodes.LoadOrStore(code, new(atomic.Int64))
+	counter.(*atomic.Int64).Add(1)
 }
 
 // WritePrometheus writes all metric values in Prometheus exposition text format

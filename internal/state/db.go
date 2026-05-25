@@ -42,7 +42,7 @@ func Open(path string) (*DB, error) {
 	}
 
 	if err := conn.Ping(); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("state: ping db: %w", err)
 	}
 
@@ -67,7 +67,7 @@ func Open(path string) (*DB, error) {
 	}
 	for _, stmt := range ddl {
 		if _, err := conn.Exec(stmt); err != nil {
-			conn.Close()
+			_ = conn.Close()
 			return nil, fmt.Errorf("state: exec ddl: %w", err)
 		}
 	}
@@ -78,7 +78,7 @@ func Open(path string) (*DB, error) {
 	var maxInode sql.NullInt64
 	row := conn.QueryRow(`SELECT COALESCE(MAX(inode), 0) FROM inodes`)
 	if err := row.Scan(&maxInode); err != nil {
-		conn.Close()
+		_ = conn.Close()
 		return nil, fmt.Errorf("state: scan max inode: %w", err)
 	}
 	db.nextInode = uint64(maxInode.Int64) + 1
@@ -149,7 +149,7 @@ func (db *DB) UpsertFiles(files []FileRecord) error {
 	if err != nil {
 		return fmt.Errorf("state: begin tx: %w", err)
 	}
-	defer tx.Rollback()
+	defer func() { _ = tx.Rollback() }()
 
 	stmt, err := tx.Prepare(`
 		INSERT OR REPLACE INTO files
@@ -159,7 +159,7 @@ func (db *DB) UpsertFiles(files []FileRecord) error {
 	if err != nil {
 		return fmt.Errorf("state: prepare upsert: %w", err)
 	}
-	defer stmt.Close()
+	defer func() { _ = stmt.Close() }()
 
 	for _, f := range files {
 		if _, err := stmt.Exec(

@@ -278,16 +278,6 @@ func waitForMount(t *testing.T, ctx context.Context, mountDir string) error {
 	}
 }
 
-// containsString checks if a string slice contains the given value.
-func containsString(ss []string, s string) bool {
-	for _, v := range ss {
-		if v == s {
-			return true
-		}
-	}
-	return false
-}
-
 // dirEntryNames returns the names of catalog DirEntry slices for logging.
 func dirEntryNames(entries []catalog.DirEntry) []string {
 	names := make([]string, len(entries))

@@ -6,7 +6,6 @@ import (
 	"context"
 	"io"
 	"log/slog"
-	"sync"
 	"syscall"
 
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -29,7 +28,6 @@ import (
 type RootNode struct {
 	fs.Inode
 
-	mu       sync.RWMutex
 	tree     *catalog.Tree
 	stateDB  *state.DB
 	streamer *stream.StreamReader
@@ -154,10 +152,10 @@ func (r *RootNode) addFileNode(ctx context.Context, parent *fs.Inode, name, cata
 
 // Getattr returns root directory attributes.
 func (r *RootNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	out.Attr.Mode = syscall.S_IFDIR | 0755
-	out.Attr.Uid = r.cfg.UID
-	out.Attr.Gid = r.cfg.GID
-	out.Attr.Nlink = 2
+	out.Mode = syscall.S_IFDIR | 0755
+	out.Uid = r.cfg.UID
+	out.Gid = r.cfg.GID
+	out.Nlink = 2
 	return 0
 }
 
@@ -200,10 +198,10 @@ type DirNode struct {
 
 // Getattr returns directory attributes.
 func (d *DirNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	out.Attr.Mode = syscall.S_IFDIR | 0755
-	out.Attr.Uid = d.cfg.UID
-	out.Attr.Gid = d.cfg.GID
-	out.Attr.Nlink = 2
+	out.Mode = syscall.S_IFDIR | 0755
+	out.Uid = d.cfg.UID
+	out.Gid = d.cfg.GID
+	out.Nlink = 2
 	return 0
 }
 
@@ -277,13 +275,13 @@ type FileNode struct {
 
 // Getattr returns file attributes.
 func (f *FileNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.AttrOut) syscall.Errno {
-	out.Attr.Mode = syscall.S_IFREG | 0444
-	out.Attr.Size = f.size
-	out.Attr.Uid = f.cfg.UID
-	out.Attr.Gid = f.cfg.GID
-	out.Attr.Nlink = 1
-	out.Attr.Blksize = 4096
-	out.Attr.Blocks = (f.size + 4095) / 4096
+	out.Mode = syscall.S_IFREG | 0444
+	out.Size = f.size
+	out.Uid = f.cfg.UID
+	out.Gid = f.cfg.GID
+	out.Nlink = 1
+	out.Blksize = 4096
+	out.Blocks = (f.size + 4095) / 4096
 	return 0
 }
 

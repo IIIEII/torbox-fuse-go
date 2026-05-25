@@ -21,13 +21,12 @@ var seasonEpisodeRe = regexp.MustCompile(`(?i)\bS\d{1,2}E\d{1,2}\b|\bS\d{1,2}\b|
 func ClassifyMediaType(tags []string, filename string, fallback MediaType) MediaType {
 	// Step 1: check tags for type=movie, type=series, type=anime
 	for _, tag := range tags {
-		lower := strings.ToLower(tag)
-		switch {
-		case lower == "type=movie":
+		switch strings.ToLower(tag) {
+		case "type=movie":
 			return MediaMovie
-		case lower == "type=series":
+		case "type=series":
 			return MediaSeries
-		case lower == "type=anime":
+		case "type=anime":
 			return MediaSeries // anime goes into series classification
 		}
 	}
