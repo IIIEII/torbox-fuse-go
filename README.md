@@ -118,6 +118,10 @@ internal/
   torbox/     TorBox API client with retry and rate limiting
 ```
 
+## Monitoring
+
+The metrics server exposes Prometheus metrics at `/metrics`. A pre-built Grafana dashboard is available at [`grafana/torbox-fuse-go.json`](grafana/torbox-fuse-go.json) — import it into Grafana to monitor cache hit ratio, streaming activity, CDN response codes, and more.
+
 ## License
 
 [MIT](LICENSE)
