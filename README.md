@@ -48,7 +48,7 @@ Your files will appear at `/mnt/torbox`.
 ### From source
 
 ```bash
-go build -o torbox-media-center ./cmd/torbox-media-center
+make build
 export TORBOX_API_KEY="your-api-key"
 ./torbox-media-center
 ```
