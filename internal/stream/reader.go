@@ -185,6 +185,10 @@ func (sr *StreamReader) maybeCancelOnSeek(fileKey string, off int64) {
 		return
 	}
 
+	if sr.metrics != nil {
+		sr.metrics.CancelledStreamCount.Add(1)
+	}
+
 	// Increment session to invalidate stale windows.
 	sess := sr.getOrCreateSession(fileKey)
 	newID := sess.id.Add(1)
@@ -205,6 +209,9 @@ func (sr *StreamReader) maybeCancelOnSeek(fileKey string, off int64) {
 		win := value.(*inflightWindow)
 		if win.sessionID < newID {
 			win.cancelFunc()
+			if sr.metrics != nil {
+				sr.metrics.InflightWindows.Add(-1)
+			}
 		}
 		return true
 	})

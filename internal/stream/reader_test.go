@@ -791,3 +791,157 @@ func TestReadAt_MetricsReadCount(t *testing.T) {
 		t.Errorf("CacheHitCount should be 2, got %d", m.CacheHitCount.Load())
 	}
 }
+
+// TestReadAt_MetricsStreamJoinCount verifies that concurrent reads to the same
+// window increment StreamJoinCount instead of StreamMissCount.
+func TestReadAt_MetricsStreamJoinCount(t *testing.T) {
+	m := metrics.New()
+	testData := make([]byte, windowSize)
+	for i := range testData {
+		testData[i] = byte(i % 256)
+	}
+
+	var cdnCalls atomic.Int32
+	server := newMockCDNServer(t, func(w http.ResponseWriter, r *http.Request) {
+		cdnCalls.Add(1)
+		time.Sleep(50 * time.Millisecond) // slow response to allow joiners
+		rangeHdr := r.Header.Get("Range")
+		var start, end int64
+		fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(testData)))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(testData[start : end+1])
+	})
+	defer server.Close()
+
+	rc := cache.NewRangeCache(8<<20, nil)
+	cdn := NewCDNClient(4, nil)
+	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+		return server.URL + "/" + fileKey
+	}, m)
+
+	// First read triggers a cache miss (new inflight window).
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		buf := make([]byte, 100)
+		sr.ReadAt(context.Background(), "file1", 0, buf, windowSize)
+	}()
+	go func() {
+		defer wg.Done()
+		// Small delay so the first goroutine creates the window first.
+		time.Sleep(10 * time.Millisecond)
+		buf := make([]byte, 100)
+		sr.ReadAt(context.Background(), "file1", 0, buf, windowSize)
+	}()
+	wg.Wait()
+
+	// Expect exactly 1 CDN call (one window, two readers joined).
+	if got := cdnCalls.Load(); got != 1 {
+		t.Errorf("expected 1 CDN call, got %d", got)
+	}
+	// First read is a miss, second is a join.
+	if m.StreamMissCount.Load() != 1 {
+		t.Errorf("StreamMissCount should be 1, got %d", m.StreamMissCount.Load())
+	}
+	if m.StreamJoinCount.Load() != 1 {
+		t.Errorf("StreamJoinCount should be 1, got %d", m.StreamJoinCount.Load())
+	}
+}
+
+// TestReadAt_MetricsInflightWindows verifies that InflightWindows increments
+// when a window is created and decrements when the cleanup removes it.
+func TestReadAt_MetricsInflightWindows(t *testing.T) {
+	m := metrics.New()
+	testData := make([]byte, windowSize)
+	for i := range testData {
+		testData[i] = byte(i % 256)
+	}
+
+	server := newMockCDNServer(t, func(w http.ResponseWriter, r *http.Request) {
+		rangeHdr := r.Header.Get("Range")
+		var start, end int64
+		fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(testData)))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(testData[start : end+1])
+	})
+	defer server.Close()
+
+	rc := cache.NewRangeCache(8<<20, nil)
+	cdn := NewCDNClient(4, nil)
+	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+		return server.URL + "/" + fileKey
+	}, m)
+
+	buf := make([]byte, 100)
+	sr.ReadAt(context.Background(), "file1", 0, buf, windowSize)
+
+	// After read, inflight window was created.
+	if m.InflightWindows.Load() < 1 {
+		t.Errorf("InflightWindows should be >= 1 after read, got %d", m.InflightWindows.Load())
+	}
+
+	// Wait for the cleanup goroutine to remove the window from the inflight map.
+	time.Sleep(200 * time.Millisecond)
+
+	if m.InflightWindows.Load() != 0 {
+		t.Errorf("InflightWindows should be 0 after cleanup, got %d", m.InflightWindows.Load())
+	}
+}
+
+// TestReadAt_MetricsCancelledStreamCount verifies that a far seek cancels
+// inflight windows and increments CancelledStreamCount.
+func TestReadAt_MetricsCancelledStreamCount(t *testing.T) {
+	m := metrics.New()
+
+	// Use a slow CDN server that delays responses so the first window is still
+	// inflight when the far seek happens.
+	server := newMockCDNServer(t, func(w http.ResponseWriter, r *http.Request) {
+		rangeHdr := r.Header.Get("Range")
+		var start, end int64
+		fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end)
+		// Delay to keep the first window inflight.
+		if start == 0 {
+			time.Sleep(500 * time.Millisecond)
+		}
+		data := make([]byte, end-start+1)
+		for i := range data {
+			data[i] = byte((start + int64(i)) % 256)
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, 20*1024*1024))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(data)
+	})
+	defer server.Close()
+
+	rc := cache.NewRangeCache(32<<20, nil)
+	cdn := NewCDNClient(4, nil)
+	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+		return server.URL + "/" + fileKey
+	}, m)
+
+	buf := make([]byte, 100)
+
+	// Start a read at offset 0 in a goroutine (creates inflight window at 0).
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		sr.ReadAt(context.Background(), "file1", 0, buf, 20*1024*1024)
+	}()
+
+	// Give the first read time to create the inflight window.
+	time.Sleep(100 * time.Millisecond)
+
+	// Seek far away (>16 MiB) to trigger seek cancellation.
+	sr.ReadAt(context.Background(), "file1", 20*1024*1024, buf, 20*1024*1024)
+
+	// Wait for the first read to complete (it was cancelled and will get an error or succeed).
+	wg.Wait()
+
+	if m.CancelledStreamCount.Load() < 1 {
+		t.Errorf("CancelledStreamCount should be >= 1, got %d", m.CancelledStreamCount.Load())
+	}
+}
