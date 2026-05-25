@@ -161,6 +161,16 @@ func (r *RootNode) Getattr(ctx context.Context, f fs.FileHandle, out *fuse.AttrO
 	return 0
 }
 
+// Getxattr returns ENOATTR for extended attributes on the root node.
+func (r *RootNode) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
+	return 0, syscall.ENOATTR
+}
+
+// Listxattr returns an empty xattr list for the root node.
+func (r *RootNode) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.Errno) {
+	return 0, 0
+}
+
 // Statfs returns filesystem statistics for the root.
 func (r *RootNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errno {
 	// Return reasonable defaults; the kernel uses this for df etc.
@@ -237,6 +247,17 @@ func (d *DirNode) Setattr(ctx context.Context, f fs.FileHandle, in *fuse.SetAttr
 	return syscall.EROFS
 }
 
+// Getxattr returns ENOATTR for all xattr queries. This silences the macOS
+// "Unimplemented opcode OPCODE-60" spam for com.apple.FinderInfo etc.
+func (d *DirNode) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
+	return 0, syscall.ENOATTR
+}
+
+// Listxattr returns an empty xattr list.
+func (d *DirNode) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.Errno) {
+	return 0, 0
+}
+
 // ---------------------------------------------------------------------------
 // FileNode
 // ---------------------------------------------------------------------------
@@ -306,12 +327,25 @@ func (f *FileNode) Fsync(ctx context.Context, fh fs.FileHandle, flags uint32) sy
 	return 0
 }
 
+// Getxattr returns ENOATTR for all xattr queries. This silences the macOS
+// "Unimplemented opcode OPCODE-60" spam for com.apple.FinderInfo etc.
+func (f *FileNode) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
+	return 0, syscall.ENOATTR
+}
+
+// Listxattr returns an empty xattr list.
+func (f *FileNode) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.Errno) {
+	return 0, 0
+}
+
 // Compile-time interface checks.
 var (
 	_ fs.InodeEmbedder      = (*RootNode)(nil)
 	_ fs.NodeOnAdder        = (*RootNode)(nil)
 	_ fs.NodeGetattrer      = (*RootNode)(nil)
 	_ fs.NodeStatfser       = (*RootNode)(nil)
+	_ fs.NodeGetxattrer     = (*RootNode)(nil)
+	_ fs.NodeListxattrer    = (*RootNode)(nil)
 
 	_ fs.InodeEmbedder      = (*DirNode)(nil)
 	_ fs.NodeGetattrer      = (*DirNode)(nil)
@@ -323,6 +357,8 @@ var (
 	_ fs.NodeSymlinker      = (*DirNode)(nil)
 	_ fs.NodeLinker         = (*DirNode)(nil)
 	_ fs.NodeSetattrer      = (*DirNode)(nil)
+	_ fs.NodeGetxattrer     = (*DirNode)(nil)
+	_ fs.NodeListxattrer    = (*DirNode)(nil)
 
 	_ fs.InodeEmbedder      = (*FileNode)(nil)
 	_ fs.NodeGetattrer      = (*FileNode)(nil)
@@ -332,6 +368,8 @@ var (
 	_ fs.NodeWriter         = (*FileNode)(nil)
 	_ fs.NodeAllocater      = (*FileNode)(nil)
 	_ fs.NodeFsyncer        = (*FileNode)(nil)
+	_ fs.NodeGetxattrer     = (*FileNode)(nil)
+	_ fs.NodeListxattrer    = (*FileNode)(nil)
 )
 
 // permalinkBuilderFor creates a PermalinkBuilder function that resolves
