@@ -44,10 +44,10 @@ func (m *Metrics) IncCDNStatusCode(code int) {
 // to w. Labels are not used — each metric is a simple untyped gauge or counter.
 func (m *Metrics) WritePrometheus(w io.Writer) {
 	writeCounter(w, "torbox_catalog_items", m.CatalogItems.Load())
-	writeCounter(w, "torbox_cache_bytes_total", m.CacheBytesTotal.Load())
+	writeGauge(w, "torbox_cache_bytes_total", m.CacheBytesTotal.Load())
 	writeGauge(w, "torbox_cache_bytes_active", m.CacheBytesActive.Load())
 	writeGauge(w, "torbox_cache_bytes_stale", m.CacheBytesStale.Load())
-	writeCounter(w, "torbox_cache_entries", m.CacheEntries.Load())
+	writeGauge(w, "torbox_cache_entries", m.CacheEntries.Load())
 	writeGauge(w, "torbox_inflight_windows", m.InflightWindows.Load())
 	writeCounter(w, "torbox_read_count_total", m.ReadCount.Load())
 	writeCounter(w, "torbox_cache_hit_count_total", m.CacheHitCount.Load())
