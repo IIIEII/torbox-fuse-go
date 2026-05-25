@@ -42,7 +42,7 @@ func TestNonFunctional_NoGoroutineLeak(t *testing.T) {
 	}))
 	defer server.Close()
 
-	rc := cache.NewRangeCache(256 << 20)
+	rc := cache.NewRangeCache(256 << 20, nil)
 	cdn := NewCDNClient(8)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
@@ -106,7 +106,7 @@ func TestNonFunctional_CancelledOpsReleaseResources(t *testing.T) {
 	}))
 	defer server.Close()
 
-	rc := cache.NewRangeCache(256 << 20)
+	rc := cache.NewRangeCache(256 << 20, nil)
 	cdn := NewCDNClient(8)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
@@ -220,7 +220,7 @@ func TestNonFunctional_ConcurrentRacePaths(t *testing.T) {
 	}))
 	defer server.Close()
 
-	rc := cache.NewRangeCache(256 << 20)
+	rc := cache.NewRangeCache(256 << 20, nil)
 	cdn := NewCDNClient(8)
 	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey

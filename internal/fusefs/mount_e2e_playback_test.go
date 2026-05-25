@@ -75,7 +75,7 @@ func mountFUSEForTest(t *testing.T, dataSize int, cdnHandler http.HandlerFunc) (
 		t.Fatalf("state.Open: %v", err)
 	}
 
-	rc := cache.NewRangeCache(256 * 1024 * 1024)
+	rc := cache.NewRangeCache(256 * 1024 * 1024, nil)
 	cdnClient := stream.NewCDNClient(8)
 	permalinkBuilder := func(fileKey string) string {
 		return cdnServer.URL

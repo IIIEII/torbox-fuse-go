@@ -66,7 +66,7 @@ func main() {
 
 	// Create range cache with configured budget.
 	budgetBytes := int64(cfg.CacheBudgetMB) * 1024 * 1024
-	rc := cache.NewRangeCache(budgetBytes)
+	rc := cache.NewRangeCache(budgetBytes, m)
 
 	// Create CDN client with configured concurrency.
 	cdn := stream.NewCDNClient(cfg.StreamConcurrency)

@@ -5,12 +5,14 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/iiieii/torbox-fuse-go/internal/metrics"
 )
 
 // --- NewRangeCache ---
 
 func TestNewRangeCache_SetsBudget(t *testing.T) {
-	rc := NewRangeCache(1024)
+	rc := NewRangeCache(1024, nil)
 	if rc == nil {
 		t.Fatal("NewRangeCache returned nil")
 	}
@@ -20,7 +22,7 @@ func TestNewRangeCache_SetsBudget(t *testing.T) {
 }
 
 func TestNewRangeCache_ZeroBudget(t *testing.T) {
-	rc := NewRangeCache(0)
+	rc := NewRangeCache(0, nil)
 	if rc == nil {
 		t.Fatal("NewRangeCache returned nil")
 	}
@@ -30,7 +32,7 @@ func TestNewRangeCache_ZeroBudget(t *testing.T) {
 // --- CopyTo ---
 
 func TestCopyTo_Miss(t *testing.T) {
-	rc := NewRangeCache(4096)
+	rc := NewRangeCache(4096, nil)
 	dst := make([]byte, 10)
 	n, ok := rc.CopyTo("nonexistent", 0, dst)
 	if ok {
@@ -42,7 +44,7 @@ func TestCopyTo_Miss(t *testing.T) {
 }
 
 func TestCopyTo_ZeroAllocHit(t *testing.T) {
-	rc := NewRangeCache(4096)
+	rc := NewRangeCache(4096, nil)
 	rc.Put("file1", 0, []byte("hello"))
 
 	dst := make([]byte, 5)
@@ -56,7 +58,7 @@ func TestCopyTo_ZeroAllocHit(t *testing.T) {
 // --- Put ---
 
 func TestPut_StoresData(t *testing.T) {
-	rc := NewRangeCache(4096)
+	rc := NewRangeCache(4096, nil)
 	data := []byte("test data")
 	rc.Put("file1", 0, data)
 
@@ -68,7 +70,7 @@ func TestPut_StoresData(t *testing.T) {
 }
 
 func TestPut_CopiesData(t *testing.T) {
-	rc := NewRangeCache(4096)
+	rc := NewRangeCache(4096, nil)
 	data := []byte("original")
 	rc.Put("file1", 0, data)
 
@@ -83,7 +85,7 @@ func TestPut_CopiesData(t *testing.T) {
 }
 
 func TestPut_OverwriteExistingBlock(t *testing.T) {
-	rc := NewRangeCache(4096)
+	rc := NewRangeCache(4096, nil)
 	rc.Put("file1", 0, []byte("old"))
 	rc.Put("file1", 0, []byte("new"))
 
@@ -98,7 +100,7 @@ func TestPut_OverwriteExistingBlock(t *testing.T) {
 
 func TestPut_BudgetEviction(t *testing.T) {
 	// Budget of 10 bytes
-	rc := NewRangeCache(10)
+	rc := NewRangeCache(10, nil)
 
 	rc.Put("file1", 0, []byte("12345")) // 5 bytes
 	rc.Put("file1", 5, []byte("67890")) // 5 bytes, total=10, at budget
@@ -128,7 +130,7 @@ func TestPut_BudgetEviction(t *testing.T) {
 
 func TestPut_BudgetEvictionMultipleBlocks(t *testing.T) {
 	// Budget of 6 bytes
-	rc := NewRangeCache(6)
+	rc := NewRangeCache(6, nil)
 
 	rc.Put("a", 0, []byte("111")) // 3 bytes
 	time.Sleep(time.Millisecond) // ensure distinct timestamps for LRU
@@ -155,7 +157,7 @@ func TestPut_BudgetEvictionMultipleBlocks(t *testing.T) {
 }
 
 func TestPut_ZeroBudgetEvictsImmediately(t *testing.T) {
-	rc := NewRangeCache(0)
+	rc := NewRangeCache(0, nil)
 	rc.Put("file1", 0, []byte("data"))
 
 	dst := make([]byte, 4)
@@ -166,7 +168,7 @@ func TestPut_ZeroBudgetEvictsImmediately(t *testing.T) {
 }
 
 func TestPut_BudgetTracksUsedBytes(t *testing.T) {
-	rc := NewRangeCache(4096)
+	rc := NewRangeCache(4096, nil)
 	rc.Put("file1", 0, []byte("1234")) // 4 bytes
 	rc.Put("file1", 4, []byte("5678")) // 4 bytes
 
@@ -176,7 +178,7 @@ func TestPut_BudgetTracksUsedBytes(t *testing.T) {
 }
 
 func TestPut_OverwriteAdjustsUsed(t *testing.T) {
-	rc := NewRangeCache(4096)
+	rc := NewRangeCache(4096, nil)
 	rc.Put("file1", 0, []byte("1234")) // 4 bytes
 	rc.Put("file1", 0, []byte("12345678")) // 8 bytes (overwrite, old was 4)
 
@@ -188,7 +190,7 @@ func TestPut_OverwriteAdjustsUsed(t *testing.T) {
 // --- PutWithSession ---
 
 func TestPutWithSession_StoresSessionID(t *testing.T) {
-	rc := NewRangeCache(4096)
+	rc := NewRangeCache(4096, nil)
 	rc.PutWithSession("file1", 0, []byte("data"), 42)
 
 	// Verify the data is stored
@@ -211,7 +213,7 @@ func TestPutWithSession_StoresSessionID(t *testing.T) {
 // --- EvictStale ---
 
 func TestEvictStale_RemovesOldSessionBlocks(t *testing.T) {
-	rc := NewRangeCache(4096)
+	rc := NewRangeCache(4096, nil)
 	rc.PutWithSession("file1", 0, []byte("old"), 1)
 	rc.PutWithSession("file1", 100, []byte("cur"), 5)
 	rc.PutWithSession("file1", 200, []byte("new"), 10)
@@ -239,7 +241,7 @@ func TestEvictStale_RemovesOldSessionBlocks(t *testing.T) {
 }
 
 func TestEvictStale_ZeroSessionIDNotEvicted(t *testing.T) {
-	rc := NewRangeCache(4096)
+	rc := NewRangeCache(4096, nil)
 	rc.Put("file1", 0, []byte("no-session")) // sessionID = 0
 
 	rc.EvictStale("file1", 100)
@@ -252,7 +254,7 @@ func TestEvictStale_ZeroSessionIDNotEvicted(t *testing.T) {
 }
 
 func TestEvictStale_NoBlocksForFile(t *testing.T) {
-	rc := NewRangeCache(4096)
+	rc := NewRangeCache(4096, nil)
 	rc.PutWithSession("other", 0, []byte("data"), 1)
 
 	// Should not panic and should not affect other files
@@ -266,7 +268,7 @@ func TestEvictStale_NoBlocksForFile(t *testing.T) {
 }
 
 func TestEvictStale_AdjustsUsedBytes(t *testing.T) {
-	rc := NewRangeCache(4096)
+	rc := NewRangeCache(4096, nil)
 	rc.PutWithSession("file1", 0, []byte("1234"), 1) // 4 bytes
 	rc.PutWithSession("file1", 4, []byte("5678"), 5) // 4 bytes, total=8
 
@@ -279,7 +281,7 @@ func TestEvictStale_AdjustsUsedBytes(t *testing.T) {
 }
 
 func TestEvictStale_OnlyAffectsTargetFileKey(t *testing.T) {
-	rc := NewRangeCache(4096)
+	rc := NewRangeCache(4096, nil)
 	rc.PutWithSession("file1", 0, []byte("old"), 1)
 	rc.PutWithSession("file2", 0, []byte("old2"), 1)
 
@@ -298,7 +300,7 @@ func TestEvictStale_OnlyAffectsTargetFileKey(t *testing.T) {
 }
 
 func TestEvictStale_CurrentSessionEqualsBlockSession(t *testing.T) {
-	rc := NewRangeCache(4096)
+	rc := NewRangeCache(4096, nil)
 	rc.PutWithSession("file1", 0, []byte("data"), 5)
 
 	rc.EvictStale("file1", 5)
@@ -313,7 +315,7 @@ func TestEvictStale_CurrentSessionEqualsBlockSession(t *testing.T) {
 // --- Sharding ---
 
 func TestShard_DifferentFileKeysDistributeAcrossShards(t *testing.T) {
-	rc := NewRangeCache(1 << 20)
+	rc := NewRangeCache(1 << 20, nil)
 
 	// Insert many blocks with different fileKeys; at least some should land
 	// in different shards (probabilistic, but with 100 keys vs 32 shards
@@ -342,7 +344,7 @@ func TestShard_DifferentFileKeysDistributeAcrossShards(t *testing.T) {
 // --- Concurrency ---
 
 func TestConcurrent_PutAndCopyTo(t *testing.T) {
-	rc := NewRangeCache(1 << 20)
+	rc := NewRangeCache(1 << 20, nil)
 
 	const goroutines = 50
 	const iterations = 100
@@ -379,7 +381,7 @@ func TestConcurrent_PutAndCopyTo(t *testing.T) {
 }
 
 func TestConcurrent_PutAndEvictStale(t *testing.T) {
-	rc := NewRangeCache(1 << 20)
+	rc := NewRangeCache(1 << 20, nil)
 
 	const goroutines = 20
 	const iterations = 50
@@ -402,7 +404,7 @@ func TestConcurrent_PutAndEvictStale(t *testing.T) {
 }
 
 func TestConcurrent_BudgetEviction(t *testing.T) {
-	rc := NewRangeCache(1024)
+	rc := NewRangeCache(1024, nil)
 
 	const goroutines = 20
 	const iterations = 100
@@ -433,7 +435,7 @@ func TestConcurrent_BudgetEviction(t *testing.T) {
 // --- lastAccess ---
 
 func TestCopyTo_UpdatesLastAccess(t *testing.T) {
-	rc := NewRangeCache(4096)
+	rc := NewRangeCache(4096, nil)
 	rc.Put("file1", 0, []byte("first"))
 	rc.Put("file2", 0, []byte("second"))
 
@@ -455,7 +457,7 @@ func TestCopyTo_UpdatesLastAccess(t *testing.T) {
 // --- Edge cases ---
 
 func TestPut_EmptyData(t *testing.T) {
-	rc := NewRangeCache(4096)
+	rc := NewRangeCache(4096, nil)
 	rc.Put("file1", 0, []byte{})
 
 	dst := make([]byte, 1)
@@ -471,7 +473,7 @@ func TestPut_EmptyData(t *testing.T) {
 
 // 1.1 Exact range match: request exactly the block that was stored.
 func TestCopyTo_ExactRangeMatch(t *testing.T) {
-	rc := NewRangeCache(1 << 20)
+	rc := NewRangeCache(1 << 20, nil)
 	data := []byte("ABCDEFGHIJ") // 10 bytes at offset 0
 	rc.Put("f1", 0, data)
 
@@ -490,7 +492,7 @@ func TestCopyTo_ExactRangeMatch(t *testing.T) {
 
 // 1.2 Full cover: request a range fully contained within a larger block.
 func TestCopyTo_FullCover_SubrangeWithinLargerBlock(t *testing.T) {
-	rc := NewRangeCache(1 << 20)
+	rc := NewRangeCache(1 << 20, nil)
 	rc.Put("f1", 0, []byte("ABCDEFGHIJ")) // 10 bytes
 
 	// Request bytes 3–6 ("DEFG"), fully inside the block
@@ -509,7 +511,7 @@ func TestCopyTo_FullCover_SubrangeWithinLargerBlock(t *testing.T) {
 
 // 1.3 Partial overlap left: request starts before block, overlaps left portion.
 func TestCopyTo_PartialOverlapLeft_MissBeforeBlock(t *testing.T) {
-	rc := NewRangeCache(1 << 20)
+	rc := NewRangeCache(1 << 20, nil)
 	rc.Put("f1", 100, []byte("HELLO")) // block at [100, 105)
 
 	// Request from offset 98 — starts before the block, so this is a miss.
@@ -523,7 +525,7 @@ func TestCopyTo_PartialOverlapLeft_MissBeforeBlock(t *testing.T) {
 
 // 1.4 Partial overlap right: request extends beyond block end, gets partial data.
 func TestCopyTo_PartialOverlapRight_ClippedAtBlockEnd(t *testing.T) {
-	rc := NewRangeCache(1 << 20)
+	rc := NewRangeCache(1 << 20, nil)
 	rc.Put("f1", 0, []byte("HELLO")) // 5 bytes at offset 0
 
 	// Request 10 bytes from offset 0 — block only has 5 bytes
@@ -542,7 +544,7 @@ func TestCopyTo_PartialOverlapRight_ClippedAtBlockEnd(t *testing.T) {
 
 // 1.5 No overlap: request at offset completely outside any block → miss.
 func TestCopyTo_NoOverlap_DistantOffset(t *testing.T) {
-	rc := NewRangeCache(1 << 20)
+	rc := NewRangeCache(1 << 20, nil)
 	rc.Put("f1", 0, []byte("data")) // block at [0, 4)
 
 	dst := make([]byte, 10)
@@ -557,7 +559,7 @@ func TestCopyTo_NoOverlap_DistantOffset(t *testing.T) {
 
 // 1.6 Adjacent ranges: two blocks at consecutive offsets, read each independently.
 func TestCopyTo_AdjacentRanges(t *testing.T) {
-	rc := NewRangeCache(1 << 20)
+	rc := NewRangeCache(1 << 20, nil)
 	rc.Put("f1", 0, []byte("AAAA"))
 	rc.Put("f1", 4, []byte("BBBB"))
 
@@ -577,7 +579,7 @@ func TestCopyTo_AdjacentRanges(t *testing.T) {
 // 1.7 Request clipped by EOF: block at end of file, request past block end
 // returns available bytes only.
 func TestCopyTo_ClippedByEOF(t *testing.T) {
-	rc := NewRangeCache(1 << 20)
+	rc := NewRangeCache(1 << 20, nil)
 	rc.Put("f1", 0, []byte("ABC")) // 3 bytes at offset 0
 
 	// Request 10 bytes from offset 1 — block only has 2 bytes from offset 1
@@ -596,7 +598,7 @@ func TestCopyTo_ClippedByEOF(t *testing.T) {
 
 // 1.8 Request exactly at EOF: offset equals block end → miss.
 func TestCopyTo_RequestAtBlockEnd(t *testing.T) {
-	rc := NewRangeCache(1 << 20)
+	rc := NewRangeCache(1 << 20, nil)
 	rc.Put("f1", 0, []byte("ABC")) // block covers [0, 3)
 
 	// Offset 3 is exactly at the end of the block — should be a miss
@@ -609,7 +611,7 @@ func TestCopyTo_RequestAtBlockEnd(t *testing.T) {
 
 // 1.9 Zero-length range: empty destination buffer → returns 0, false.
 func TestCopyTo_ZeroLengthRange(t *testing.T) {
-	rc := NewRangeCache(1 << 20)
+	rc := NewRangeCache(1 << 20, nil)
 	rc.Put("f1", 0, []byte("ABC"))
 
 	n, ok := rc.CopyTo("f1", 0, []byte{})
@@ -623,7 +625,7 @@ func TestCopyTo_ZeroLengthRange(t *testing.T) {
 
 // 1.10 Invalid range: negative offset → miss (verify no panic).
 func TestCopyTo_NegativeOffset_NoPanic(t *testing.T) {
-	rc := NewRangeCache(1 << 20)
+	rc := NewRangeCache(1 << 20, nil)
 	rc.Put("f1", 0, []byte("ABC"))
 
 	dst := make([]byte, 10)
@@ -645,7 +647,7 @@ func TestCopyTo_NegativeOffset_NoPanic(t *testing.T) {
 // start, including prefetch-window key alignment (offset 17 MiB hitting block
 // starting at 16 MiB).
 func TestCopyTo_PrefetchWindowKeyAlignment(t *testing.T) {
-	rc := NewRangeCache(10 << 20) // 10 MiB budget
+	rc := NewRangeCache(10 << 20, nil) // 10 MiB budget
 
 	// Store a 4 MiB block at offset 16 MiB (aligned to prefetchWindowSize)
 	blockSize := 4 * 1024 * 1024
@@ -678,7 +680,7 @@ func TestCopyTo_PrefetchWindowKeyAlignment(t *testing.T) {
 // 2.2 Overlapping block replacement: Put block at (fileKey, 0) with "old",
 // then Put at (fileKey, 0) with "new". Verify other blocks are still intact.
 func TestPut_OverwritePreservesOtherBlocks(t *testing.T) {
-	rc := NewRangeCache(4096)
+	rc := NewRangeCache(4096, nil)
 	rc.Put("f1", 0, []byte("old_data_at_0"))
 	rc.Put("f1", 100, []byte("neighbor_at_100"))
 
@@ -701,4 +703,113 @@ func TestPut_OverwritePreservesOtherBlocks(t *testing.T) {
 	if string(dst2[:n2]) != "neighbor_at_100" {
 		t.Errorf("neighbor block: got %q, want %q", string(dst2[:n2]), "neighbor_at_100")
 	}
+}
+
+// ============================================================
+// Metrics integration tests
+// ============================================================
+
+func TestMetrics_PutBlock_IncrementsCounters(t *testing.T) {
+	m := metrics.New()
+	rc := NewRangeCache(4096, m)
+
+	rc.Put("file1", 0, []byte("1234")) // 4 bytes
+
+	if m.CacheBytesTotal.Load() != 4 {
+		t.Errorf("CacheBytesTotal: got %d, want 4", m.CacheBytesTotal.Load())
+	}
+	if m.CacheBytesActive.Load() != 4 {
+		t.Errorf("CacheBytesActive: got %d, want 4", m.CacheBytesActive.Load())
+	}
+	if m.CacheEntries.Load() != 1 {
+		t.Errorf("CacheEntries: got %d, want 1", m.CacheEntries.Load())
+	}
+}
+
+func TestMetrics_PutBlock_MultipleBlocks(t *testing.T) {
+	m := metrics.New()
+	rc := NewRangeCache(4096, m)
+
+	rc.Put("file1", 0, []byte("1234")) // 4 bytes
+	rc.Put("file1", 4, []byte("5678")) // 4 bytes, total 8
+
+	if m.CacheBytesTotal.Load() != 8 {
+		t.Errorf("CacheBytesTotal: got %d, want 8", m.CacheBytesTotal.Load())
+	}
+	if m.CacheBytesActive.Load() != 8 {
+		t.Errorf("CacheBytesActive: got %d, want 8", m.CacheBytesActive.Load())
+	}
+	if m.CacheEntries.Load() != 2 {
+		t.Errorf("CacheEntries: got %d, want 2", m.CacheEntries.Load())
+	}
+}
+
+func TestMetrics_PutBlock_OverwriteAdjustsMetrics(t *testing.T) {
+	m := metrics.New()
+	rc := NewRangeCache(4096, m)
+
+	rc.Put("file1", 0, []byte("1234")) // 4 bytes
+	rc.Put("file1", 0, []byte("12345678")) // 8 bytes, replaces old 4-byte block
+
+	// CacheBytesTotal adjusted on replacement: 0 + 4 - 4 + 8 = 8
+	if m.CacheBytesTotal.Load() != 8 {
+		t.Errorf("CacheBytesTotal: got %d, want 8", m.CacheBytesTotal.Load())
+	}
+	// CacheBytesActive tracks current live bytes: 8 (old 4 removed, new 8 added)
+	if m.CacheBytesActive.Load() != 8 {
+		t.Errorf("CacheBytesActive: got %d, want 8", m.CacheBytesActive.Load())
+	}
+	// CacheEntries: still 1 (overwrite, not a new entry)
+	if m.CacheEntries.Load() != 1 {
+		t.Errorf("CacheEntries: got %d, want 1", m.CacheEntries.Load())
+	}
+}
+
+func TestMetrics_EvictOne_DecrementsCounters(t *testing.T) {
+	m := metrics.New()
+	// Budget of 5 bytes — adding 6 bytes triggers eviction
+	rc := NewRangeCache(5, m)
+
+	rc.Put("file1", 0, []byte("12345")) // 5 bytes, at budget
+	rc.Put("file2", 0, []byte("6"))     // 1 byte, triggers eviction of oldest
+
+	// After eviction: file1@0 evicted (5 bytes removed), file2@0 remains (1 byte)
+	if m.CacheBytesActive.Load() != 1 {
+		t.Errorf("CacheBytesActive: got %d, want 1", m.CacheBytesActive.Load())
+	}
+	if m.CacheEntries.Load() != 1 {
+		t.Errorf("CacheEntries: got %d, want 1", m.CacheEntries.Load())
+	}
+}
+
+func TestMetrics_EvictStale_DecrementsCounters(t *testing.T) {
+	m := metrics.New()
+	rc := NewRangeCache(4096, m)
+
+	rc.PutWithSession("file1", 0, []byte("1234"), 1) // 4 bytes, session 1
+	rc.PutWithSession("file1", 4, []byte("5678"), 5) // 4 bytes, session 5
+
+	rc.EvictStale("file1", 5) // evicts session 1 block (4 bytes)
+
+	if m.CacheBytesStale.Load() != 4 {
+		t.Errorf("CacheBytesStale: got %d, want 4", m.CacheBytesStale.Load())
+	}
+	if m.CacheBytesActive.Load() != 4 {
+		t.Errorf("CacheBytesActive: got %d, want 4", m.CacheBytesActive.Load())
+	}
+	if m.CacheEntries.Load() != 1 {
+		t.Errorf("CacheEntries: got %d, want 1", m.CacheEntries.Load())
+	}
+}
+
+func TestMetrics_NilMetrics_NoPanic(t *testing.T) {
+	rc := NewRangeCache(4096, nil)
+
+	// All operations should work without panicking
+	rc.Put("file1", 0, []byte("1234"))
+	rc.PutWithSession("file2", 0, []byte("5678"), 1)
+	rc.EvictStale("file2", 2)
+
+	dst := make([]byte, 4)
+	rc.CopyTo("file1", 0, dst)
 }

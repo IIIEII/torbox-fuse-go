@@ -7,6 +7,8 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/iiieii/torbox-fuse-go/internal/metrics"
 )
 
 const numShards = 32
@@ -19,6 +21,7 @@ type RangeCache struct {
 	shards [numShards]rangeShard
 	budget int64
 	used   atomic.Int64
+	m      *metrics.Metrics
 }
 
 // rangeShard holds a partition of the cache protected by a single lock.
@@ -42,10 +45,11 @@ type RangeBlock struct {
 	lastAccess atomic.Int64
 }
 
-// NewRangeCache creates a RangeCache with the given byte budget.
-// When total cached data exceeds budget, oldest-accessed blocks are evicted.
-func NewRangeCache(budgetBytes int64) *RangeCache {
-	rc := &RangeCache{budget: budgetBytes}
+// NewRangeCache creates a RangeCache with the given byte budget and optional
+// metrics collector. When total cached data exceeds budget, oldest-accessed
+// blocks are evicted. If m is nil, metrics collection is skipped.
+func NewRangeCache(budgetBytes int64, m *metrics.Metrics) *RangeCache {
+	rc := &RangeCache{budget: budgetBytes, m: m}
 	for i := range rc.shards {
 		rc.shards[i].blocks = make(map[cacheKey]*RangeBlock)
 	}
@@ -129,12 +133,23 @@ func (rc *RangeCache) putBlock(fileKey string, start int64, data []byte, session
 	key := cacheKey{fileKey: fileKey, start: start}
 	// If a block already exists at this key, subtract its size.
 	if old, ok := sh.blocks[key]; ok {
-		rc.used.Add(-int64(len(old.data)))
+		oldSize := int64(len(old.data))
+		rc.used.Add(-oldSize)
+		if rc.m != nil {
+			rc.m.CacheBytesTotal.Add(-oldSize)
+			rc.m.CacheBytesActive.Add(-oldSize)
+			rc.m.CacheEntries.Add(-1)
+		}
 	}
 	sh.blocks[key] = blk
 	sh.mu.Unlock()
 
 	rc.used.Add(int64(len(buf)))
+	if rc.m != nil {
+		rc.m.CacheBytesTotal.Add(int64(len(buf)))
+		rc.m.CacheBytesActive.Add(int64(len(buf)))
+		rc.m.CacheEntries.Add(1)
+	}
 	rc.evict()
 }
 
@@ -157,6 +172,11 @@ func (rc *RangeCache) EvictStale(fileKey string, currentSession int64) {
 					rc.used.Add(-size)
 				} else {
 					rc.used.Store(0)
+				}
+				if rc.m != nil {
+					rc.m.CacheBytesStale.Add(size)
+					rc.m.CacheBytesActive.Add(-size)
+					rc.m.CacheEntries.Add(-1)
 				}
 			}
 		}
@@ -212,6 +232,11 @@ func (rc *RangeCache) evictOne() {
 			rc.used.Add(-size)
 		} else {
 			rc.used.Store(0)
+		}
+		if rc.m != nil {
+			rc.m.CacheBytesTotal.Add(-size)
+			rc.m.CacheBytesActive.Add(-size)
+			rc.m.CacheEntries.Add(-1)
 		}
 	}
 	sh.mu.Unlock()

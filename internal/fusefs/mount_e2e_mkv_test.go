@@ -159,7 +159,7 @@ func mountFUSEForMKV(t *testing.T, mkvPath string) (string, func()) {
 		t.Fatalf("state.Open: %v", err)
 	}
 
-	rc := cache.NewRangeCache(256 * 1024 * 1024)
+	rc := cache.NewRangeCache(256 * 1024 * 1024, nil)
 	cdnClient := stream.NewCDNClient(8)
 	permalinkBuilder := func(fileKey string) string {
 		return cdnServer.URL

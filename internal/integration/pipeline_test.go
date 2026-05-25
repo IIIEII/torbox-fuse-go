@@ -132,7 +132,7 @@ func TestFullPipeline_CatalogToStreamRead(t *testing.T) {
 	}
 
 	// Set up stream reader with mock CDN.
-	rc := cache.NewRangeCache(256 * 1024 * 1024)
+	rc := cache.NewRangeCache(256 * 1024 * 1024, nil)
 	cdnClient := stream.NewCDNClient(8)
 	permalinkBuilder := func(fileKey string) string {
 		return cdnServer.URL
