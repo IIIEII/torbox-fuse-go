@@ -825,6 +825,13 @@ func TestReadAt_MetricsInflightWindows(t *testing.T) {
 		rangeHdr := r.Header.Get("Range")
 		var start, end int64
 		fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end)
+		if start >= int64(len(testData)) {
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		if end >= int64(len(testData)) {
+			end = int64(len(testData) - 1)
+		}
 		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(testData)))
 		w.WriteHeader(http.StatusPartialContent)
 		w.Write(testData[start : end+1])
@@ -846,7 +853,9 @@ func TestReadAt_MetricsInflightWindows(t *testing.T) {
 	}
 
 	// Wait for the cleanup goroutine to remove the window from the inflight map.
-	time.Sleep(200 * time.Millisecond)
+	// Also wait for the cascading read-ahead window (which may fail with 416)
+	// to be cleaned up.
+	time.Sleep(500 * time.Millisecond)
 
 	if m.InflightWindows.Load() != 0 {
 		t.Errorf("InflightWindows should be 0 after cleanup, got %d", m.InflightWindows.Load())

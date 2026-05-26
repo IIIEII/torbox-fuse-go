@@ -73,6 +73,7 @@ type inflightWindow struct {
 	readyCond  *sync.Cond
 	cancelFunc context.CancelFunc
 	waiters    atomic.Int32
+	fileSize   int64
 }
 
 // fileSession tracks per-file read-ahead state.
@@ -127,7 +128,7 @@ func (sr *StreamReader) ReadAt(ctx context.Context, fileKey string, off int64, p
 			rem = rem[:maxRead]
 		}
 
-		n, err := sr.readWindow(ctx, fileKey, curOff, rem)
+		n, err := sr.readWindow(ctx, fileKey, curOff, rem, fileSize)
 		totalN += n
 		if err != nil {
 			return totalN, err
@@ -150,7 +151,7 @@ func (sr *StreamReader) ReadAt(ctx context.Context, fileKey string, off int64, p
 // It may return fewer bytes than requested if the available data in the current
 // window is less than len(p). The caller (ReadAt) handles spanning multiple
 // windows.
-func (sr *StreamReader) readWindow(ctx context.Context, fileKey string, off int64, p []byte) (int, error) {
+func (sr *StreamReader) readWindow(ctx context.Context, fileKey string, off int64, p []byte, fileSize int64) (int, error) {
 	// Try cache first — zero-alloc hot path.
 	if n, ok := sr.cache.CopyTo(fileKey, off, p); ok {
 		slog.Debug("stream read cache hit", "fileKey", fileKey, "offset", off, "size", len(p), "n", n)
@@ -162,7 +163,7 @@ func (sr *StreamReader) readWindow(ctx context.Context, fileKey string, off int6
 		// the next window is never prefetched.
 		ws := windowStart(off)
 		sess := sr.getOrCreateSession(fileKey)
-		sr.maybeReadAhead(fileKey, off+int64(n), ws, sess)
+		sr.maybeReadAhead(fileKey, off+int64(n), ws, fileSize, sess)
 		return n, nil
 	}
 
@@ -175,7 +176,7 @@ func (sr *StreamReader) readWindow(ctx context.Context, fileKey string, off int6
 	sess := sr.getOrCreateSession(fileKey)
 
 	// Find or create an inflight window.
-	win, created := sr.getOrCreateWindow(fileKey, ws)
+	win, created := sr.getOrCreateWindow(fileKey, ws, fileSize)
 
 	if sr.metrics != nil {
 		if created {
@@ -200,7 +201,7 @@ func (sr *StreamReader) readWindow(ctx context.Context, fileKey string, off int6
 	}
 
 	// Trigger read-ahead if conditions are met.
-	sr.maybeReadAhead(fileKey, off+int64(n), ws, sess)
+	sr.maybeReadAhead(fileKey, off+int64(n), ws, fileSize, sess)
 
 	return n, nil
 }
@@ -295,7 +296,7 @@ func (sr *StreamReader) getOrCreateSession(fileKey string) *fileSession {
 // getOrCreateWindow finds an existing inflight window or creates a new one.
 // It returns the window and whether a new one was created (true) or an
 // existing one was found (false).
-func (sr *StreamReader) getOrCreateWindow(fileKey string, ws int64) (*inflightWindow, bool) {
+func (sr *StreamReader) getOrCreateWindow(fileKey string, ws int64, fileSize int64) (*inflightWindow, bool) {
 	ik := inflightKey{fileKey: fileKey, start: ws}
 
 	if v, ok := sr.inflight.Load(ik); ok {
@@ -321,6 +322,7 @@ func (sr *StreamReader) getOrCreateWindow(fileKey string, ws int64) (*inflightWi
 		key:        ik,
 		readyCond:  sync.NewCond(&sync.Mutex{}),
 		cancelFunc: cancel,
+		fileSize:   fileSize,
 	}
 
 	actual, loaded := sr.inflight.LoadOrStore(ik, win)
@@ -415,6 +417,13 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 	// only by LRU budget eviction).
 	sr.cache.Put(fileKey, winStart, data)
 
+	// Trigger read-ahead of the next window now that this window's data is
+	// cached and available. This fires read-ahead much earlier than waiting
+	// for a cache-hit in readWindow — as soon as the window is cached, not
+	// when the reader reaches the threshold offset.
+	sess := sr.getOrCreateSession(fileKey)
+	sr.maybeReadAhead(fileKey, winStart+windowSize, winStart, win.fileSize, sess)
+
 	// Remove from inflight map after a short delay to allow late joiners.
 	// The window data is already in the cache for future reads.
 	go func() {
@@ -446,8 +455,13 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 //   - The next window is not cached and not already inflight
 //   - Per-file inflight count < maxInflight
 //   - No recent far seek for this file
-func (sr *StreamReader) maybeReadAhead(fileKey string, endOff, winStart int64, sess *fileSession) {
+func (sr *StreamReader) maybeReadAhead(fileKey string, endOff, winStart, fileSize int64, sess *fileSession) {
 	nextStart := winStart + windowSize
+
+	// Don't prefetch beyond EOF — there's nothing to fetch.
+	if nextStart >= fileSize {
+		return
+	}
 
 	// Check: read extends past readAheadThreshold into the current window.
 	if endOff < winStart+readAheadThreshold {
@@ -488,5 +502,5 @@ func (sr *StreamReader) maybeReadAhead(fileKey string, endOff, winStart int64, s
 	}
 
 	// Create read-ahead window.
-	_, _ = sr.getOrCreateWindow(fileKey, nextStart)
+	_, _ = sr.getOrCreateWindow(fileKey, nextStart, fileSize)
 }
