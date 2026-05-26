@@ -186,8 +186,9 @@ func TestPrefetch_SuppressionNoDuplicateFetches(t *testing.T) {
 	}
 }
 
-// 4.7 Test: per-file inflight limit enforced — with maxInflight=1,
-// verify that read-ahead does not start additional windows.
+// 4.7 Test: per-file inflight limit only counts active (not completed) windows.
+// Completed windows whose data is cached should not block read-ahead, since
+// they no longer consume CDN bandwidth.
 func TestPrefetch_PerFileInflightLimit(t *testing.T) {
 	testData := make([]byte, 16*1024*1024) // 16 MiB = 4 windows
 	for i := range testData {
@@ -215,13 +216,14 @@ func TestPrefetch_PerFileInflightLimit(t *testing.T) {
 
 	rc := cache.NewRangeCache(256 << 20, nil)
 	cdn := NewCDNClient(8, nil)
-	// maxInflight=1 means at most 1 inflight window per file
+	// maxInflight=1 means at most 1 active inflight window per file.
+	// Completed (done=true) windows are excluded from the count.
 	sr := NewStreamReader(rc, cdn, 1, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	}, nil)
 
-	// Read from offset 0 — creates 1 inflight window
-	buf := make([]byte, 4*1024*1024)
+	// Read past readAheadThreshold (2 MiB) to trigger read-ahead.
+	buf := make([]byte, 3*1024*1024) // 3 MiB read
 	_, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(8*1024*1024))
 	if err != nil {
 		t.Fatalf("ReadAt(0): %v", err)
@@ -229,10 +231,11 @@ func TestPrefetch_PerFileInflightLimit(t *testing.T) {
 
 	time.Sleep(200 * time.Millisecond)
 
-	// With maxInflight=1, at most 1 CDN request should have been made
-	// (the current window; prefetch is blocked by the limit).
-	if got := requestCount.Load(); got > 1 {
-		t.Errorf("expected at most 1 CDN request with maxInflight=1, got %d", got)
+	// Should have 2 CDN requests: the first window (read) and the second window
+	// (read-ahead triggered because the completed first window doesn't count
+	// against maxInflight).
+	if got := requestCount.Load(); got < 2 {
+		t.Errorf("expected at least 2 CDN requests (first window + read-ahead), got %d", got)
 	}
 }
 

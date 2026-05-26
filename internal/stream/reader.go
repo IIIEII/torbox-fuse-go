@@ -471,11 +471,14 @@ func (sr *StreamReader) maybeReadAhead(fileKey string, endOff, winStart int64, s
 		return
 	}
 
-	// Check: per-file inflight count < maxInflight.
+	// Check: per-file active inflight count < maxInflight.
+	// Completed windows (done=true, waiting 100ms before removal) don't count
+	// because their data is already in the cache and they're not consuming
+	// CDN bandwidth.
 	inflightCount := 0
-	sr.inflight.Range(func(key, _ any) bool {
+	sr.inflight.Range(func(key, value any) bool {
 		ik := key.(inflightKey)
-		if ik.fileKey == fileKey {
+		if ik.fileKey == fileKey && !value.(*inflightWindow).done.Load() {
 			inflightCount++
 		}
 		return true
