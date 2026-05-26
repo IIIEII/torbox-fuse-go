@@ -2,7 +2,9 @@ package stream
 
 import (
 	"context"
+	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -13,7 +15,6 @@ import (
 )
 
 func TestFetchRange_206PartialContent(t *testing.T) {
-	// Set up a mock HTTP server that validates the Range header and returns 206.
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			t.Errorf("expected GET, got %s", r.Method)
@@ -46,14 +47,19 @@ func TestFetchRange_206PartialContent(t *testing.T) {
 	defer ts.Close()
 
 	cdn := NewCDNClient(4, nil)
-	data, err := cdn.FetchRange(context.Background(), ts.URL, 100, 199)
+	resp, err := cdn.FetchRange(context.Background(), ts.URL, 100, 199)
 	if err != nil {
 		t.Fatalf("FetchRange returned error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response body: %v", err)
 	}
 	if len(data) != 100 {
 		t.Fatalf("expected 100 bytes, got %d", len(data))
 	}
-	// Verify content: byte at index i should be (100+i) % 256
 	for i, b := range data {
 		want := byte((100 + int64(i)) % 256)
 		if b != want {
@@ -63,7 +69,6 @@ func TestFetchRange_206PartialContent(t *testing.T) {
 }
 
 func TestFetchRange_200OK_ZeroOffset(t *testing.T) {
-	// Some CDNs return 200 OK instead of 206 when offset is 0.
 	body := []byte("hello world")
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rangeHdr := r.Header.Get("Range")
@@ -80,9 +85,15 @@ func TestFetchRange_200OK_ZeroOffset(t *testing.T) {
 	defer ts.Close()
 
 	cdn := NewCDNClient(4, nil)
-	data, err := cdn.FetchRange(context.Background(), ts.URL, 0, int64(len(body)-1))
+	resp, err := cdn.FetchRange(context.Background(), ts.URL, 0, int64(len(body)-1))
 	if err != nil {
 		t.Fatalf("FetchRange returned error: %v", err)
+	}
+	defer resp.Body.Close()
+
+	data, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response body: %v", err)
 	}
 	if string(data) != string(body) {
 		t.Fatalf("expected %q, got %q", body, data)
@@ -90,7 +101,6 @@ func TestFetchRange_200OK_ZeroOffset(t *testing.T) {
 }
 
 func TestFetchRange_200OK_NonZeroOffset(t *testing.T) {
-	// Server returns 200 for a non-zero offset — should be an error.
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("full body"))
@@ -105,14 +115,12 @@ func TestFetchRange_200OK_NonZeroOffset(t *testing.T) {
 }
 
 func TestFetchRange_ConcurrencyLimit(t *testing.T) {
-	// Verify the semaphore limits concurrent requests.
 	const maxConns = 2
 	var active atomic.Int32
 	var maxActive atomic.Int32
 
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		cur := active.Add(1)
-		// Track the maximum concurrent requests seen.
 		for {
 			prev := maxActive.Load()
 			if cur <= prev || maxActive.CompareAndSwap(prev, cur) {
@@ -120,7 +128,7 @@ func TestFetchRange_ConcurrencyLimit(t *testing.T) {
 			}
 		}
 
-		time.Sleep(50 * time.Millisecond) // hold the slot open
+		time.Sleep(50 * time.Millisecond)
 
 		active.Add(-1)
 		w.Header().Set("Content-Range", "bytes 0-0/*")
@@ -135,8 +143,13 @@ func TestFetchRange_ConcurrencyLimit(t *testing.T) {
 	errCh := make(chan error, totalReqs)
 	for i := 0; i < totalReqs; i++ {
 		go func() {
-			_, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0)
-			errCh <- err
+			resp, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0)
+			if err != nil {
+				errCh <- err
+				return
+			}
+			resp.Body.Close()
+			errCh <- nil
 		}()
 	}
 
@@ -153,7 +166,6 @@ func TestFetchRange_ConcurrencyLimit(t *testing.T) {
 }
 
 func TestFetchRange_FollowsRedirect(t *testing.T) {
-	// Set up a CDN target that returns 206 with Range header preserved.
 	data := make([]byte, 1024)
 	for i := range data {
 		data[i] = byte(i % 256)
@@ -178,7 +190,6 @@ func TestFetchRange_FollowsRedirect(t *testing.T) {
 	}))
 	defer cdn.Close()
 
-	// Set up a redirect server that 302s to the CDN target.
 	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", cdn.URL+r.URL.Path)
 		w.WriteHeader(http.StatusFound)
@@ -186,9 +197,15 @@ func TestFetchRange_FollowsRedirect(t *testing.T) {
 	defer redirect.Close()
 
 	client := NewCDNClient(4, nil)
-	result, err := client.FetchRange(context.Background(), redirect.URL, 0, 99)
+	resp, err := client.FetchRange(context.Background(), redirect.URL, 0, 99)
 	if err != nil {
 		t.Fatalf("FetchRange after redirect: %v", err)
+	}
+	defer resp.Body.Close()
+
+	result, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("reading response body: %v", err)
 	}
 	if len(result) != 100 {
 		t.Fatalf("expected 100 bytes, got %d", len(result))
@@ -202,7 +219,6 @@ func TestFetchRange_FollowsRedirect(t *testing.T) {
 }
 
 func TestFetchRange_TooManyRedirects(t *testing.T) {
-	// Server redirects to itself, causing redirect loop.
 	redirect := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Location", r.URL.String())
 		w.WriteHeader(http.StatusFound)
@@ -228,20 +244,21 @@ func TestFetchRange_IncrementsCDNRequestCount(t *testing.T) {
 
 	cdn := NewCDNClient(4, m)
 
-	_, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0)
+	resp, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0)
 	if err != nil {
 		t.Fatalf("FetchRange returned error: %v", err)
 	}
+	resp.Body.Close()
 
 	if got := m.CDNRequestCount.Load(); got != 1 {
 		t.Errorf("CDNRequestCount = %d, want 1", got)
 	}
 
-	// Second call should increment to 2.
-	_, err = cdn.FetchRange(context.Background(), ts.URL, 0, 0)
+	resp, err = cdn.FetchRange(context.Background(), ts.URL, 0, 0)
 	if err != nil {
 		t.Fatalf("second FetchRange returned error: %v", err)
 	}
+	resp.Body.Close()
 
 	if got := m.CDNRequestCount.Load(); got != 2 {
 		t.Errorf("CDNRequestCount = %d after second call, want 2", got)
@@ -260,12 +277,12 @@ func TestFetchRange_IncCDNStatusCode(t *testing.T) {
 
 	cdn := NewCDNClient(4, m)
 
-	_, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0)
+	resp, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0)
 	if err != nil {
 		t.Fatalf("FetchRange returned error: %v", err)
 	}
+	resp.Body.Close()
 
-	// Verify the 206 status code was recorded.
 	counter, ok := m.CDNStatusCodes.Load(206)
 	if !ok {
 		t.Fatal("no CDNStatusCodes entry for 206")
@@ -285,17 +302,44 @@ func TestFetchRange_NilMetricsNoPanic(t *testing.T) {
 
 	cdn := NewCDNClient(4, nil)
 
-	_, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0)
+	resp, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0)
 	if err != nil {
 		t.Fatalf("FetchRange with nil metrics returned error: %v", err)
 	}
+	resp.Body.Close()
+}
+
+func TestFetchRange_HTTPStatusError(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusTooManyRequests)
+	}))
+	defer ts.Close()
+
+	cdn := NewCDNClient(4, nil)
+	_, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0)
+	if err == nil {
+		t.Fatal("expected error for 429, got nil")
+	}
+
+	var hse *HTTPStatusError
+	if !ErrorAs(err, &hse) {
+		t.Fatalf("expected HTTPStatusError, got %T: %v", err, err)
+	}
+	if hse.StatusCode != 429 {
+		t.Errorf("HTTPStatusError.StatusCode = %d, want 429", hse.StatusCode)
+	}
+}
+
+// ErrorAs wraps errors.As for test use.
+func ErrorAs(err error, target any) bool {
+	return errors.As(err, target) //nolint:errcheck // test helper
 }
 
 func TestResolveURL(t *testing.T) {
 	tests := []struct {
-		base      string
-		location  string
-		want      string
+		base     string
+		location string
+		want     string
 	}{
 		{
 			base:     "https://api.torbox.app/v1/api/torrents/requestdl?token=x",

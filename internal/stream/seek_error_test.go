@@ -216,7 +216,8 @@ func TestSeek_InvalidRangeResponse(t *testing.T) {
 	}
 }
 
-// 6.9 Temporary backend error: CDN returns 500 on first request, 200 on retry.
+// 6.9 Temporary backend error: CDN returns 500 on first request, then succeeds.
+// fetchWindow retries internally, so the read succeeds transparently.
 func TestSeek_TemporaryBackendError(t *testing.T) {
 	testData := make([]byte, 1024)
 	for i := range testData {
@@ -252,20 +253,19 @@ func TestSeek_TemporaryBackendError(t *testing.T) {
 		return server.URL + "/" + fileKey
 	}, nil)
 
-	// First read should fail
+	// Read succeeds despite 500 on first CDN request — fetchWindow retries internally.
 	buf := make([]byte, 10)
-	_, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(1024))
-	if err == nil {
-		t.Error("expected first read to fail")
-	}
-
-	// Retry should succeed
 	n, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(1024))
 	if err != nil {
-		t.Fatalf("expected retry to succeed, got: %v", err)
+		t.Fatalf("expected read to succeed (after internal retry), got: %v", err)
 	}
 	if n != 10 {
-		t.Errorf("retry: got %d bytes, want 10", n)
+		t.Errorf("got %d bytes, want 10", n)
+	}
+
+	// Verify the CDN was called more than once (proving retry happened)
+	if got := callCount.Load(); got < 2 {
+		t.Errorf("expected at least 2 CDN calls (1 fail + 1 retry), got %d", got)
 	}
 }
 
@@ -276,10 +276,12 @@ func TestSeek_StateUsableAfterError(t *testing.T) {
 		testData[i] = byte(i % 256)
 	}
 
+	// Server fails for the first maxRetries+1 calls (exhausting all internal
+	// retries), then succeeds on subsequent calls.
 	var callCount atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		count := callCount.Add(1)
-		if count == 1 {
+		if count <= int32(maxRetries+1) {
 			w.WriteHeader(http.StatusInternalServerError)
 			return
 		}
@@ -305,14 +307,15 @@ func TestSeek_StateUsableAfterError(t *testing.T) {
 		return server.URL + "/" + fileKey
 	}, nil)
 
-	// First read fails
+	// First read fails — all retries exhausted.
 	buf := make([]byte, 10)
 	_, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(4*1024*1024))
 	if err == nil {
-		t.Error("expected error on first read")
+		t.Error("expected error on first read (all retries exhausted)")
 	}
 
-	// Second read succeeds
+
+	// Second read succeeds with a fresh window.
 	n, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(4*1024*1024))
 	if err != nil {
 		t.Fatalf("expected second read to succeed, got: %v", err)

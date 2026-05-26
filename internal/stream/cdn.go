@@ -5,7 +5,6 @@ package stream
 import (
 	"context"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"net/url"
@@ -14,12 +13,17 @@ import (
 	"github.com/iiieii/torbox-fuse-go/internal/metrics"
 )
 
-// maxResponseSize is the maximum CDN response body size (8 MiB).
-// This prevents unbounded memory if the CDN returns 200 OK instead of 206.
-const maxResponseSize = 8 * 1024 * 1024
-
 // maxRedirects is the maximum number of HTTP redirects to follow.
 const maxRedirects = 5
+
+// HTTPStatusError represents an unexpected HTTP status code from the CDN.
+type HTTPStatusError struct {
+	StatusCode int
+}
+
+func (e *HTTPStatusError) Error() string {
+	return fmt.Sprintf("cdn returned status %d", e.StatusCode)
+}
 
 // CDNClient performs HTTP range requests to TorBox CDN URLs with a concurrency
 // semaphore that limits the number of in-flight requests.
@@ -56,7 +60,8 @@ func NewCDNClient(maxConns int, m *metrics.Metrics) *CDNClient {
 
 // FetchRange issues an HTTP GET with a Range header for bytes [start, end] to
 // the given URL. It blocks until a semaphore slot is available, sends the
-// request, and returns the response body bytes.
+// request, and returns the HTTP response with the body still open for streaming.
+// The caller must close resp.Body when done reading.
 //
 // It follows redirects manually to preserve the Range header, which Go's
 // default http.Client drops on 301/302 redirects.
@@ -64,7 +69,8 @@ func NewCDNClient(maxConns int, m *metrics.Metrics) *CDNClient {
 // It accepts:
 //   - 206 Partial Content (expected)
 //   - 200 OK only when start == 0 (full response fallback)
-func (c *CDNClient) FetchRange(ctx context.Context, rawURL string, start, end int64) ([]byte, error) {
+//   - 429, 5xx: returns HTTPStatusError (caller decides whether to retry)
+func (c *CDNClient) FetchRange(ctx context.Context, rawURL string, start, end int64) (*http.Response, error) {
 	c.sem <- struct{}{}
 	defer func() { <-c.sem }()
 
@@ -112,33 +118,22 @@ func (c *CDNClient) FetchRange(ctx context.Context, rawURL string, start, end in
 			continue
 		}
 
-		defer resp.Body.Close()
-
 		switch resp.StatusCode {
 		case http.StatusPartialContent:
 			// expected
 		case http.StatusOK:
 			if start != 0 {
+				resp.Body.Close()
 				slog.Warn("cdn returned 200 for non-zero offset", "url", currentURL, "start", start)
 				return nil, fmt.Errorf("server returned 200 OK for non-zero offset %d", start)
 			}
 		default:
+			resp.Body.Close()
 			slog.Warn("cdn returned unexpected status", "url", currentURL, "status", resp.StatusCode)
-			return nil, fmt.Errorf("cdn returned status %d", resp.StatusCode)
+			return nil, &HTTPStatusError{StatusCode: resp.StatusCode}
 		}
 
-		body, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseSize))
-		if err != nil {
-			slog.Warn("cdn read error", "url", currentURL, "err", err)
-			return nil, fmt.Errorf("read cdn response: %w", err)
-		}
-		if len(body) >= int(maxResponseSize) {
-			slog.Warn("cdn response too large", "url", currentURL, "size", len(body))
-			return nil, fmt.Errorf("cdn response too large (exceeded %d bytes)", maxResponseSize)
-		}
-
-		slog.Debug("cdn fetch range response", "url", currentURL, "status", resp.StatusCode, "bodySize", len(body))
-		return body, nil
+		return resp, nil
 	}
 
 	return nil, fmt.Errorf("too many redirects (%d) for %s", maxRedirects, rawURL)

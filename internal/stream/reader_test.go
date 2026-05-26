@@ -15,6 +15,10 @@ import (
 	"github.com/iiieii/torbox-fuse-go/internal/metrics"
 )
 
+// windowSize is the test window size (4 MiB). Tests pass this to NewStreamReader
+// as the prefetchBytes parameter. It must match the value used for test data sizes.
+const windowSize = int64(4 * 1024 * 1024)
+
 // newMockCDNServer creates an httptest.Server that delegates to handler.
 func newMockCDNServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 	t.Helper()

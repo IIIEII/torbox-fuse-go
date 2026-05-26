@@ -5,6 +5,7 @@ package stream
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -17,19 +18,16 @@ import (
 )
 
 const (
-	// windowSize is the size of each inflight fetch window (4 MiB).
-	windowSize int64 = 4 * 1024 * 1024
+	// maxRetries is the maximum number of retry attempts for retryable CDN
+	// errors (429 rate limit, 5xx server errors). Total attempts = 1 + maxRetries.
+	maxRetries = 3
 
-	// seekThreshold is the distance in bytes that triggers seek cancellation.
-	// A read more than 16 MiB away from all inflight windows for the same file
-	// cancels orphaned (waiters == 0) inflight windows.
-	seekThreshold int64 = 16 * 1024 * 1024
+	// maxBackoff caps the exponential backoff duration.
+	maxBackoff = 30 * time.Second
 
-	// readAheadThreshold is how far into the current window the read offset
-	// must be before read-ahead is triggered. Set to half the window size so
-	// that read-ahead fires when the reader is midway through a window, giving
-	// the CDN enough time to deliver the next window before the reader needs it.
-	readAheadThreshold int64 = 2 * 1024 * 1024
+	// readChunkSize is the size of each chunk read from the CDN response body.
+	// 32 KiB balances syscall overhead with prompt early-return updates.
+	readChunkSize = 32 * 1024
 )
 
 // PermalinkBuilder returns the CDN URL for a given fileKey.
@@ -44,8 +42,8 @@ type StreamReader struct {
 	cdn           *CDNClient
 	inflight      sync.Map // inflightKey -> *inflightWindow
 	sessions      sync.Map // fileKey -> *fileSession
+	windowSize    int64
 	maxInflight   int
-	prefetchBytes int64
 	permalinkFor  PermalinkBuilder
 	metrics       *metrics.Metrics
 }
@@ -56,13 +54,13 @@ type inflightKey struct {
 	start   int64
 }
 
-// inflightWindow tracks an in-progress CDN fetch for a single 4 MiB window.
+// inflightWindow tracks an in-progress CDN fetch for a single window.
 // Readers wait on readyCond until their requested bytes are available (early return).
 //
-// Synchronization guarantee: err is written by fetchWindow before done.Broadcast()
-// and read by waitForBytes after done.Wait() returns, establishing a happens-before.
-// No additional locking is needed for err because the Broadcast/Wait pair provides
-// the necessary memory ordering.
+// Synchronization: buf, total, and err are protected by readyCond.L.
+// fetchWindow holds the lock for each chunk append + Broadcast, and
+// waitForBytes holds the lock while copying from buf. readyTo and done
+// are atomic and can be read without the lock.
 type inflightWindow struct {
 	key        inflightKey
 	buf        []byte
@@ -82,14 +80,15 @@ type fileSession struct {
 }
 
 // NewStreamReader creates a StreamReader with the given dependencies.
-func NewStreamReader(rc *cache.RangeCache, cdn *CDNClient, maxInflight int, prefetchBytes int64, permalinkFor PermalinkBuilder, m *metrics.Metrics) *StreamReader {
+// windowSize controls the size of each CDN fetch window (e.g. 16 MiB).
+func NewStreamReader(rc *cache.RangeCache, cdn *CDNClient, maxInflight int, windowSize int64, permalinkFor PermalinkBuilder, m *metrics.Metrics) *StreamReader {
 	return &StreamReader{
-		cache:         rc,
-		cdn:           cdn,
-		maxInflight:   maxInflight,
-		prefetchBytes: prefetchBytes,
-		permalinkFor:  permalinkFor,
-		metrics:       m,
+		cache:        rc,
+		cdn:          cdn,
+		windowSize:   windowSize,
+		maxInflight:  maxInflight,
+		permalinkFor: permalinkFor,
+		metrics:      m,
 	}
 }
 
@@ -161,7 +160,7 @@ func (sr *StreamReader) readWindow(ctx context.Context, fileKey string, off int6
 		// Trigger read-ahead on cache hits too — sequential playback
 		// typically hits cached data, and skipping read-ahead here means
 		// the next window is never prefetched.
-		ws := windowStart(off)
+		ws := sr.windowStart(off)
 		sess := sr.getOrCreateSession(fileKey)
 		sr.maybeReadAhead(fileKey, off+int64(n), ws, fileSize, sess)
 		return n, nil
@@ -170,7 +169,7 @@ func (sr *StreamReader) readWindow(ctx context.Context, fileKey string, off int6
 	slog.Debug("stream read cache miss", "fileKey", fileKey, "offset", off, "size", len(p))
 
 	// Determine which window this read falls in.
-	ws := windowStart(off)
+	ws := sr.windowStart(off)
 
 	// Get or create the file session (for lastSeek tracking).
 	sess := sr.getOrCreateSession(fileKey)
@@ -206,16 +205,17 @@ func (sr *StreamReader) readWindow(ctx context.Context, fileKey string, off int6
 	return n, nil
 }
 
-// windowStart returns the start offset of the 4 MiB window containing off.
-func windowStart(off int64) int64 {
-	return (off / windowSize) * windowSize
+// windowStart returns the start offset of the window containing off.
+func (sr *StreamReader) windowStart(off int64) int64 {
+	return (off / sr.windowSize) * sr.windowSize
 }
 
-// maybeCancelOnSeek checks if this read represents a far seek (>16 MiB away
-// from ALL inflight windows for the same file). If so, it cancels inflight
+// maybeCancelOnSeek checks if this read represents a far seek (>4 * windowSize
+// away from ALL inflight windows for the same file). If so, it cancels inflight
 // windows that are far from the new read position to save bandwidth.
 // It does NOT evict cached data — other concurrent readers may still need it.
 func (sr *StreamReader) maybeCancelOnSeek(fileKey string, off int64) {
+	seekThreshold := sr.windowSize * 4
 	farSeek := true
 
 	// Check if this offset is close to ANY inflight window for this file.
@@ -301,13 +301,14 @@ func (sr *StreamReader) getOrCreateWindow(fileKey string, ws int64, fileSize int
 
 	if v, ok := sr.inflight.Load(ik); ok {
 		win := v.(*inflightWindow)
-		if !win.done.Load() {
-			return win, false
-		}
-		// Window completed with error — allow retry by removing it.
-		if win.err != nil {
+		if win.done.Load() && win.err != nil {
+			// Errored window with all retries exhausted — remove it so a
+			// fresh window can be created. The cleanup goroutine may not have
+			// run yet, so we eagerly delete here.
 			sr.inflight.Delete(ik)
-			// fall through to create new window
+			if sr.metrics != nil {
+				sr.metrics.InflightWindows.Add(-1)
+			}
 		} else {
 			return win, false
 		}
@@ -369,94 +370,239 @@ func (sr *StreamReader) waitForBytes(ctx context.Context, win *inflightWindow, o
 		}
 		win.readyCond.Wait()
 	}
-	win.readyCond.L.Unlock()
 
+	// Lock is held here (cond.Wait reacquires before returning).
+	// fetchWindow modifies buf/err/total under this same lock, so reading
+	// them while holding the lock avoids the data race.
 	if win.err != nil {
+		win.readyCond.L.Unlock()
 		return 0, fmt.Errorf("stream window fetch: %w", win.err)
 	}
 
 	// Copy available bytes from window buffer.
 	avail := win.readyTo.Load() - offInWin
 	if avail <= 0 {
+		win.readyCond.L.Unlock()
 		return 0, fmt.Errorf("stream window: no data available at offset %d", off)
 	}
 	if avail > int64(len(p)) {
 		avail = int64(len(p))
 	}
 	copy(p, win.buf[offInWin:offInWin+avail])
+	win.readyCond.L.Unlock()
 	return int(avail), nil
 }
 
-// fetchWindow performs the CDN fetch for an inflight window and updates
-// readyTo as data arrives, unblocking waiting readers via early return.
+// fetchWindow performs the CDN fetch for an inflight window, reading the
+// response body chunk-by-chunk and updating readyTo as data arrives.
+// It retries retryable errors (429, 5xx) with exponential backoff,
+// transparently to waiting readers.
+//
+// Synchronization: buf and err are modified under readyCond.L so that
+// waitForBytes can safely read them while holding the same lock.
 func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStart int64, win *inflightWindow) {
 	defer func() {
+		win.readyCond.L.Lock()
 		win.done.Store(true)
 		win.readyCond.Broadcast()
+		win.readyCond.L.Unlock()
 	}()
 
 	url := sr.permalinkFor(fileKey)
-	winEnd := winStart + windowSize - 1
+	winEnd := winStart + sr.windowSize - 1
 
-	slog.Debug("fetching window", "fileKey", fileKey, "start", winStart, "end", winEnd, "url", url)
+	var lastErr error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			// Reset partial data from previous attempt.
+			win.readyCond.L.Lock()
+			win.buf = nil
+			win.total = 0
+			win.readyTo.Store(0)
+			win.readyCond.Broadcast() // wake waiters so they re-check
+			win.readyCond.L.Unlock()
 
-	data, err := sr.cdn.FetchRange(ctx, url, winStart, winEnd)
-	if err != nil {
-		slog.Warn("fetch window error", "fileKey", fileKey, "start", winStart, "err", err)
-		win.err = err
-		return
+			backoff := time.Duration(1<<uint(attempt-1)) * time.Second // 1s, 2s, 4s
+			if backoff > maxBackoff {
+				backoff = maxBackoff
+			}
+			slog.Warn("fetch window retry", "fileKey", fileKey, "start", winStart, "attempt", attempt, "backoff", backoff)
+			select {
+			case <-ctx.Done():
+				win.readyCond.L.Lock()
+				win.err = ctx.Err()
+				win.readyCond.Broadcast()
+				win.readyCond.L.Unlock()
+				return
+			case <-time.After(backoff):
+			}
+		}
+
+		slog.Debug("fetching window", "fileKey", fileKey, "start", winStart, "end", winEnd, "url", url)
+
+		resp, err := sr.cdn.FetchRange(ctx, url, winStart, winEnd)
+		if err != nil {
+			slog.Warn("fetch window error", "fileKey", fileKey, "start", winStart, "err", err)
+			lastErr = err
+			if isRetryable(err) && attempt < maxRetries {
+				continue
+			}
+			win.readyCond.L.Lock()
+			win.err = err
+			win.readyCond.Broadcast()
+			win.readyCond.L.Unlock()
+			return
+		}
+
+		// Read response body chunk-by-chunk, updating readyTo as data arrives
+		// so readers get early return. Lock held only during buf mutations
+		// and Broadcast — released between chunks so readers can proceed.
+		win.readyCond.L.Lock()
+		win.buf = make([]byte, 0, sr.windowSize)
+		win.readyCond.L.Unlock()
+		chunk := make([]byte, readChunkSize)
+		success := true
+		for {
+			n, readErr := resp.Body.Read(chunk)
+			if n > 0 {
+				win.readyCond.L.Lock()
+				win.buf = append(win.buf, chunk[:n]...)
+				win.total = int64(len(win.buf))
+				win.readyTo.Store(win.total)
+				win.readyCond.Broadcast()
+				win.readyCond.L.Unlock()
+			}
+			if readErr != nil {
+				if readErr == io.EOF {
+					break
+				}
+				slog.Warn("fetch window read error", "fileKey", fileKey, "start", winStart, "err", readErr)
+				lastErr = readErr
+				success = false
+				break
+			}
+		}
+		resp.Body.Close()
+
+		win.readyCond.L.Lock()
+		bufLen := len(win.buf)
+		win.readyCond.L.Unlock()
+
+		if success && bufLen > 0 {
+			slog.Debug("fetch window complete", "fileKey", fileKey, "start", winStart, "bytes", bufLen)
+
+			// Store in cache (no session tag -- cache data is never evicted by seek cancellation,
+			// only by LRU budget eviction).
+			win.readyCond.L.Lock()
+			cachedBuf := win.buf
+			win.readyCond.L.Unlock()
+			sr.cache.Put(fileKey, winStart, cachedBuf)
+
+			// Mark window as done before triggering read-ahead so that the
+			// inflight count check excludes this completed window.
+			win.readyCond.L.Lock()
+			win.done.Store(true)
+			win.readyCond.L.Unlock()
+
+			// Trigger read-ahead of the next window now that this window's data is
+			// cached and available.
+			sess := sr.getOrCreateSession(fileKey)
+			sr.maybeReadAhead(fileKey, winStart+sr.windowSize, winStart, win.fileSize, sess)
+
+			// Remove from inflight map after a short delay to allow late joiners.
+			// The window data is already in the cache for future reads.
+			go sr.cleanupWindow(win)
+
+			return
+		}
+
+		// Retry if retryable.
+		if !isRetryable(lastErr) || attempt >= maxRetries {
+			win.readyCond.L.Lock()
+			win.err = lastErr
+			win.readyCond.Broadcast()
+			win.readyCond.L.Unlock()
+			return
+		}
 	}
 
-	slog.Debug("fetch window complete", "fileKey", fileKey, "start", winStart, "bytes", len(data))
+	win.readyCond.L.Lock()
+	win.err = lastErr
+	win.readyCond.Broadcast()
+	win.readyCond.L.Unlock()
 
-	win.buf = data
-	win.total = int64(len(data))
-	win.readyTo.Store(win.total)
+	// Errored window -- remove after 5s to allow future reads to retry.
+	go sr.cleanupWindowOnError(win)
+}
 
-	// Store in cache (no session tag — cache data is never evicted by seek cancellation,
-	// only by LRU budget eviction).
-	sr.cache.Put(fileKey, winStart, data)
-
-	// Trigger read-ahead of the next window now that this window's data is
-	// cached and available. This fires read-ahead much earlier than waiting
-	// for a cache-hit in readWindow — as soon as the window is cached, not
-	// when the reader reaches the threshold offset.
-	sess := sr.getOrCreateSession(fileKey)
-	sr.maybeReadAhead(fileKey, winStart+windowSize, winStart, win.fileSize, sess)
-
-	// Remove from inflight map after a short delay to allow late joiners.
-	// The window data is already in the cache for future reads.
-	go func() {
-		time.Sleep(100 * time.Millisecond)
-		// Only delete if this window is still registered (not already replaced).
-		if v, ok := sr.inflight.Load(win.key); ok && v.(*inflightWindow) == win {
-			sr.inflight.Delete(win.key)
-			if sr.metrics != nil {
-				sr.metrics.InflightWindows.Add(-1)
-			}
+// cleanupWindow removes a completed (successful) inflight window from the map
+// after a short delay to allow late joiners.
+func (sr *StreamReader) cleanupWindow(win *inflightWindow) {
+	time.Sleep(100 * time.Millisecond)
+	// Only delete if this window is still registered (not already replaced).
+	if v, ok := sr.inflight.Load(win.key); ok && v.(*inflightWindow) == win {
+		sr.inflight.Delete(win.key)
+		if sr.metrics != nil {
+			sr.metrics.InflightWindows.Add(-1)
 		}
-		// Clean up session if no inflight windows remain for this file.
-		hasInflight := false
-		sr.inflight.Range(func(key, value any) bool {
-			if key.(inflightKey).fileKey == win.key.fileKey {
-				hasInflight = true
-				return false
-			}
-			return true
-		})
-		if !hasInflight {
-			sr.sessions.Delete(win.key.fileKey)
+	}
+	// Clean up session if no inflight windows remain for this file.
+	sr.maybeCleanupSession(win.key.fileKey)
+}
+
+// cleanupWindowOnError removes an errored inflight window from the map after
+// a delay, allowing future reads to retry with a fresh window.
+func (sr *StreamReader) cleanupWindowOnError(win *inflightWindow) {
+	time.Sleep(5 * time.Second)
+	if v, ok := sr.inflight.Load(win.key); ok && v.(*inflightWindow) == win {
+		sr.inflight.Delete(win.key)
+		if sr.metrics != nil {
+			sr.metrics.InflightWindows.Add(-1)
 		}
-	}()
+	}
+	sr.maybeCleanupSession(win.key.fileKey)
+}
+
+// maybeCleanupSession removes the file session if no inflight windows remain.
+func (sr *StreamReader) maybeCleanupSession(fileKey string) {
+	hasInflight := false
+	sr.inflight.Range(func(key, value any) bool {
+		if key.(inflightKey).fileKey == fileKey {
+			hasInflight = true
+			return false
+		}
+		return true
+	})
+	if !hasInflight {
+		sr.sessions.Delete(fileKey)
+	}
+}
+
+// isRetryable returns true for errors that may succeed on retry:
+// 429 (rate limit), 5xx (server errors), and network timeouts.
+// context.Canceled is NOT retryable — it's an explicit cancellation.
+func isRetryable(err error) bool {
+	var hse *HTTPStatusError
+	if errors.As(err, &hse) {
+		return hse.StatusCode == 429 || (hse.StatusCode >= 500 && hse.StatusCode < 600)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		return true
+	}
+	if errors.Is(err, context.Canceled) {
+		return false
+	}
+	// Unknown errors (network failures, DNS, etc.) are retryable.
+	return true
 }
 
 // maybeReadAhead triggers a prefetch of the next window if conditions are met:
-//   - The read end offset is at least readAheadThreshold into the current window
+//   - The read end offset is at least windowSize/2 into the current window
 //   - The next window is not cached and not already inflight
 //   - Per-file inflight count < maxInflight
 //   - No recent far seek for this file
 func (sr *StreamReader) maybeReadAhead(fileKey string, endOff, winStart, fileSize int64, sess *fileSession) {
-	nextStart := winStart + windowSize
+	nextStart := winStart + sr.windowSize
 
 	// Don't prefetch beyond EOF — there's nothing to fetch.
 	if nextStart >= fileSize {
@@ -464,6 +610,7 @@ func (sr *StreamReader) maybeReadAhead(fileKey string, endOff, winStart, fileSiz
 	}
 
 	// Check: read extends past readAheadThreshold into the current window.
+	readAheadThreshold := sr.windowSize / 2
 	if endOff < winStart+readAheadThreshold {
 		return
 	}
@@ -486,7 +633,7 @@ func (sr *StreamReader) maybeReadAhead(fileKey string, endOff, winStart, fileSiz
 	}
 
 	// Check: per-file active inflight count < maxInflight.
-	// Completed windows (done=true, waiting 100ms before removal) don't count
+	// Completed windows (done=true, waiting before removal) don't count
 	// because their data is already in the cache and they're not consuming
 	// CDN bandwidth.
 	inflightCount := 0

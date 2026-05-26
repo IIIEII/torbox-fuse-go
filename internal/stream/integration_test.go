@@ -383,26 +383,17 @@ func TestIntegration_BackendFailureRecovery(t *testing.T) {
 		return server.URL + "/" + fileKey
 	}, nil)
 
-	// First read should fail (error window is removed after error, allowing retry)
+	// fetchWindow retries internally with exponential backoff on 5xx errors.
+	// The first 2 CDN calls return 500, so the initial request (attempt 0) fails
+	// and the retry (attempt 1) also fails. Attempt 2 succeeds (call 3).
+	// The read should transparently succeed after internal retries.
 	buf := make([]byte, 1024)
-	_, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(4*1024*1024))
-	if err == nil {
-		t.Error("expected first read to fail")
-	}
-
-	// Second read should also fail
-	_, err = sr.ReadAt(context.Background(), "f1", 0, buf, int64(4*1024*1024))
-	if err == nil {
-		t.Error("expected second read to fail")
-	}
-
-	// Third read should succeed
 	n, err := sr.ReadAt(context.Background(), "f1", 0, buf, int64(4*1024*1024))
 	if err != nil {
-		t.Fatalf("expected third read to succeed, got: %v", err)
+		t.Fatalf("expected read to succeed after internal retries, got: %v", err)
 	}
 	if n != len(buf) {
-		t.Errorf("third read: got %d bytes, want %d", n, len(buf))
+		t.Errorf("read: got %d bytes, want %d", n, len(buf))
 	}
 	for i := 0; i < n; i++ {
 		if buf[i] != byte(i%256) {
