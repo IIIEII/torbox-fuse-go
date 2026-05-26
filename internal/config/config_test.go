@@ -42,6 +42,9 @@ func TestConfigDefaults(t *testing.T) {
 	if cfg.EntryTimeoutSec != 1 {
 		t.Errorf("EntryTimeoutSec = %d, want 1", cfg.EntryTimeoutSec)
 	}
+	if cfg.CDNURLCacheTTLSec != 300 {
+		t.Errorf("CDNURLCacheTTLSec = %d, want 300", cfg.CDNURLCacheTTLSec)
+	}
 	if cfg.CatalogRefreshInterval != 3*time.Hour {
 		t.Errorf("CatalogRefreshInterval = %v, want 3h", cfg.CatalogRefreshInterval)
 	}

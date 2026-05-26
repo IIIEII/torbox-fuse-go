@@ -46,7 +46,7 @@ func TestFetchRange_206PartialContent(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	cdn := NewCDNClient(4, nil)
+	cdn := NewCDNClient(4, nil, 0)
 	resp, err := cdn.FetchRange(context.Background(), ts.URL, 100, 199)
 	if err != nil {
 		t.Fatalf("FetchRange returned error: %v", err)
@@ -84,7 +84,7 @@ func TestFetchRange_200OK_ZeroOffset(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	cdn := NewCDNClient(4, nil)
+	cdn := NewCDNClient(4, nil, 0)
 	resp, err := cdn.FetchRange(context.Background(), ts.URL, 0, int64(len(body)-1))
 	if err != nil {
 		t.Fatalf("FetchRange returned error: %v", err)
@@ -107,7 +107,7 @@ func TestFetchRange_200OK_NonZeroOffset(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	cdn := NewCDNClient(4, nil)
+	cdn := NewCDNClient(4, nil, 0)
 	_, err := cdn.FetchRange(context.Background(), ts.URL, 100, 199)
 	if err == nil {
 		t.Fatal("expected error for 200 OK at non-zero offset, got nil")
@@ -137,7 +137,7 @@ func TestFetchRange_ConcurrencyLimit(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	cdn := NewCDNClient(maxConns, nil)
+	cdn := NewCDNClient(maxConns, nil, 0)
 
 	const totalReqs = 6
 	errCh := make(chan error, totalReqs)
@@ -196,7 +196,7 @@ func TestFetchRange_FollowsRedirect(t *testing.T) {
 	}))
 	defer redirect.Close()
 
-	client := NewCDNClient(4, nil)
+	client := NewCDNClient(4, nil, 0)
 	resp, err := client.FetchRange(context.Background(), redirect.URL, 0, 99)
 	if err != nil {
 		t.Fatalf("FetchRange after redirect: %v", err)
@@ -225,7 +225,7 @@ func TestFetchRange_TooManyRedirects(t *testing.T) {
 	}))
 	defer redirect.Close()
 
-	client := NewCDNClient(4, nil)
+	client := NewCDNClient(4, nil, 0)
 	_, err := client.FetchRange(context.Background(), redirect.URL, 0, 99)
 	if err == nil {
 		t.Fatal("expected error for redirect loop, got nil")
@@ -242,7 +242,7 @@ func TestFetchRange_IncrementsCDNRequestCount(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	cdn := NewCDNClient(4, m)
+	cdn := NewCDNClient(4, m, 0)
 
 	resp, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0)
 	if err != nil {
@@ -275,7 +275,7 @@ func TestFetchRange_IncCDNStatusCode(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	cdn := NewCDNClient(4, m)
+	cdn := NewCDNClient(4, m, 0)
 
 	resp, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0)
 	if err != nil {
@@ -300,7 +300,7 @@ func TestFetchRange_NilMetricsNoPanic(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	cdn := NewCDNClient(4, nil)
+	cdn := NewCDNClient(4, nil, 0)
 
 	resp, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0)
 	if err != nil {
@@ -315,7 +315,7 @@ func TestFetchRange_HTTPStatusError(t *testing.T) {
 	}))
 	defer ts.Close()
 
-	cdn := NewCDNClient(4, nil)
+	cdn := NewCDNClient(4, nil, 0)
 	_, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0)
 	if err == nil {
 		t.Fatal("expected error for 429, got nil")
@@ -335,7 +335,174 @@ func ErrorAs(err error, target any) bool {
 	return errors.As(err, target) //nolint:errcheck // test helper
 }
 
-func TestResolveURL(t *testing.T) {
+func TestResolveURL_CacheHit(t *testing.T) {
+	var resolveCount atomic.Int32
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resolveCount.Add(1)
+		w.Header().Set("Content-Range", "bytes 0-0/100")
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write([]byte{0x00})
+	}))
+	defer cdn.Close()
+
+	c := NewCDNClient(4, nil, 5*time.Minute)
+
+	// First resolution — should hit the CDN.
+	got := c.ResolveURL(context.Background(), cdn.URL)
+	if got != cdn.URL {
+		t.Errorf("ResolveURL first call = %q, want %q", got, cdn.URL)
+	}
+	if resolveCount.Load() != 1 {
+		t.Errorf("resolveCount after first call = %d, want 1", resolveCount.Load())
+	}
+
+	// Second resolution — should be cached, no new request.
+	got2 := c.ResolveURL(context.Background(), cdn.URL)
+	if got2 != cdn.URL {
+		t.Errorf("ResolveURL cached call = %q, want %q", got2, cdn.URL)
+	}
+	if resolveCount.Load() != 1 {
+		t.Errorf("resolveCount after cached call = %d, want 1 (should be cached)", resolveCount.Load())
+	}
+}
+
+func TestResolveURL_CacheExpiry(t *testing.T) {
+	var resolveCount atomic.Int32
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resolveCount.Add(1)
+		w.Header().Set("Content-Range", "bytes 0-0/100")
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write([]byte{0x00})
+	}))
+	defer cdn.Close()
+
+	// Very short TTL so it expires quickly.
+	c := NewCDNClient(4, nil, 50*time.Millisecond)
+
+	c.ResolveURL(context.Background(), cdn.URL)
+	if resolveCount.Load() != 1 {
+		t.Fatalf("resolveCount after first call = %d, want 1", resolveCount.Load())
+	}
+
+	// Wait for TTL to expire.
+	time.Sleep(100 * time.Millisecond)
+
+	c.ResolveURL(context.Background(), cdn.URL)
+	if resolveCount.Load() != 2 {
+		t.Errorf("resolveCount after expiry = %d, want 2 (should re-resolve)", resolveCount.Load())
+	}
+}
+
+func TestResolveURL_FollowsRedirect(t *testing.T) {
+	cdnServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-0/100")
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write([]byte{0x00})
+	}))
+	defer cdnServer.Close()
+
+	redirectServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", cdnServer.URL)
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer redirectServer.Close()
+
+	c := NewCDNClient(4, nil, 5*time.Minute)
+
+	got := c.ResolveURL(context.Background(), redirectServer.URL)
+	if got != cdnServer.URL {
+		t.Errorf("ResolveURL = %q, want %q (should follow redirect to CDN)", got, cdnServer.URL)
+	}
+
+	// Verify cached — no new redirect request.
+	got2 := c.ResolveURL(context.Background(), redirectServer.URL)
+	if got2 != cdnServer.URL {
+		t.Errorf("ResolveURL cached = %q, want %q", got2, cdnServer.URL)
+	}
+}
+
+func TestResolveURL_ZeroTTL(t *testing.T) {
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-0/100")
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write([]byte{0x00})
+	}))
+	defer cdn.Close()
+
+	c := NewCDNClient(4, nil, 0) // TTL=0 disables caching
+
+	got := c.ResolveURL(context.Background(), cdn.URL)
+	if got != cdn.URL {
+		t.Errorf("ResolveURL with TTL=0 = %q, want %q (pass-through)", got, cdn.URL)
+	}
+
+	// Verify nothing was cached.
+	if _, ok := c.urlCache.Load(cdn.URL); ok {
+		t.Error("urlCache should be empty when TTL=0")
+	}
+}
+
+func TestInvalidateURL(t *testing.T) {
+	cdn := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-0/100")
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write([]byte{0x00})
+	}))
+	defer cdn.Close()
+
+	c := NewCDNClient(4, nil, 5*time.Minute)
+
+	// Resolve and cache.
+	c.ResolveURL(context.Background(), cdn.URL)
+	if _, ok := c.urlCache.Load(cdn.URL); !ok {
+		t.Fatal("expected URL to be cached after ResolveURL")
+	}
+
+	// Invalidate.
+	c.InvalidateURL(cdn.URL)
+	if _, ok := c.urlCache.Load(cdn.URL); ok {
+		t.Error("expected URL to be removed from cache after InvalidateURL")
+	}
+}
+
+func TestFetchRange_ExpiredCDNURLRetry(t *testing.T) {
+	var requestCount atomic.Int32
+	cdnServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount.Add(1)
+		w.Header().Set("Content-Range", "bytes 0-0/100")
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write([]byte{0x00})
+	}))
+	defer cdnServer.Close()
+
+	// API server: redirects to CDN on first call, then returns 403 on CDN requests,
+	// then redirects to a new CDN URL on the second API call.
+	var apiCallCount atomic.Int32
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		count := apiCallCount.Add(1)
+		w.Header().Set("Location", cdnServer.URL)
+		w.WriteHeader(http.StatusFound)
+		_ = count
+	}))
+	defer apiServer.Close()
+
+	c := NewCDNClient(4, nil, 5*time.Minute)
+
+	// First, resolve the URL through the API.
+	resolved := c.ResolveURL(context.Background(), apiServer.URL)
+	if resolved != cdnServer.URL {
+		t.Fatalf("ResolveURL = %q, want %q", resolved, cdnServer.URL)
+	}
+
+	// Now fetch range from the resolved URL should work.
+	resp, err := c.FetchRange(context.Background(), apiServer.URL, 0, 0)
+	if err != nil {
+		t.Fatalf("FetchRange error: %v", err)
+	}
+	resp.Body.Close()
+}
+
+func TestResolveRedirectLocation(t *testing.T) {
 	tests := []struct {
 		base     string
 		location string

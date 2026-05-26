@@ -17,6 +17,7 @@ type Config struct {
 	StreamConcurrency      int
 	AttrTimeoutSec        int
 	EntryTimeoutSec       int
+	CDNURLCacheTTLSec     int
 	CatalogRefreshInterval time.Duration
 	MetricsListenAddr      string
 	StateDBPath            string
@@ -84,6 +85,7 @@ func Load() (*Config, error) {
 		StreamConcurrency:      envInt("FUSE_STREAM_CONCURRENCY", 8),
 		AttrTimeoutSec:        envInt("FUSE_ATTR_TIMEOUT_SEC", 1),
 		EntryTimeoutSec:       envInt("FUSE_ENTRY_TIMEOUT_SEC", 1),
+		CDNURLCacheTTLSec:    envInt("FUSE_CDN_URL_CACHE_TTL_SEC", 300),
 		CatalogRefreshInterval: envDuration("CATALOG_REFRESH_INTERVAL", 3*time.Hour),
 		MetricsListenAddr:      env("METRICS_LISTEN_ADDR", "127.0.0.1:9080"),
 		StateDBPath:            env("STATE_DB_PATH", "/config/state.db"),

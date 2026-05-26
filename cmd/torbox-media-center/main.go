@@ -68,8 +68,9 @@ func main() {
 	budgetBytes := int64(cfg.CacheBudgetMB) * 1024 * 1024
 	rc := cache.NewRangeCache(budgetBytes, m)
 
-	// Create CDN client with configured concurrency.
-	cdn := stream.NewCDNClient(cfg.StreamConcurrency, m)
+	// Create CDN client with configured concurrency and URL cache TTL.
+	urlCacheTTL := time.Duration(cfg.CDNURLCacheTTLSec) * time.Second
+	cdn := stream.NewCDNClient(cfg.StreamConcurrency, m, urlCacheTTL)
 
 	// Create permalink builder from config and TorBox client.
 	permalinkBuilder := fusefs.PermalinkBuilderFromClient(cfg, tbClient)
