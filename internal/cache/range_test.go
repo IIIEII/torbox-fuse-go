@@ -638,6 +638,93 @@ func TestCopyTo_NegativeOffset_NoPanic(t *testing.T) {
 	}
 }
 
+// --- CachedPrefixLen ---
+
+func TestCachedPrefixLen_Hit(t *testing.T) {
+	rc := NewRangeCache(1<<20, nil)
+	data := []byte("ABCDEFGHIJ") // 10 bytes at offset 0
+	rc.Put("f1", 0, data)
+
+	length, ok := rc.CachedPrefixLen("f1", 0)
+	if !ok {
+		t.Fatal("expected cache hit")
+	}
+	if length != 10 {
+		t.Errorf("got length %d, want 10", length)
+	}
+}
+
+func TestCachedPrefixLen_Miss(t *testing.T) {
+	rc := NewRangeCache(1<<20, nil)
+
+	length, ok := rc.CachedPrefixLen("f1", 0)
+	if ok {
+		t.Error("expected cache miss")
+	}
+	if length != 0 {
+		t.Errorf("got length %d on miss, want 0", length)
+	}
+}
+
+func TestCachedPrefixLen_MissAtDifferentOffset(t *testing.T) {
+	rc := NewRangeCache(1<<20, nil)
+	rc.Put("f1", 0, []byte("ABCDEFGHIJ"))
+
+	// Look for a block starting at offset 5 — block starts at 0, not 5
+	length, ok := rc.CachedPrefixLen("f1", 5)
+	if ok {
+		t.Error("expected miss for offset that doesn't match block start")
+	}
+	if length != 0 {
+		t.Errorf("got length %d, want 0", length)
+	}
+}
+
+func TestCachedPrefixLen_DifferentFileKey(t *testing.T) {
+	rc := NewRangeCache(1<<20, nil)
+	rc.Put("f1", 0, []byte("ABCDEFGHIJ"))
+
+	// Look for a block in file f2 at offset 0 — no such block
+	_, ok := rc.CachedPrefixLen("f2", 0)
+	if ok {
+		t.Error("expected miss for different file key")
+	}
+}
+
+func TestCachedPrefixLen_LargeOffset(t *testing.T) {
+	rc := NewRangeCache(16<<20, nil) // 16 MiB budget to fit 4 MiB block
+	data := make([]byte, 4*1024*1024) // 4 MiB block at 16 MiB offset
+	rc.Put("f1", 16*1024*1024, data)
+
+	length, ok := rc.CachedPrefixLen("f1", 16*1024*1024)
+	if !ok {
+		t.Fatal("expected cache hit")
+	}
+	if length != int64(len(data)) {
+		t.Errorf("got length %d, want %d", length, len(data))
+	}
+}
+
+func TestCachedPrefixLen_AfterOverwrite(t *testing.T) {
+	rc := NewRangeCache(1<<20, nil)
+	rc.Put("f1", 0, []byte("old_data")) // 8 bytes
+
+	length, ok := rc.CachedPrefixLen("f1", 0)
+	if !ok || length != 8 {
+		t.Errorf("before overwrite: ok=%v length=%d, want ok=true length=8", ok, length)
+	}
+
+	rc.Put("f1", 0, []byte("new_longer_data")) // 15 bytes
+
+	length, ok = rc.CachedPrefixLen("f1", 0)
+	if !ok {
+		t.Fatal("expected cache hit after overwrite")
+	}
+	if length != 15 {
+		t.Errorf("after overwrite: got length %d, want 15", length)
+	}
+}
+
 // ============================================================
 // Phase 2: Cache lookup/store gaps (spec §2)
 // ============================================================

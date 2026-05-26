@@ -901,6 +901,7 @@ func TestReadAt_MetricsCancelledStreamCount(t *testing.T) {
 		readyCond:  sync.NewCond(&sync.Mutex{}),
 		cancelFunc: cancel,
 	}
+	orphanWin.done.Store(true) // seek cancellation only cancels done windows
 	sr.inflight.Store(orphanWin.key, orphanWin)
 	sr.metrics.InflightWindows.Add(1)
 

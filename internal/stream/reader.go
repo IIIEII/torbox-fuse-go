@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"net/http"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -401,6 +402,10 @@ func (sr *StreamReader) waitForBytes(ctx context.Context, win *inflightWindow, o
 // It retries retryable errors (429, 5xx) with exponential backoff,
 // transparently to waiting readers.
 //
+// Before fetching from CDN, it checks the cache for a contiguous prefix starting
+// at winStart. If found, only the missing suffix is fetched from CDN, saving
+// bandwidth on re-fetches after interrupted or cancelled windows.
+//
 // Synchronization: buf and err are modified under readyCond.L so that
 // waitForBytes can safely read them while holding the same lock.
 func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStart int64, win *inflightWindow) {
@@ -412,7 +417,10 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 	}()
 
 	url := sr.permalinkFor(fileKey)
-	winEnd := winStart + sr.windowSize - 1
+	winEnd := winStart + sr.windowSize
+	if winEnd > win.fileSize {
+		winEnd = win.fileSize
+	}
 
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
@@ -441,9 +449,62 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 			}
 		}
 
-		slog.Debug("fetching window", "fileKey", fileKey, "start", winStart, "end", winEnd, "url", url)
+		// Check cache for a contiguous prefix starting at winStart.
+		// If partial data was cached from a previous interrupted fetch,
+		// we only need to fetch the missing suffix from CDN.
+		var cachedLen int64
+		if cl, ok := sr.cache.CachedPrefixLen(fileKey, winStart); ok && cl > 0 {
+			cachedLen = cl
+		}
 
-		resp, err := sr.cdn.FetchRange(ctx, url, winStart, winEnd)
+		windowLen := winEnd - winStart
+
+		// If the entire window is already cached, copy from cache and we're done.
+		// This shouldn't normally happen (readWindow would have hit the cache),
+		// but handle it gracefully.
+		if cachedLen >= windowLen {
+			win.readyCond.L.Lock()
+			win.buf = make([]byte, windowLen)
+			n, _ := sr.cache.CopyTo(fileKey, winStart, win.buf)
+			win.total = int64(n)
+			win.readyTo.Store(win.total)
+			win.readyCond.Broadcast()
+			win.readyCond.L.Unlock()
+			sr.cache.Put(fileKey, winStart, win.buf)
+			win.readyCond.L.Lock()
+			win.done.Store(true)
+			win.readyCond.L.Unlock()
+			sess := sr.getOrCreateSession(fileKey)
+			sr.maybeReadAhead(fileKey, winStart+sr.windowSize, winStart, win.fileSize, sess)
+			go sr.cleanupWindow(win)
+			return
+		}
+
+		// Determine CDN fetch range: skip the cached prefix if present.
+		fetchStart := winStart + cachedLen
+		fetchEnd := winEnd - 1 // FetchRange uses inclusive end
+
+		// Prepare the buffer: pre-fill cached prefix if present.
+		win.readyCond.L.Lock()
+		if cachedLen > 0 {
+			win.buf = make([]byte, cachedLen)
+			n, _ := sr.cache.CopyTo(fileKey, winStart, win.buf)
+			win.buf = win.buf[:n]
+			win.total = int64(len(win.buf))
+			win.readyTo.Store(win.total)
+			win.readyCond.Broadcast()
+		} else {
+			win.buf = make([]byte, 0, sr.windowSize)
+		}
+		win.readyCond.L.Unlock()
+
+		if cachedLen > 0 {
+			slog.Debug("cache prefix hit", "fileKey", fileKey, "start", winStart, "cachedLen", cachedLen, "fetchStart", fetchStart)
+		}
+
+		slog.Debug("fetching window", "fileKey", fileKey, "start", winStart, "end", winEnd, "fetchStart", fetchStart, "url", url)
+
+		resp, err := sr.cdn.FetchRange(ctx, url, fetchStart, fetchEnd)
 		if err != nil {
 			slog.Warn("fetch window error", "fileKey", fileKey, "start", winStart, "err", err)
 			lastErr = err
@@ -457,34 +518,8 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 			return
 		}
 
-		// Read response body chunk-by-chunk, updating readyTo as data arrives
-		// so readers get early return. Lock held only during buf mutations
-		// and Broadcast — released between chunks so readers can proceed.
-		win.readyCond.L.Lock()
-		win.buf = make([]byte, 0, sr.windowSize)
-		win.readyCond.L.Unlock()
-		chunk := make([]byte, readChunkSize)
-		success := true
-		for {
-			n, readErr := resp.Body.Read(chunk)
-			if n > 0 {
-				win.readyCond.L.Lock()
-				win.buf = append(win.buf, chunk[:n]...)
-				win.total = int64(len(win.buf))
-				win.readyTo.Store(win.total)
-				win.readyCond.Broadcast()
-				win.readyCond.L.Unlock()
-			}
-			if readErr != nil {
-				if readErr == io.EOF {
-					break
-				}
-				slog.Warn("fetch window read error", "fileKey", fileKey, "start", winStart, "err", readErr)
-				lastErr = readErr
-				success = false
-				break
-			}
-		}
+		// Stream CDN response body into win.buf starting after the cached prefix.
+		fetched, success := sr.streamInto(resp, cachedLen, win, fileKey, winStart)
 		resp.Body.Close()
 
 		win.readyCond.L.Lock()
@@ -492,10 +527,6 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 		win.readyCond.L.Unlock()
 
 		if bufLen > 0 {
-			// Cache whatever data we received -- even if the read was interrupted
-			// (e.g. seek cancellation via context canceled), the partial data is
-			// valid and future reads in this range should hit the cache instead
-			// of triggering another CDN round-trip.
 			win.readyCond.L.Lock()
 			cachedBuf := win.buf
 			win.readyCond.L.Unlock()
@@ -503,27 +534,23 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 		}
 
 		if success && bufLen > 0 {
-			slog.Debug("fetch window complete", "fileKey", fileKey, "start", winStart, "bytes", bufLen)
+			slog.Debug("fetch window complete", "fileKey", fileKey, "start", winStart, "bytes", bufLen, "cachedPrefix", cachedLen)
 
-			// Mark window as done before triggering read-ahead so that the
-			// inflight count check excludes this completed window.
 			win.readyCond.L.Lock()
 			win.done.Store(true)
 			win.readyCond.L.Unlock()
 
-			// Trigger read-ahead of the next window now that this window's data is
-			// cached and available.
 			sess := sr.getOrCreateSession(fileKey)
 			sr.maybeReadAhead(fileKey, winStart+sr.windowSize, winStart, win.fileSize, sess)
-
-			// Remove from inflight map after a short delay to allow late joiners.
-			// The window data is already in the cache for future reads.
 			go sr.cleanupWindow(win)
-
 			return
 		}
 
-		// Retry if retryable.
+		if !success {
+			lastErr = fmt.Errorf("stream read failed after %d bytes", fetched)
+		} else {
+			lastErr = fmt.Errorf("no data received")
+		}
 		if !isRetryable(lastErr) || attempt >= maxRetries {
 			win.readyCond.L.Lock()
 			win.err = lastErr
@@ -538,8 +565,34 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 	win.readyCond.Broadcast()
 	win.readyCond.L.Unlock()
 
-	// Errored window -- remove after 5s to allow future reads to retry.
 	go sr.cleanupWindowOnError(win)
+}
+
+// streamInto reads the CDN response body into win.buf, appending chunks starting
+// at the given buffer offset (bufOff). It updates readyTo as data arrives and
+// broadcasts to wake waiting readers. Returns (bytesRead, success).
+func (sr *StreamReader) streamInto(resp *http.Response, bufOff int64, win *inflightWindow, fileKey string, winStart int64) (int64, bool) {
+	chunk := make([]byte, readChunkSize)
+	var totalRead int64
+	for {
+		n, readErr := resp.Body.Read(chunk)
+		if n > 0 {
+			win.readyCond.L.Lock()
+			win.buf = append(win.buf, chunk[:n]...)
+			win.total = int64(len(win.buf))
+			win.readyTo.Store(bufOff + totalRead + int64(n))
+			win.readyCond.Broadcast()
+			win.readyCond.L.Unlock()
+			totalRead += int64(n)
+		}
+		if readErr != nil {
+			if readErr == io.EOF {
+				return totalRead, true
+			}
+			slog.Warn("stream read error", "fileKey", fileKey, "start", winStart, "err", readErr)
+			return totalRead, false
+		}
+	}
 }
 
 // cleanupWindow removes a completed (successful) inflight window from the map

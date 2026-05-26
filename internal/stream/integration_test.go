@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"sync"
 	"sync/atomic"
 	"testing"
 
@@ -399,5 +400,104 @@ func TestIntegration_BackendFailureRecovery(t *testing.T) {
 		if buf[i] != byte(i%256) {
 			t.Fatalf("data mismatch at offset %d after recovery", i)
 		}
+	}
+}
+
+// 7.10 Cache-aware fetch: when partial data is cached from a previous interrupted
+// fetch, the next read only requests the missing suffix from CDN.
+func TestIntegration_CacheAwareFetch(t *testing.T) {
+	testData := make([]byte, 8*1024*1024)
+	for i := range testData {
+		testData[i] = byte(i % 256)
+	}
+
+	// Track CDN range requests to verify cache-aware behavior.
+	var mu sync.Mutex
+	var rangeRequests []string
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		rangeHdr := r.Header.Get("Range")
+		mu.Lock()
+		rangeRequests = append(rangeRequests, rangeHdr)
+		mu.Unlock()
+
+		if rangeHdr == "" {
+			w.Header().Set("Content-Length", fmt.Sprintf("%d", len(testData)))
+			w.WriteHeader(http.StatusOK)
+			w.Write(testData)
+			return
+		}
+		var start, end int64
+		n, err := fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end)
+		if err != nil || n != 2 {
+			http.Error(w, "bad range", http.StatusBadRequest)
+			return
+		}
+		if start >= int64(len(testData)) {
+			w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+			return
+		}
+		if end >= int64(len(testData)) {
+			end = int64(len(testData) - 1)
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(testData)))
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", end-start+1))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(testData[start : end+1])
+	}))
+	defer server.Close()
+
+	rc := cache.NewRangeCache(256 << 20, nil)
+	cdn := NewCDNClient(8, nil)
+	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
+		return server.URL + "/" + fileKey
+	}, nil)
+
+	// Simulate a previous interrupted fetch: manually cache 1 MiB of window
+	// [4MiB, 8MiB) for file "f2". This represents partial data from an
+	// interrupted fetch that was saved to cache.
+	partialStart := int64(4 * 1024 * 1024)
+	partialLen := int64(1024 * 1024) // 1 MiB
+	partialData := make([]byte, partialLen)
+	copy(partialData, testData[partialStart:partialStart+partialLen])
+	rc.Put("f2", partialStart, partialData)
+
+	// Read from offset 6 MiB (beyond the 1 MiB cached prefix at 4 MiB).
+	// This should create an inflight window for [4MiB, 8MiB), detect the
+	// cached prefix at offset 4MiB, and only fetch [5MiB, 8MiB) from CDN.
+	beyondPrefix := int64(4*1024*1024 + 2*1024*1024)
+	buf := make([]byte, 1024)
+	n, err := sr.ReadAt(context.Background(), "f2", beyondPrefix, buf, int64(len(testData)))
+	if err != nil {
+		t.Fatalf("beyond prefix read: %v", err)
+	}
+	if n != len(buf) {
+		t.Errorf("beyond prefix read: got %d bytes, want %d", n, len(buf))
+	}
+	for i := 0; i < n; i++ {
+		if buf[i] != byte((beyondPrefix+int64(i))%256) {
+			t.Fatalf("data mismatch at offset %d: got 0x%02x, want 0x%02x",
+				beyondPrefix+int64(i), buf[i], byte((beyondPrefix+int64(i))%256))
+		}
+	}
+
+	// Verify the CDN request for window [4MiB, 8MiB) started at 5MiB
+	// (skipping the 1 MiB cached prefix).
+	mu.Lock()
+	finalRanges := rangeRequests
+	mu.Unlock()
+	foundCacheAwareRange := false
+	for _, r := range finalRanges {
+		var start, end int64
+		if n, err := fmt.Sscanf(r, "bytes=%d-%d", &start, &end); err == nil && n == 2 {
+			if start == partialStart+partialLen {
+				foundCacheAwareRange = true
+				break
+			}
+		}
+	}
+	if !foundCacheAwareRange {
+		t.Errorf("expected cache-aware CDN range starting at %d, got ranges: %v",
+			partialStart+partialLen, finalRanges)
 	}
 }

@@ -96,6 +96,27 @@ func (rc *RangeCache) CopyTo(fileKey string, off int64, dst []byte) (int, bool) 
 	return 0, false
 }
 
+// CachedPrefixLen returns the length of contiguous cached data starting at off
+// for the given fileKey. Returns (length, true) if cached data exists at that
+// exact offset; (0, false) otherwise.
+//
+// This is an O(1) shard lookup — since Put stores at (fileKey, start), looking
+// up (fileKey, off) where off equals a stored block's start always hits the
+// correct shard.
+func (rc *RangeCache) CachedPrefixLen(fileKey string, off int64) (int64, bool) {
+	si := shardIndex(fileKey, off)
+	sh := &rc.shards[si]
+	sh.mu.RLock()
+	key := cacheKey{fileKey: fileKey, start: off}
+	if blk, ok := sh.blocks[key]; ok {
+		n := int64(len(blk.data))
+		sh.mu.RUnlock()
+		return n, true
+	}
+	sh.mu.RUnlock()
+	return 0, false
+}
+
 // Put inserts a block at (fileKey, start). The data slice is copied so the
 // caller may reuse their buffer. Empty data is silently ignored.
 // If the total cached size exceeds the budget after insertion, the
