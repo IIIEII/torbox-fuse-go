@@ -302,10 +302,12 @@ func (sr *StreamReader) getOrCreateWindow(fileKey string, ws int64) (*inflightWi
 	}
 
 	// Create new inflight window.
+	// buf is set by fetchWindow once the CDN response arrives — readers wait
+	// on readyCond until readyTo >= their needed offset, so nil buf is safe
+	// until data arrives.
 	wctx, cancel := context.WithCancel(context.Background())
 	win := &inflightWindow{
 		key:        ik,
-		buf:        make([]byte, windowSize),
 		readyCond:  sync.NewCond(&sync.Mutex{}),
 		cancelFunc: cancel,
 	}
@@ -394,8 +396,8 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 
 	slog.Debug("fetch window complete", "fileKey", fileKey, "start", winStart, "bytes", len(data))
 
+	win.buf = data
 	win.total = int64(len(data))
-	copy(win.buf, data)
 	win.readyTo.Store(win.total)
 
 	// Store in cache (no session tag — cache data is never evicted by seek cancellation,
