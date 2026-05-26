@@ -231,21 +231,12 @@ func (sr *StreamReader) maybeCancelOnSeek(fileKey string, off int64) {
 		return
 	}
 
-	if sr.metrics != nil {
-		sr.metrics.CancelledStreamCount.Add(1)
-	}
-
 	sess := sr.getOrCreateSession(fileKey)
-	sess.lastSeek.Store(time.Now().UnixNano())
-
-	slog.Debug("seek cancellation",
-		"fileKey", fileKey,
-		"offset", off,
-	)
 
 	// Cancel orphaned inflight windows far from the new read position.
 	// Only cancel windows with waiters == 0 — these have no active readers
 	// (e.g. read-ahead prefetch data that no one asked for).
+	cancelled := false
 	sr.inflight.Range(func(key, value any) bool {
 		ik := key.(inflightKey)
 		if ik.fileKey != fileKey {
@@ -258,12 +249,24 @@ func (sr *StreamReader) maybeCancelOnSeek(fileKey string, off int64) {
 		}
 		if distance > seekThreshold && win.waiters.Load() == 0 {
 			win.cancelFunc()
+			cancelled = true
 			if sr.metrics != nil {
 				sr.metrics.InflightWindows.Add(-1)
 			}
 		}
 		return true
 	})
+
+	// Only suppress read-ahead if we actually cancelled something.
+	// A far seek detection alone must NOT suppress read-ahead — Plex reads
+	// from multiple regions (header, EOF probe) and every ReadAt triggers
+	// farSeek, which would permanently disable read-ahead otherwise.
+	if cancelled {
+		if sr.metrics != nil {
+			sr.metrics.CancelledStreamCount.Add(1)
+		}
+		sess.lastSeek.Store(time.Now().UnixNano())
+	}
 
 	// Do NOT evict cached data — concurrent readers may still need it.
 	// Cache eviction is handled by the LRU budget mechanism.

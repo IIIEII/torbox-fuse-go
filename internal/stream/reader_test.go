@@ -859,18 +859,10 @@ func TestReadAt_MetricsInflightWindows(t *testing.T) {
 func TestReadAt_MetricsCancelledStreamCount(t *testing.T) {
 	m := metrics.New()
 
-	// Use a slow CDN server so the orphaned read-ahead window stays inflight.
-	var fetchedOffsets []int64
-	var mu sync.Mutex
 	server := newMockCDNServer(t, func(w http.ResponseWriter, r *http.Request) {
 		rangeHdr := r.Header.Get("Range")
 		var start, end int64
 		fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end)
-		mu.Lock()
-		fetchedOffsets = append(fetchedOffsets, start)
-		mu.Unlock()
-		// Delay all responses so windows stay inflight.
-		time.Sleep(300 * time.Millisecond)
 		data := make([]byte, end-start+1)
 		for i := range data {
 			data[i] = byte((start + int64(i)) % 256)
@@ -887,24 +879,21 @@ func TestReadAt_MetricsCancelledStreamCount(t *testing.T) {
 		return server.URL + "/" + fileKey
 	}, m)
 
-	// Read at offset 0 to create an inflight window with waiters > 0.
-	// This window should NOT be cancelled by a far seek because it has an active reader.
-	buf := make([]byte, 100)
-	go sr.ReadAt(context.Background(), "file1", 0, buf, 24*1024*1024)
-
-	// Wait for the inflight window at offset 0 to be created.
-	time.Sleep(100 * time.Millisecond)
-
-	// Now create an orphaned read-ahead window at offset 4 MiB by reading there
-	// and finishing quickly (waiters drops to 0 after the read returns).
-	buf2 := make([]byte, 100)
-	sr.ReadAt(context.Background(), "file1", windowSize, buf2, 24*1024*1024)
-
-	// Wait a moment for the read-ahead window at 8 MiB to be created (if any).
-	time.Sleep(100 * time.Millisecond)
+	// Insert an orphaned window (waiters == 0) at offset 0.
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	orphanWin := &inflightWindow{
+		key:        inflightKey{fileKey: "file1", start: 0},
+		buf:        make([]byte, windowSize),
+		readyCond:  sync.NewCond(&sync.Mutex{}),
+		cancelFunc: cancel,
+	}
+	sr.inflight.Store(orphanWin.key, orphanWin)
+	sr.metrics.InflightWindows.Add(1)
 
 	// Seek far away (>16 MiB) to trigger seek cancellation.
-	sr.ReadAt(context.Background(), "file1", 20*1024*1024, make([]byte, 100), 24*1024*1024)
+	buf := make([]byte, 100)
+	sr.ReadAt(context.Background(), "file1", 20*1024*1024, buf, 24*1024*1024)
 
 	if m.CancelledStreamCount.Load() < 1 {
 		t.Errorf("CancelledStreamCount should be >= 1, got %d", m.CancelledStreamCount.Load())
