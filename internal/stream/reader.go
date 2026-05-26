@@ -242,9 +242,12 @@ func (sr *StreamReader) maybeCancelOnSeek(fileKey string, off int64) {
 
 	sess := sr.getOrCreateSession(fileKey)
 
-	// Cancel orphaned inflight windows far from the new read position.
-	// Only cancel windows with waiters == 0 — these have no active readers
-	// (e.g. read-ahead prefetch data that no one asked for).
+	// Cancel completed read-ahead windows far from the new read position.
+	// Only cancel windows that are done (data already cached) with waiters == 0.
+	// In-progress windows (!done) must NOT be cancelled — their data is still
+	// being streamed from CDN and will be needed by future reads. Canceling an
+	// in-flight window wastes the CDN bandwidth already spent and forces a fresh
+	// round-trip when the player returns to that range.
 	cancelled := false
 	sr.inflight.Range(func(key, value any) bool {
 		ik := key.(inflightKey)
@@ -256,7 +259,7 @@ func (sr *StreamReader) maybeCancelOnSeek(fileKey string, off int64) {
 		if distance < 0 {
 			distance = -distance
 		}
-		if distance > seekThreshold && win.waiters.Load() == 0 {
+		if distance > seekThreshold && win.done.Load() && win.waiters.Load() == 0 {
 			win.cancelFunc()
 			cancelled = true
 			if sr.metrics != nil {

@@ -1005,7 +1005,8 @@ func TestReadAt_SeekCancelsOrphanedWindow(t *testing.T) {
 	}, m)
 
 	// Create an orphaned window at offset 0 by directly inserting it into the
-	// inflight map with waiters == 0 (simulating a read-ahead that no one is using).
+	// inflight map with waiters == 0 and done == true (simulating a completed
+	// read-ahead window that no one is using anymore).
 	_, cancel := context.WithCancel(context.Background())
 	orphanWin := &inflightWindow{
 		key:       inflightKey{fileKey: "file1", start: 0},
@@ -1013,6 +1014,7 @@ func TestReadAt_SeekCancelsOrphanedWindow(t *testing.T) {
 		readyCond: sync.NewCond(&sync.Mutex{}),
 		cancelFunc: cancel,
 	}
+	orphanWin.done.Store(true)
 	sr.inflight.Store(orphanWin.key, orphanWin)
 	if sr.metrics != nil {
 		sr.metrics.InflightWindows.Add(1)
