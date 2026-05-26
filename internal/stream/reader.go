@@ -488,15 +488,19 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 		bufLen := len(win.buf)
 		win.readyCond.L.Unlock()
 
-		if success && bufLen > 0 {
-			slog.Debug("fetch window complete", "fileKey", fileKey, "start", winStart, "bytes", bufLen)
-
-			// Store in cache (no session tag -- cache data is never evicted by seek cancellation,
-			// only by LRU budget eviction).
+		if bufLen > 0 {
+			// Cache whatever data we received -- even if the read was interrupted
+			// (e.g. seek cancellation via context canceled), the partial data is
+			// valid and future reads in this range should hit the cache instead
+			// of triggering another CDN round-trip.
 			win.readyCond.L.Lock()
 			cachedBuf := win.buf
 			win.readyCond.L.Unlock()
 			sr.cache.Put(fileKey, winStart, cachedBuf)
+		}
+
+		if success && bufLen > 0 {
+			slog.Debug("fetch window complete", "fileKey", fileKey, "start", winStart, "bytes", bufLen)
 
 			// Mark window as done before triggering read-ahead so that the
 			// inflight count check excludes this completed window.
