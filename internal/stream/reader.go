@@ -26,8 +26,10 @@ const (
 	seekThreshold int64 = 16 * 1024 * 1024
 
 	// readAheadThreshold is how far into the current window the read offset
-	// must be before read-ahead is triggered.
-	readAheadThreshold int64 = 4 * 1024 * 1024
+	// must be before read-ahead is triggered. Set to half the window size so
+	// that read-ahead fires when the reader is midway through a window, giving
+	// the CDN enough time to deliver the next window before the reader needs it.
+	readAheadThreshold int64 = 2 * 1024 * 1024
 )
 
 // PermalinkBuilder returns the CDN URL for a given fileKey.
@@ -155,6 +157,12 @@ func (sr *StreamReader) readWindow(ctx context.Context, fileKey string, off int6
 		if sr.metrics != nil {
 			sr.metrics.CacheHitCount.Add(1)
 		}
+		// Trigger read-ahead on cache hits too — sequential playback
+		// typically hits cached data, and skipping read-ahead here means
+		// the next window is never prefetched.
+		ws := windowStart(off)
+		sess := sr.getOrCreateSession(fileKey)
+		sr.maybeReadAhead(fileKey, off+int64(n), ws, sess)
 		return n, nil
 	}
 
@@ -192,7 +200,7 @@ func (sr *StreamReader) readWindow(ctx context.Context, fileKey string, off int6
 	}
 
 	// Trigger read-ahead if conditions are met.
-	sr.maybeReadAhead(fileKey, off, ws, sess)
+	sr.maybeReadAhead(fileKey, off+int64(n), ws, sess)
 
 	return n, nil
 }
@@ -434,15 +442,15 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 }
 
 // maybeReadAhead triggers a prefetch of the next window if conditions are met:
-//   - The read offset is at least 4 MiB into the current window
+//   - The read end offset is at least readAheadThreshold into the current window
 //   - The next window is not cached and not already inflight
 //   - Per-file inflight count < maxInflight
 //   - No recent far seek for this file
-func (sr *StreamReader) maybeReadAhead(fileKey string, off, winStart int64, sess *fileSession) {
+func (sr *StreamReader) maybeReadAhead(fileKey string, endOff, winStart int64, sess *fileSession) {
 	nextStart := winStart + windowSize
 
-	// Check: read is at least 4 MiB into the current window.
-	if off < winStart+readAheadThreshold {
+	// Check: read extends past readAheadThreshold into the current window.
+	if endOff < winStart+readAheadThreshold {
 		return
 	}
 
