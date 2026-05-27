@@ -83,7 +83,7 @@ func Load() (*Config, error) {
 		CacheBudgetMB:          envInt("FUSE_CACHE_BUDGET_MB", 256),
 		PrefetchWindowMB:       envInt("FUSE_PREFETCH_WINDOW_MB", 16),
 		StreamMaxInflight:      envInt("FUSE_STREAM_MAX_INFLIGHT", 2),
-		StreamConcurrency:      envInt("FUSE_STREAM_CONCURRENCY", 8),
+		StreamConcurrency:      envInt("FUSE_STREAM_CONCURRENCY", 8), // per-CDN-host concurrent requests
 		AttrTimeoutSec:        envInt("FUSE_ATTR_TIMEOUT_SEC", 1),
 		EntryTimeoutSec:       envInt("FUSE_ENTRY_TIMEOUT_SEC", 1),
 		CDNURLCacheTTLSec:      envInt("FUSE_CDN_URL_CACHE_TTL_SEC", 300),

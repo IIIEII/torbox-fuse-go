@@ -14,6 +14,11 @@ import (
 	"github.com/iiieii/torbox-fuse-go/internal/metrics"
 )
 
+// hostSem holds a per-CDN-host concurrency semaphore.
+type hostSem struct {
+	sem chan struct{}
+}
+
 // maxRedirects is the maximum number of HTTP redirects to follow.
 const maxRedirects = 5
 
@@ -32,21 +37,25 @@ type cdnURLCacheEntry struct {
 	resolvedAt  time.Time
 }
 
-// CDNClient performs HTTP range requests to TorBox CDN URLs with a concurrency
-// semaphore that limits the number of in-flight requests.
+// CDNClient performs HTTP range requests to TorBox CDN URLs with per-host
+// concurrency limits. Each CDN host gets its own semaphore, so requests to
+// different hosts don't compete for the same slots. This maximizes parallelism
+// when files are spread across multiple CDN servers (e.g. nexus-040, nexus-096,
+// nexus-128, etc.).
 // It caches API redirect resolutions so subsequent range requests go directly
 // to the CDN URL instead of hitting the TorBox API every time.
 type CDNClient struct {
-	client      *http.Client
-	sem         chan struct{}
-	metrics     *metrics.Metrics
-	urlCache    sync.Map // apiURL string -> *cdnURLCacheEntry
-	urlCacheTTL time.Duration
+	client          *http.Client
+	maxConnsPerHost int
+	hostSems        sync.Map // string -> *hostSem — per-CDN-host semaphore
+	metrics         *metrics.Metrics
+	urlCache        sync.Map // apiURL string -> *cdnURLCacheEntry
+	urlCacheTTL     time.Duration
 }
 
 // NewCDNClient creates a CDNClient that allows at most maxConns concurrent
-// range requests. The underlying HTTP transport is tuned for streaming:
-// compression disabled, idle connections kept warm.
+// range requests per CDN host. The underlying HTTP transport is tuned for
+// streaming: compression disabled, idle connections kept warm.
 //
 // urlCacheTTL controls how long resolved CDN URLs are cached. Set to 0 to
 // disable caching (every request hits the API). Typical value: 5m.
@@ -67,10 +76,31 @@ func NewCDNClient(maxConns int, m *metrics.Metrics, urlCacheTTL time.Duration) *
 				DisableCompression: true,
 			},
 		},
-		sem:         make(chan struct{}, maxConns),
-		metrics:     m,
-		urlCacheTTL: urlCacheTTL,
+		maxConnsPerHost: maxConns,
+		metrics:         m,
+		urlCacheTTL:     urlCacheTTL,
 	}
+}
+
+// getHostSem returns the per-host semaphore for the given host, creating one
+// lazily if needed.
+func (c *CDNClient) getHostSem(host string) *hostSem {
+	if v, ok := c.hostSems.Load(host); ok {
+		return v.(*hostSem)
+	}
+	hs := &hostSem{sem: make(chan struct{}, c.maxConnsPerHost)}
+	actual, _ := c.hostSems.LoadOrStore(host, hs)
+	return actual.(*hostSem)
+}
+
+// hostFromURL extracts the host (with port if non-standard) from a URL.
+// Falls back to the raw URL on parse error.
+func hostFromURL(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil || u.Host == "" {
+		return rawURL
+	}
+	return u.Host
 }
 
 // ResolveURL resolves an API redirect URL to the direct CDN URL. It caches the
@@ -161,9 +191,14 @@ func (c *CDNClient) resolveRedirect(ctx context.Context, rawURL string) (string,
 }
 
 // FetchRange issues an HTTP GET with a Range header for bytes [start, end] to
-// the given URL. It blocks until a semaphore slot is available, sends the
-// request, and returns the HTTP response with the body still open for streaming.
+// the given URL. It blocks until a per-host semaphore slot is available, sends
+// the request, and returns the HTTP response with the body still open for streaming.
 // The caller must close resp.Body when done reading.
+//
+// Concurrency is limited per CDN host: each host gets its own semaphore with
+// maxConnsPerHost slots. This means requests to different CDN servers (e.g.
+// nexus-040 vs nexus-128) don't compete for the same slots, maximizing
+// parallelism when files are spread across multiple CDNs.
 //
 // It resolves the API redirect URL to a direct CDN URL (cached with TTL)
 // before issuing the range request, avoiding repeated API hits.
@@ -176,17 +211,21 @@ func (c *CDNClient) resolveRedirect(ctx context.Context, rawURL string) (string,
 //   - 200 OK only when start == 0 (full response fallback)
 //   - 429, 5xx: returns HTTPStatusError (caller decides whether to retry)
 func (c *CDNClient) FetchRange(ctx context.Context, rawURL string, start, end int64) (*http.Response, error) {
-	c.sem <- struct{}{}
-	defer func() { <-c.sem }()
+	// Resolve API URL to direct CDN URL first — we need the host for per-host
+	// rate limiting, and we need the resolved URL for the request anyway.
+	resolvedURL := c.ResolveURL(ctx, rawURL)
+
+	// Acquire per-host semaphore: limits concurrent requests to each CDN host.
+	host := hostFromURL(resolvedURL)
+	hs := c.getHostSem(host)
+	hs.sem <- struct{}{}
+	defer func() { <-hs.sem }()
 
 	if c.metrics != nil {
 		c.metrics.CDNRequestCount.Add(1)
 	}
 
-	// Resolve API URL to direct CDN URL (cached with TTL).
-	resolvedURL := c.ResolveURL(ctx, rawURL)
-
-	slog.Debug("cdn fetch range request", "url", resolvedURL, "start", start, "end", end)
+	slog.Debug("cdn fetch range request", "url", resolvedURL, "start", start, "end", end, "host", host)
 
 	resp, err := c.doRangeRequest(ctx, resolvedURL, start, end)
 	if err != nil {
