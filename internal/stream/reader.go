@@ -1,6 +1,5 @@
-// Package stream provides the CDN range HTTP client and StreamReader that
-// manages inflight windows, early return, read-ahead, and seek cancellation
-// for the TorBox FUSE filesystem streaming hot path.
+// Package stream provides the CDN range client and StreamReader for the
+// TorBox FUSE streaming hot path.
 package stream
 
 import (
@@ -29,6 +28,23 @@ const (
 	// readChunkSize is the size of each chunk read from the CDN response body.
 	// 32 KiB balances syscall overhead with prompt early-return updates.
 	readChunkSize = 32 * 1024
+
+	// smallReadThreshold is the maximum request size (in bytes) that qualifies
+	// as a "small read" — metadata scans and EOF probes from media players.
+	// Reads at or below this threshold may bypass the window system and fetch
+	// only the requested bytes directly from CDN.
+	smallReadThreshold = 256 * 1024 // 256 KiB
+
+	// sequentialReadWindow defines how far back from the last read offset a
+	// new read must fall to be considered sequential. Reads within this
+	// distance of the previous read are counted toward the sequential streak.
+	sequentialReadWindow = 4 * 1024 * 1024 // 4 MiB
+
+	// sequentialReadsRequired is the number of sequential reads needed before
+	// read-ahead kicks in. Set to 1 so that the first sequential read (from
+	// offset 0) enables read-ahead, while random metadata scans that jump
+	// around never accumulate enough sequential streaks.
+	sequentialReadsRequired = 1
 )
 
 // PermalinkBuilder returns the CDN URL for a given fileKey.
@@ -39,15 +55,15 @@ type PermalinkBuilder func(fileKey string) string
 // ready, not when the full window completes), read-ahead of the next window,
 // and seek cancellation for far seeks.
 type StreamReader struct {
-	cache         *cache.RangeCache
-	cdn           *CDNClient
-	inflight      sync.Map // inflightKey -> *inflightWindow
-	sessions      sync.Map // fileKey -> *fileSession
-	windowSize    int64
-	maxInflight   int
-	globalBudget  chan struct{} // limits total inflight windows across all files
-	permalinkFor  PermalinkBuilder
-	metrics       *metrics.Metrics
+	cache        *cache.RangeCache
+	cdn          *CDNClient
+	inflight     sync.Map // inflightKey -> *inflightWindow
+	sessions     sync.Map // fileKey -> *fileSession
+	windowSize   int64
+	maxInflight  int
+	globalBudget chan struct{} // limits total inflight windows across all files
+	permalinkFor PermalinkBuilder
+	metrics      *metrics.Metrics
 }
 
 // inflightKey identifies an inflight window by file key and window start offset.
@@ -76,9 +92,12 @@ type inflightWindow struct {
 	fileSize   int64
 }
 
-// fileSession tracks per-file read-ahead state.
+// fileSession tracks per-file read patterns for read-ahead decisions.
 type fileSession struct {
-	lastSeek atomic.Int64
+	lastSeek          atomic.Int64  // nano timestamp of last far-seek
+	lastReadOff       atomic.Int64  // offset of last ReadAt call
+	sequentialReads    atomic.Int32  // count of sequential reads (resets on seek/random)
+	randomReads       atomic.Int32  // count of random-access reads (for small-read eligibility)
 }
 
 // NewStreamReader creates a StreamReader with the given dependencies.
@@ -116,6 +135,21 @@ func (sr *StreamReader) ReadAt(ctx context.Context, fileKey string, off int64, p
 	// of the same file concurrently (e.g. Plex reading header + EOF probe).
 	sr.maybeCancelOnSeek(fileKey, off)
 
+	// Track access pattern for read-ahead decisions.
+	sess := sr.getOrCreateSession(fileKey)
+	sr.updateAccessPattern(fileKey, off, int64(len(p)), sess)
+
+	// Small reads (metadata scans, EOF probes) from random-access patterns
+	// bypass the window system to avoid fetching 16 MiB for a 64 KiB request.
+	// The result is still cached for future reuse.
+	if int64(len(p)) <= smallReadThreshold && sess.randomReads.Load() > 0 && !isSequential(sess) {
+		if n, err := sr.smallRead(ctx, fileKey, off, p, fileSize); err == nil {
+			return n, err
+		}
+		// Fall through to window path if small read fails — it may succeed
+		// via the normal window mechanism (e.g. if data is in an inflight window).
+	}
+
 	var totalN int
 	curOff := off
 	rem := p
@@ -151,6 +185,92 @@ func (sr *StreamReader) ReadAt(ctx context.Context, fileKey string, off int64, p
 	return totalN, nil
 }
 
+// smallRead handles small requests (≤ smallReadThreshold) for random-access
+// patterns by issuing a direct CDN range request for exactly the needed bytes.
+// The result is stored in the cache for future reuse. Returns (n, nil) on
+// success, or (0, err) on failure — the caller should fall through to the
+// window path.
+func (sr *StreamReader) smallRead(ctx context.Context, fileKey string, off int64, p []byte, fileSize int64) (int, error) {
+	// Try cache first — might already have this data from a window fetch.
+	if n, ok := sr.cache.CopyTo(fileKey, off, p); ok {
+		slog.Debug("small read cache hit", "fileKey", fileKey, "offset", off, "size", len(p), "n", n)
+		if sr.metrics != nil {
+			sr.metrics.CacheHitCount.Add(1)
+		}
+		return n, nil
+	}
+
+	// Check if there's already an inflight window covering this offset —
+	// if so, it's better to join the window than to issue a separate request.
+	ws := sr.windowStart(off)
+	if _, ok := sr.inflight.Load(inflightKey{fileKey: fileKey, start: ws}); ok {
+		return 0, fmt.Errorf("inflight window exists")
+	}
+
+	end := off + int64(len(p)) - 1
+	if end >= fileSize {
+		end = fileSize - 1
+	}
+
+	url := sr.permalinkFor(fileKey)
+	resp, err := sr.cdn.FetchRange(ctx, url, off, end)
+	if err != nil {
+		slog.Debug("small read fetch error", "fileKey", fileKey, "offset", off, "err", err)
+		return 0, err
+	}
+	defer resp.Body.Close()
+
+	data := make([]byte, int64(len(p)))
+	n, err := io.ReadFull(resp.Body, data)
+	if err != nil && err != io.ErrUnexpectedEOF && err != io.EOF {
+		return 0, fmt.Errorf("small read body: %w", err)
+	}
+	data = data[:n]
+
+	if n > 0 {
+		sr.cache.Put(fileKey, off, data)
+		copy(p, data)
+	}
+
+	slog.Debug("small read complete", "fileKey", fileKey, "offset", off, "size", n)
+	return n, nil
+}
+
+// updateAccessPattern tracks whether reads are sequential or random-access.
+// Sequential reads increment the streak counter; random reads reset it and
+// increment the random counter. Read-ahead only activates after
+// sequentialReadsRequired sequential reads. Small-read bypass only activates
+// after at least one random-access read is observed.
+func (sr *StreamReader) updateAccessPattern(fileKey string, off, size int64, sess *fileSession) {
+	lastOff := sess.lastReadOff.Load()
+	sess.lastReadOff.Store(off + size)
+
+	// First read for this file — assume sequential (start of playback).
+	// This ensures read-ahead activates after the second sequential read,
+	// rather than requiring three reads to kick in.
+	if lastOff == 0 {
+		if off == 0 {
+			sess.sequentialReads.Add(1)
+		}
+		return
+	}
+
+	// Sequential: current offset is within sequentialReadWindow of the previous end.
+	if off >= lastOff-sequentialReadWindow && off <= lastOff+sequentialReadWindow {
+		sess.sequentialReads.Add(1)
+	} else {
+		// Random access (far seek, metadata scan) — reset streak.
+		sess.sequentialReads.Store(0)
+		sess.randomReads.Add(1)
+	}
+}
+
+// isSequential returns true if the file access pattern is sequential enough
+// to warrant read-ahead (at least sequentialReadsRequired sequential reads).
+func isSequential(sess *fileSession) bool {
+	return sess.sequentialReads.Load() >= sequentialReadsRequired
+}
+
 // readWindow reads up to len(p) bytes from a single window at the given offset.
 // It may return fewer bytes than requested if the available data in the current
 // window is less than len(p). The caller (ReadAt) handles spanning multiple
@@ -175,9 +295,6 @@ func (sr *StreamReader) readWindow(ctx context.Context, fileKey string, off int6
 
 	// Determine which window this read falls in.
 	ws := sr.windowStart(off)
-
-	// Get or create the file session (for lastSeek tracking).
-	sess := sr.getOrCreateSession(fileKey)
 
 	// Find or create an inflight window.
 	win, created := sr.getOrCreateWindow(fileKey, ws, fileSize)
@@ -205,6 +322,7 @@ func (sr *StreamReader) readWindow(ctx context.Context, fileKey string, off int6
 	}
 
 	// Trigger read-ahead if conditions are met.
+	sess := sr.getOrCreateSession(fileKey)
 	sr.maybeReadAhead(fileKey, off+int64(n), ws, fileSize, sess)
 
 	return n, nil
@@ -290,8 +408,8 @@ func (sr *StreamReader) maybeCancelOnSeek(fileKey string, off int64) {
 }
 
 // getOrCreateSession returns the file session for the given fileKey,
-// creating one if it doesn't exist. The session tracks lastSeek for
-// read-ahead suppression.
+// creating one if it doesn't exist. The session tracks access pattern
+// and last-seek for read-ahead suppression.
 func (sr *StreamReader) getOrCreateSession(fileKey string) *fileSession {
 	if v, ok := sr.sessions.Load(fileKey); ok {
 		return v.(*fileSession)
@@ -589,7 +707,9 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 
 // streamInto reads the CDN response body into win.buf, appending chunks starting
 // at the given buffer offset (bufOff). It updates readyTo as data arrives and
-// broadcasts to wake waiting readers. Returns (bytesRead, success).
+// broadcasts to wake waiting readers. After each chunk, it checks whether all
+// waiters have left (waiters == 0) and if so, cancels the remaining fetch to
+// avoid downloading data that nobody needs. Returns (bytesRead, success).
 func (sr *StreamReader) streamInto(resp *http.Response, bufOff int64, win *inflightWindow, fileKey string, winStart int64) (int64, bool) {
 	chunk := make([]byte, readChunkSize)
 	var totalRead int64
@@ -611,6 +731,7 @@ func (sr *StreamReader) streamInto(resp *http.Response, bufOff int64, win *infli
 			slog.Warn("stream read error", "fileKey", fileKey, "start", winStart, "err", readErr)
 			return totalRead, false
 		}
+
 	}
 }
 
@@ -676,6 +797,8 @@ func isRetryable(err error) bool {
 }
 
 // maybeReadAhead triggers a prefetch of the next window if conditions are met:
+//   - The access pattern is sequential (at least sequentialReadsRequired
+//     sequential reads)
 //   - The read end offset is at least windowSize/2 into the current window
 //   - The next window is not cached and not already inflight
 //   - Per-file inflight count < maxInflight
@@ -685,6 +808,12 @@ func (sr *StreamReader) maybeReadAhead(fileKey string, endOff, winStart, fileSiz
 
 	// Don't prefetch beyond EOF — there's nothing to fetch.
 	if nextStart >= fileSize {
+		return
+	}
+
+	// Only prefetch for sequential access patterns. Random access (metadata
+	// scans, EOF probes) doesn't benefit from read-ahead and wastes bandwidth.
+	if !isSequential(sess) {
 		return
 	}
 
