@@ -45,6 +45,7 @@ type StreamReader struct {
 	sessions      sync.Map // fileKey -> *fileSession
 	windowSize    int64
 	maxInflight   int
+	globalBudget  chan struct{} // limits total inflight windows across all files
 	permalinkFor  PermalinkBuilder
 	metrics       *metrics.Metrics
 }
@@ -82,12 +83,15 @@ type fileSession struct {
 
 // NewStreamReader creates a StreamReader with the given dependencies.
 // windowSize controls the size of each CDN fetch window (e.g. 16 MiB).
-func NewStreamReader(rc *cache.RangeCache, cdn *CDNClient, maxInflight int, windowSize int64, permalinkFor PermalinkBuilder, m *metrics.Metrics) *StreamReader {
+// maxGlobalWindows limits the total number of inflight windows across all files,
+// capping inflight buffer memory at maxGlobalWindows x windowSize.
+func NewStreamReader(rc *cache.RangeCache, cdn *CDNClient, maxInflight, maxGlobalWindows int, windowSize int64, permalinkFor PermalinkBuilder, m *metrics.Metrics) *StreamReader {
 	return &StreamReader{
 		cache:        rc,
 		cdn:          cdn,
 		windowSize:   windowSize,
 		maxInflight:  maxInflight,
+		globalBudget: make(chan struct{}, maxGlobalWindows),
 		permalinkFor: permalinkFor,
 		metrics:      m,
 	}
@@ -409,7 +413,22 @@ func (sr *StreamReader) waitForBytes(ctx context.Context, win *inflightWindow, o
 // Synchronization: buf and err are modified under readyCond.L so that
 // waitForBytes can safely read them while holding the same lock.
 func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStart int64, win *inflightWindow) {
+	// Acquire global budget slot — blocks if too many windows are inflight.
+	// This prevents OOM when many files are opened simultaneously.
+	select {
+	case sr.globalBudget <- struct{}{}:
+	case <-ctx.Done():
+		win.readyCond.L.Lock()
+		win.err = ctx.Err()
+		win.done.Store(true)
+		win.readyCond.Broadcast()
+		win.readyCond.L.Unlock()
+		go sr.cleanupWindowOnError(win)
+		return
+	}
+
 	defer func() {
+		<-sr.globalBudget
 		win.readyCond.L.Lock()
 		win.done.Store(true)
 		win.readyCond.Broadcast()

@@ -45,6 +45,9 @@ func TestConfigDefaults(t *testing.T) {
 	if cfg.CDNURLCacheTTLSec != 300 {
 		t.Errorf("CDNURLCacheTTLSec = %d, want 300", cfg.CDNURLCacheTTLSec)
 	}
+	if cfg.StreamMaxGlobalWindows != 16 {
+		t.Errorf("StreamMaxGlobalWindows = %d, want 16", cfg.StreamMaxGlobalWindows)
+	}
 	if cfg.CatalogRefreshInterval != 3*time.Hour {
 		t.Errorf("CatalogRefreshInterval = %v, want 3h", cfg.CatalogRefreshInterval)
 	}

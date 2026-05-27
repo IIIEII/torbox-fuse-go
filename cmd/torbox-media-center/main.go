@@ -77,7 +77,7 @@ func main() {
 
 	// Create stream reader.
 	prefetchBytes := int64(cfg.PrefetchWindowMB) * 1024 * 1024
-	streamer := stream.NewStreamReader(rc, cdn, cfg.StreamMaxInflight, prefetchBytes, permalinkBuilder, m)
+	streamer := stream.NewStreamReader(rc, cdn, cfg.StreamMaxInflight, cfg.StreamMaxGlobalWindows, prefetchBytes, permalinkBuilder, m)
 
 	// Initial catalog refresh.
 	ctx, cancel := context.WithCancel(context.Background())

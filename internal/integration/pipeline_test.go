@@ -138,7 +138,7 @@ func TestFullPipeline_CatalogToStreamRead(t *testing.T) {
 		return cdnServer.URL
 	}
 	prefetchBytes := int64(16 * 1024 * 1024)
-	streamer := stream.NewStreamReader(rc, cdnClient, 2, prefetchBytes, permalinkBuilder, nil)
+	streamer := stream.NewStreamReader(rc, cdnClient, 2, 100, prefetchBytes, permalinkBuilder, nil)
 
 	// Read from stream.
 	buf := make([]byte, 1024)

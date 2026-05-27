@@ -80,7 +80,7 @@ func mountFUSEForTest(t *testing.T, dataSize int, cdnHandler http.HandlerFunc) (
 	permalinkBuilder := func(fileKey string) string {
 		return cdnServer.URL
 	}
-	streamer := stream.NewStreamReader(rc, cdnClient, 2, int64(16*1024*1024), permalinkBuilder, nil)
+	streamer := stream.NewStreamReader(rc, cdnClient, 2, 100, int64(16*1024*1024), permalinkBuilder, nil)
 
 	cfg := &config.Config{
 		APIKey:            "test-api-key",

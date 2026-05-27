@@ -29,7 +29,7 @@ func newMockCDNServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 // is already in the RangeCache without touching the CDN.
 func TestReadAt_CacheHit(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
-	sr := NewStreamReader(rc, NewCDNClient(4, nil, 0), 2, 4<<20, func(fileKey string) string {
+	sr := NewStreamReader(rc, NewCDNClient(4, nil, 0), 2, 100, 4<<20, func(fileKey string) string {
 		t.Fatal("permalinkFor should not be called on cache hit")
 		return ""
 	}, nil)
@@ -57,7 +57,7 @@ func TestReadAt_CacheHit(t *testing.T) {
 func TestReadAt_CacheMissFetchesFromCDN(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
 	cdn := NewCDNClient(4, nil, 0)
-	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	}, nil)
 
@@ -120,7 +120,7 @@ func TestReadAt_CacheMissFetchesFromCDN(t *testing.T) {
 func TestReadAt_MultipleReadersJoinInflightWindow(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
 	cdn := NewCDNClient(4, nil, 0)
-	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	}, nil)
 
@@ -199,7 +199,7 @@ func TestReadAt_MultipleReadersJoinInflightWindow(t *testing.T) {
 func TestReadAt_TwoReadersOneFetch(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
 	cdn := NewCDNClient(4, nil, 0)
-	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	}, nil)
 
@@ -255,7 +255,7 @@ func TestReadAt_TwoReadersOneFetch(t *testing.T) {
 func TestReadAt_SubrangeJoinsInflight(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
 	cdn := NewCDNClient(4, nil, 0)
-	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	}, nil)
 
@@ -325,7 +325,7 @@ func TestReadAt_SubrangeJoinsInflight(t *testing.T) {
 func TestReadAt_InflightCleanedAfterSuccess(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
 	cdn := NewCDNClient(4, nil, 0)
-	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	}, nil)
 
@@ -367,7 +367,7 @@ func TestReadAt_InflightCleanedAfterSuccess(t *testing.T) {
 func TestReadAt_InflightCleanedAfterError(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
 	cdn := NewCDNClient(4, nil, 0)
-	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	}, nil)
 
@@ -433,7 +433,7 @@ func TestReadAt_InflightCleanedAfterCancel(t *testing.T) {
 	})
 	defer server.Close()
 
-	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	}, nil)
 
@@ -474,7 +474,7 @@ func TestReadAt_InflightCleanedAfterCancel(t *testing.T) {
 func TestReadAt_EarlyReturnFromInflight(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
 	cdn := NewCDNClient(4, nil, 0)
-	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	}, nil)
 
@@ -514,7 +514,7 @@ func TestReadAt_EarlyReturnFromInflight(t *testing.T) {
 func TestReadAt_ShortReadNearEOF(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
 	cdn := NewCDNClient(4, nil, 0)
-	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	}, nil)
 
@@ -563,7 +563,7 @@ func TestReadAt_ShortReadNearEOF(t *testing.T) {
 func TestReadAt_ExactByteCorrectness(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
 	cdn := NewCDNClient(4, nil, 0)
-	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	}, nil)
 
@@ -632,7 +632,7 @@ func TestReadAt_OffByOneAtBoundaries(t *testing.T) {
 	rc := cache.NewRangeCache(1 << 20, nil)
 	cdn := NewCDNClient(4, nil, 0)
 	// Use a small window size for easier boundary testing
-	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	}, nil)
 
@@ -722,7 +722,7 @@ func TestReadAt_MetricsReadCount(t *testing.T) {
 
 	rc := cache.NewRangeCache(8<<20, nil)
 	cdn := NewCDNClient(4, nil, 0)
-	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	}, m)
 
@@ -782,7 +782,7 @@ func TestReadAt_MetricsStreamJoinCount(t *testing.T) {
 
 	rc := cache.NewRangeCache(8<<20, nil)
 	cdn := NewCDNClient(4, nil, 0)
-	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	}, m)
 
@@ -844,7 +844,7 @@ func TestReadAt_MetricsInflightWindows(t *testing.T) {
 
 	rc := cache.NewRangeCache(8<<20, nil)
 	cdn := NewCDNClient(4, nil, 0)
-	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	}, m)
 
@@ -888,7 +888,7 @@ func TestReadAt_MetricsCancelledStreamCount(t *testing.T) {
 
 	rc := cache.NewRangeCache(32<<20, nil)
 	cdn := NewCDNClient(4, nil, 0)
-	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	}, m)
 
@@ -938,7 +938,7 @@ func TestReadAt_ParallelReadersNoCancel(t *testing.T) {
 
 	rc := cache.NewRangeCache(32<<20, nil)
 	cdn := NewCDNClient(4, nil, 0)
-	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	}, m)
 
@@ -1001,7 +1001,7 @@ func TestReadAt_SeekCancelsOrphanedWindow(t *testing.T) {
 
 	rc := cache.NewRangeCache(32<<20, nil)
 	cdn := NewCDNClient(4, nil, 0)
-	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	}, m)
 
@@ -1072,7 +1072,7 @@ func TestReadAt_CrossWindowBoundary(t *testing.T) {
 	})
 	defer server.Close()
 
-	sr := NewStreamReader(rc, cdn, 2, 4<<20, func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	}, nil)
 
@@ -1112,5 +1112,82 @@ func TestReadAt_CrossWindowBoundary(t *testing.T) {
 		if buf[i] != byte(int(off)+i%256) {
 			t.Fatalf("byte %d from window 2: got 0x%02x, want 0x%02x", i, buf[i], byte(int(off)+i%256))
 		}
+	}
+}
+
+
+func TestStreamReader_GlobalBudgetLimitsConcurrency(t *testing.T) {
+	// Verify that the global budget limits the number of concurrently
+	// inflight windows across all files. With maxGlobalWindows=2, only
+	// 2 fetchWindow goroutines should be active at once, even if reads
+	// are issued for many different files.
+
+	const maxGlobalWindows = 2
+	const numFiles = 6
+
+	testData := make([]byte, 4<<20)
+	for i := range testData {
+		testData[i] = byte(i % 256)
+	}
+
+	var activeFetches atomic.Int32
+	var maxActiveFetches atomic.Int32
+
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cur := activeFetches.Add(1)
+		for {
+			prev := maxActiveFetches.Load()
+			if cur <= prev || maxActiveFetches.CompareAndSwap(prev, cur) {
+				break
+			}
+		}
+
+		time.Sleep(100 * time.Millisecond)
+
+		activeFetches.Add(-1)
+
+		rangeHdr := r.Header.Get("Range")
+		var start, end int64
+		fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end)
+		if end >= int64(len(testData)) {
+			end = int64(len(testData) - 1)
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(testData)))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(testData[start : end+1])
+	}))
+	defer server.Close()
+
+	rc := cache.NewRangeCache(256*1024*1024, nil)
+	cdn := NewCDNClient(8, nil, 0)
+	sr := NewStreamReader(rc, cdn, 2, maxGlobalWindows, 4<<20, func(fileKey string) string {
+		return server.URL + "/" + fileKey
+	}, nil)
+
+	var wg sync.WaitGroup
+	errCh := make(chan error, numFiles)
+
+	for i := 0; i < numFiles; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			fileKey := fmt.Sprintf("file-%d", idx)
+			buf := make([]byte, 1024)
+			if _, err := sr.ReadAt(context.Background(), fileKey, 0, buf, int64(len(testData))); err != nil && err != io.EOF {
+				errCh <- fmt.Errorf("ReadAt(%s): %v", fileKey, err)
+			}
+		}(i)
+	}
+
+	wg.Wait()
+	close(errCh)
+
+	for err := range errCh {
+		t.Error(err)
+	}
+
+	observed := maxActiveFetches.Load()
+	if observed > int32(maxGlobalWindows) {
+		t.Errorf("observed %d concurrent fetches, maxGlobalWindows is %d", observed, maxGlobalWindows)
 	}
 }

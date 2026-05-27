@@ -51,7 +51,7 @@ func TestPrefetch_SkippedWhenAlreadyCached(t *testing.T) {
 
 	rc := cache.NewRangeCache(256 << 20, nil)
 	cdn := NewCDNClient(8, nil, 0)
-	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	}, nil)
 
@@ -106,7 +106,7 @@ func TestPrefetch_SkippedWhenAlreadyInflight(t *testing.T) {
 
 	rc := cache.NewRangeCache(256 << 20, nil)
 	cdn := NewCDNClient(8, nil, 0)
-	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	}, nil)
 
@@ -165,7 +165,7 @@ func TestPrefetch_SuppressionNoDuplicateFetches(t *testing.T) {
 
 	rc := cache.NewRangeCache(256 << 20, nil)
 	cdn := NewCDNClient(8, nil, 0)
-	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	}, nil)
 
@@ -223,7 +223,7 @@ func TestPrefetch_PerFileInflightLimit(t *testing.T) {
 	cdn := NewCDNClient(8, nil, 0)
 	// maxInflight=1 means at most 1 active inflight window per file.
 	// Completed (done=true) windows are excluded from the count.
-	sr := NewStreamReader(rc, cdn, 1, int64(4<<20), func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 1, 100, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	}, nil)
 
@@ -275,7 +275,7 @@ func TestPrefetch_WorkAfterFarSeekNoOrphans(t *testing.T) {
 
 	rc := cache.NewRangeCache(256 << 20, nil)
 	cdn := NewCDNClient(8, nil, 0)
-	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	}, nil)
 
@@ -345,7 +345,7 @@ func TestPrefetch_TriggersWhenPastThreshold(t *testing.T) {
 
 	rc := cache.NewRangeCache(256 << 20, nil)
 	cdn := NewCDNClient(8, nil, 0)
-	sr := NewStreamReader(rc, cdn, 2, int64(4<<20), func(fileKey string) string {
+	sr := NewStreamReader(rc, cdn, 2, 100, int64(4<<20), func(fileKey string) string {
 		return server.URL + "/" + fileKey
 	}, nil)
 
