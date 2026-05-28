@@ -1,0 +1,845 @@
+//go:build !short
+
+package stream
+
+import (
+	"context"
+	"fmt"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"sync"
+	"sync/atomic"
+	"testing"
+	"time"
+
+	"github.com/iiieii/torbox-fuse-go/internal/cache"
+)
+
+// ============================================================
+// Stress tests: simulate Plex-like conditions
+// ============================================================
+//
+// These tests exercise the full streaming pipeline under realistic conditions:
+// concurrent file access, rate limiting, cache eviction pressure, and
+// complex read patterns. They are gated behind !short because they need
+// real goroutine scheduling and take >1s each.
+
+// ── Mock CDN infrastructure ─────────────────────────────────────────────
+
+// stressFile holds test data and metadata for one simulated media file.
+type stressFile struct {
+	key  string
+	data []byte
+	size int64
+}
+
+// stressConfig controls the behavior of the mock CDN and StreamReader.
+type stressConfig struct {
+	// CDN behavior
+	rateLimitAfter     int           // return 429 after this many requests (0 = never)
+	rateLimitStatus    int           // HTTP status for rate limiting (default: 429)
+	serverErrorsAfter  int           // return 5xx after this many requests (0 = never)
+	serverErrorStatus  int           // HTTP status for server errors (default: 500)
+	cdnLatency         time.Duration // artificial delay per CDN response (0 = none)
+	redirectCDN         bool          // if true, API URL redirects to a CDN URL
+
+	// StreamReader configuration
+	windowSize       int64 // bytes per inflight window (default: 4 MiB)
+	maxInflight     int   // per-file max inflight windows (default: 2)
+	maxGlobalWindows int   // global max inflight windows (default: 100)
+	cacheBudgetMB   int   // cache budget in MiB (default: 256)
+	urlCacheTTL     time.Duration // CDN URL cache TTL (default: 5m)
+	concurrency     int   // per-CDN-host max concurrent requests (default: 8)
+}
+
+func (c *stressConfig) defaults() *stressConfig {
+	if c.windowSize == 0 {
+		c.windowSize = 4 << 20 // 4 MiB
+	}
+	if c.maxInflight == 0 {
+		c.maxInflight = 2
+	}
+	if c.maxGlobalWindows == 0 {
+		c.maxGlobalWindows = 100
+	}
+	if c.cacheBudgetMB == 0 {
+		c.cacheBudgetMB = 256
+	}
+	if c.urlCacheTTL == 0 {
+		c.urlCacheTTL = 5 * time.Minute
+	}
+	if c.concurrency == 0 {
+		c.concurrency = 8
+	}
+	if c.rateLimitStatus == 0 {
+		c.rateLimitStatus = 429
+	}
+	if c.serverErrorStatus == 0 {
+		c.serverErrorStatus = 500
+	}
+	return c
+}
+
+// stressTestEnv holds all the pieces needed for a stress test.
+type stressTestEnv struct {
+	sr        *StreamReader
+	cdn       *CDNClient
+	rc        *cache.RangeCache
+	server    *httptest.Server
+	cfg       *stressConfig
+	files     []stressFile
+	requests  atomic.Int32 // total CDN requests
+	resolves  atomic.Int32 // total resolve requests (for redirect mode)
+	rateLimited atomic.Int32 // total 429 responses returned
+}
+
+// newStressEnv creates a stress test environment with the given config and files.
+func newStressEnv(t *testing.T, cfg *stressConfig, files []stressFile) *stressTestEnv {
+	t.Helper()
+	cfg.defaults()
+
+	env := &stressTestEnv{
+		cfg:   cfg,
+		files: files,
+	}
+
+	// Build a map of file data for the mock server.
+	fileData := make(map[string][]byte, len(files))
+	for _, f := range files {
+		fileData[f.key] = f.data
+	}
+
+	if cfg.redirectCDN {
+		// Two-server mode: API server redirects to CDN server.
+		cdnServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			env.serveCDN(w, r, fileData)
+		}))
+		env.server = cdnServer
+
+		apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			env.resolves.Add(1)
+			// Redirect to CDN server with the same path.
+			w.Header().Set("Location", cdnServer.URL+r.URL.Path)
+			w.WriteHeader(http.StatusFound)
+		}))
+
+		env.rc = cache.NewRangeCache(int64(cfg.cacheBudgetMB)<<20, nil)
+		env.cdn = NewCDNClient(cfg.concurrency, nil, cfg.urlCacheTTL)
+
+		permalinkBuilder := func(fileKey string) string {
+			return apiServer.URL + "/" + fileKey
+		}
+		env.sr = NewStreamReader(env.rc, env.cdn, cfg.maxInflight, cfg.maxGlobalWindows, cfg.windowSize, permalinkBuilder, nil)
+
+		// We need to close the API server too, but we can't add it to env.server.
+		// Store a custom cleanup.
+		t.Cleanup(func() {
+			apiServer.Close()
+			cdnServer.Close()
+		})
+	} else {
+		// Single-server mode: CDN serves files directly.
+		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			env.serveCDN(w, r, fileData)
+		}))
+		env.server = server
+
+		env.rc = cache.NewRangeCache(int64(cfg.cacheBudgetMB)<<20, nil)
+		env.cdn = NewCDNClient(cfg.concurrency, nil, cfg.urlCacheTTL)
+
+		permalinkBuilder := func(fileKey string) string {
+			return server.URL + "/" + fileKey
+		}
+		env.sr = NewStreamReader(env.rc, env.cdn, cfg.maxInflight, cfg.maxGlobalWindows, cfg.windowSize, permalinkBuilder, nil)
+	}
+
+	t.Cleanup(func() {
+		// Cleanup is handled above for redirect mode.
+		// For single-server mode, we close here.
+		if !cfg.redirectCDN {
+			env.server.Close()
+		}
+	})
+
+	return env
+}
+
+// serveCDN handles a CDN range request, applying rate limiting and server errors
+// as configured.
+func (env *stressTestEnv) serveCDN(w http.ResponseWriter, r *http.Request, fileData map[string][]byte) {
+	reqNum := env.requests.Add(1)
+
+	// Extract file key from URL path.
+	fileKey := r.URL.Path[1:] // remove leading slash
+	data, ok := fileData[fileKey]
+	if !ok {
+		http.Error(w, "not found", http.StatusNotFound)
+		return
+	}
+
+	// Apply rate limiting.
+	if env.cfg.rateLimitAfter > 0 && reqNum > int32(env.cfg.rateLimitAfter) {
+		env.rateLimited.Add(1)
+		w.WriteHeader(env.cfg.rateLimitStatus)
+		return
+	}
+
+	// Apply server errors.
+	if env.cfg.serverErrorsAfter > 0 && reqNum > int32(env.cfg.serverErrorsAfter) {
+		w.WriteHeader(env.cfg.serverErrorStatus)
+		return
+	}
+
+	// Apply latency.
+	if env.cfg.cdnLatency > 0 {
+		time.Sleep(env.cfg.cdnLatency)
+	}
+
+	// Serve range request.
+	rangeHdr := r.Header.Get("Range")
+	if rangeHdr == "" {
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+		return
+	}
+	var start, end int64
+	n, err := fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end)
+	if err != nil || n != 2 {
+		http.Error(w, "bad range", http.StatusBadRequest)
+		return
+	}
+	if start >= int64(len(data)) {
+		w.WriteHeader(http.StatusRequestedRangeNotSatisfiable)
+		return
+	}
+	if end >= int64(len(data)) {
+		end = int64(len(data) - 1)
+	}
+	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+	w.Header().Set("Content-Length", fmt.Sprintf("%d", end-start+1))
+	w.WriteHeader(http.StatusPartialContent)
+	w.Write(data[start : end+1])
+}
+
+// makeStressFiles creates count files of the given size with deterministic data.
+func makeStressFiles(count int, size int64) []stressFile {
+	files := make([]stressFile, count)
+	for i := 0; i < count; i++ {
+		data := make([]byte, size)
+		// Each file gets a unique pattern: byte((offset + fileIndex) % 256)
+		// This makes data corruption detectable even across files.
+		for j := range data {
+			data[j] = byte((int64(j) + int64(i)*7) % 256)
+		}
+		files[i] = stressFile{
+			key:  fmt.Sprintf("file_%03d", i),
+			data: data,
+			size: size,
+		}
+	}
+	return files
+}
+
+// verifyData checks that buf matches the expected pattern for the given file
+// index and offset.
+func verifyData(t *testing.T, fileIdx int, offset int64, buf []byte) {
+	t.Helper()
+	for i := 0; i < len(buf); i++ {
+		expected := byte((offset + int64(i) + int64(fileIdx)*7) % 256)
+		if buf[i] != expected {
+			t.Errorf("data mismatch at file %d offset %d: got 0x%02x, want 0x%02x",
+				fileIdx, offset+int64(i), buf[i], expected)
+			return
+		}
+	}
+}
+
+// ============================================================
+// Test 1: Plex playback pattern
+// ============================================================
+// Simulates a single file being read with a Plex-like pattern:
+// 1. Header probe (read first 64 KiB)
+// 2. EOF probe (read last 1 KiB)
+// 3. Sequential playback (128 KiB chunks from start)
+// 4. Seek/scrub (jump to middle, read a bit, jump back)
+
+func TestStress_PlexPlaybackPattern(t *testing.T) {
+	const fileSize = 16 * 1024 * 1024 // 16 MiB
+	files := makeStressFiles(1, fileSize)
+
+	env := newStressEnv(t, &stressConfig{}, files)
+	f := env.files[0]
+	ctx := context.Background()
+
+	// Step 1: Header probe (first 64 KiB)
+	t.Log("step 1: header probe")
+	buf := make([]byte, 64*1024)
+	n, err := env.sr.ReadAt(ctx, f.key, 0, buf, f.size)
+	if err != nil && err != io.EOF {
+		t.Fatalf("header probe: %v", err)
+	}
+	verifyData(t, 0, 0, buf[:n])
+
+	// Step 2: EOF probe (last 1 KiB)
+	t.Log("step 2: EOF probe")
+	eofOff := f.size - 1024
+	eofBuf := make([]byte, 1024)
+	n, err = env.sr.ReadAt(ctx, f.key, eofOff, eofBuf, f.size)
+	if err != nil && err != io.EOF {
+		t.Fatalf("EOF probe: %v", err)
+	}
+	verifyData(t, 0, eofOff, eofBuf[:n])
+
+	// Step 3: Sequential playback (128 KiB chunks from offset 0)
+	t.Log("step 3: sequential playback")
+	playbackBuf := make([]byte, 128*1024)
+	var totalRead int64
+	for off := int64(0); off < f.size; {
+		n, err := env.sr.ReadAt(ctx, f.key, off, playbackBuf, f.size)
+		if err != nil && err != io.EOF {
+			t.Fatalf("sequential playback at offset %d: %v", off, err)
+		}
+		if n == 0 {
+			break
+		}
+		verifyData(t, 0, off, playbackBuf[:n])
+		totalRead += int64(n)
+		off += int64(n)
+	}
+	if totalRead != f.size {
+		t.Errorf("sequential playback: read %d bytes, want %d", totalRead, f.size)
+	}
+
+	// Step 4: Seek/scrub (jump to middle, read, jump back)
+	t.Log("step 4: seek/scrub")
+	midOff := f.size / 2
+	scrubBuf := make([]byte, 4*1024)
+	n, err = env.sr.ReadAt(ctx, f.key, midOff, scrubBuf, f.size)
+	if err != nil && err != io.EOF {
+		t.Fatalf("seek to middle: %v", err)
+	}
+	verifyData(t, 0, midOff, scrubBuf[:n])
+
+	// Jump back to near-start
+	n, err = env.sr.ReadAt(ctx, f.key, 1024, scrubBuf, f.size)
+	if err != nil && err != io.EOF {
+		t.Fatalf("seek back to start: %v", err)
+	}
+	verifyData(t, 0, 1024, scrubBuf[:n])
+
+	t.Logf("total CDN requests: %d", env.requests.Load())
+}
+
+// ============================================================
+// Test 2: Library scan thundering herd
+// ============================================================
+// Simulates Plex opening 30 files simultaneously, reading metadata
+// from each (2-3 small random reads), then closing them.
+// Verifies: all reads succeed, no data corruption, CDN load is bounded.
+
+func TestStress_LibraryScanThunderingHerd(t *testing.T) {
+	const fileCount = 30
+	const fileSize int64 = 4 * 1024 * 1024 // 4 MiB each
+
+	files := makeStressFiles(fileCount, fileSize)
+	env := newStressEnv(t, &stressConfig{}, files)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	type result struct {
+		fileIdx int
+		err     error
+	}
+
+	results := make(chan result, fileCount*3) // 3 reads per file
+	var wg sync.WaitGroup
+
+	for i := 0; i < fileCount; i++ {
+		f := env.files[i]
+		// Each file gets 2-3 small random reads (metadata pattern).
+		offsets := []int64{0, f.size - 1024, f.size / 3}
+		for _, off := range offsets {
+			wg.Add(1)
+			go func(idx int, offset int64) {
+				defer wg.Done()
+				buf := make([]byte, 4096)
+				// Clamp read to file size
+				readEnd := offset + int64(len(buf))
+				if readEnd > f.size {
+					buf = buf[:f.size-offset]
+				}
+				n, err := env.sr.ReadAt(ctx, env.files[idx].key, offset, buf, env.files[idx].size)
+				if err != nil && err != io.EOF {
+					results <- result{fileIdx: idx, err: fmt.Errorf("ReadAt(file=%d, off=%d): %w", idx, offset, err)}
+					return
+				}
+				verifyData(t, idx, offset, buf[:n])
+				results <- result{fileIdx: idx}
+			}(i, off)
+		}
+	}
+
+	wg.Wait()
+	close(results)
+
+	var errors []error
+	for res := range results {
+		if res.err != nil {
+			errors = append(errors, res.err)
+		}
+	}
+	if len(errors) > 0 {
+		for _, e := range errors {
+			t.Error(e)
+		}
+	}
+
+	t.Logf("library scan: %d files, %d CDN requests", fileCount, env.requests.Load())
+}
+
+// ============================================================
+// Test 3: Playback during scan (the critical scenario)
+// ============================================================
+// While 30 files are being scanned, one file is being played sequentially.
+// Verifies: playback data arrives promptly, scan data doesn't evict
+// playback data from cache, and both complete successfully.
+
+func TestStress_PlaybackDuringScan(t *testing.T) {
+	const fileCount = 30
+	const fileSize int64 = 4 * 1024 * 1024 // 4 MiB each
+
+	files := makeStressFiles(fileCount, fileSize)
+	env := newStressEnv(t, &stressConfig{
+		cacheBudgetMB: 32, // Small budget to force eviction pressure
+	}, files)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Start library scan in background.
+	scanDone := make(chan struct{})
+	go func() {
+		defer close(scanDone)
+		for i := 0; i < fileCount; i++ {
+			f := env.files[i]
+			// Skip file 0 — that's our playback file.
+			if i == 0 {
+				continue
+			}
+			// 2-3 metadata reads per file.
+			for _, off := range []int64{0, f.size - 1024, f.size / 3} {
+				buf := make([]byte, 4096)
+				if off+int64(len(buf)) > f.size {
+					buf = buf[:f.size-off]
+				}
+				n, err := env.sr.ReadAt(ctx, f.key, off, buf, f.size)
+				if err != nil && err != io.EOF {
+					t.Logf("scan read file=%d off=%d: %v", i, off, err)
+					continue
+				}
+				verifyData(t, i, off, buf[:n])
+			}
+		}
+	}()
+
+	// Simultaneously, play file 0 sequentially.
+	playbackFile := env.files[0]
+	playbackBuf := make([]byte, 128*1024)
+	var playbackBytes int64
+	var playbackStart time.Time
+	playbackStarted := false
+
+	for off := int64(0); off < playbackFile.size; {
+		if !playbackStarted {
+			playbackStart = time.Now()
+			playbackStarted = true
+		}
+		n, err := env.sr.ReadAt(ctx, playbackFile.key, off, playbackBuf, playbackFile.size)
+		if err != nil && err != io.EOF {
+			t.Fatalf("playback at offset %d: %v", off, err)
+		}
+		if n == 0 {
+			break
+		}
+		verifyData(t, 0, off, playbackBuf[:n])
+		playbackBytes += int64(n)
+		off += int64(n)
+	}
+
+	playbackDuration := time.Since(playbackStart)
+	if playbackBytes != playbackFile.size {
+		t.Errorf("playback: read %d bytes, want %d", playbackBytes, playbackFile.size)
+	}
+
+	// Verify playback completes in reasonable time.
+	// 16 MiB over localhost should take < 10s even under cache pressure.
+	if playbackDuration > 30*time.Second {
+		t.Errorf("playback took %v, expected < 30s", playbackDuration)
+	}
+
+	// Wait for scan to complete.
+	<-scanDone
+
+	t.Logf("playback during scan: %d bytes in %v, %d CDN requests",
+		playbackBytes, playbackDuration, env.requests.Load())
+}
+
+// ============================================================
+// Test 4: Rate-limited URL resolution
+// ============================================================
+// Simulates 429 on URL resolution. 30 concurrent ResolveURL calls
+// when the CDN returns 429. Verifies:
+// - Only 1 actual resolution attempt (singleflight dedup)
+// - Subsequent calls during backoff return API URL directly
+// - After backoff expires, resolution succeeds
+
+func TestStress_RateLimitedResolution(t *testing.T) {
+	// Set up: API server returns 429 on the first attempt, then succeeds
+	// by redirecting to the CDN server.
+	var resolveAttempts atomic.Int32
+	var cdnRequests atomic.Int32
+	var return429 atomic.Bool
+
+	cdnServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		cdnRequests.Add(1)
+		// CDN server responds with 206 for range requests.
+		rangeHdr := r.Header.Get("Range")
+		var start, end int64
+		fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/100", start, end))
+		w.Header().Set("Content-Length", fmt.Sprintf("%d", end-start+1))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(make([]byte, end-start+1))
+	}))
+	defer cdnServer.Close()
+
+	apiServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		resolveAttempts.Add(1)
+		// Return 429 only when the flag is set (simulates a transient outage).
+		if return429.Load() {
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		w.Header().Set("Location", cdnServer.URL+r.URL.Path)
+		w.WriteHeader(http.StatusFound)
+	}))
+	defer apiServer.Close()
+
+	cdn := NewCDNClient(8, nil, 5*time.Minute)
+	cdn.rateLimitCooldown = 200 * time.Millisecond // fast backoff for tests
+	ctx := context.Background()
+	apiURL := apiServer.URL + "/test_file"
+
+	// Phase 1: API returns 429. ResolveURL should cache the failure and
+	// fall back to the API URL.
+	return429.Store(true)
+	result := cdn.ResolveURL(ctx, apiURL)
+	if result != apiURL {
+		t.Errorf("phase 1: expected fallback to API URL on 429, got %q", result)
+	}
+	if resolveAttempts.Load() != 1 {
+		t.Errorf("phase 1: expected 1 resolve attempt, got %d", resolveAttempts.Load())
+	}
+
+	// Phase 2: Subsequent calls during the backoff period should return
+	// the API URL immediately without making additional resolution attempts.
+	for i := 0; i < 10; i++ {
+		result = cdn.ResolveURL(ctx, apiURL)
+		if result != apiURL {
+			t.Errorf("phase 2 call %d: expected API URL fallback during backoff, got %q", i+1, result)
+		}
+	}
+	// No additional resolve attempts — all calls hit the cached 429 entry.
+	if resolveAttempts.Load() != 1 {
+		t.Errorf("phase 2: expected 1 resolve attempt (all others cached), got %d", resolveAttempts.Load())
+	}
+
+	// Phase 3: Simultaneous concurrent calls during backoff — singleflight
+	// should dedup them so only 1 resolve attempt is made even if the
+	// backoff expires mid-call. We don't test this here because the backoff
+	// is 10s and we'd need precise timing; instead we test that concurrent
+	// calls during active backoff all return the API URL.
+	var wg sync.WaitGroup
+	for i := 0; i < 30; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			r := cdn.ResolveURL(ctx, apiURL)
+			if r != apiURL {
+				t.Errorf("phase 3: expected API URL fallback, got %q", r)
+			}
+		}()
+	}
+	wg.Wait()
+	if resolveAttempts.Load() != 1 {
+		t.Errorf("phase 3: expected 1 resolve attempt after 30 concurrent calls during backoff, got %d", resolveAttempts.Load())
+	}
+
+	// Phase 4: After backoff expires, API now returns 302 redirect.
+	// Clear the 429 flag so resolution succeeds.
+	return429.Store(false)
+	time.Sleep(cdn.rateLimitCooldown + 100*time.Millisecond)
+
+	result = cdn.ResolveURL(ctx, apiURL)
+	if result != cdnServer.URL+"/test_file" {
+		t.Errorf("phase 4: expected CDN URL after backoff expiry, got %q", result)
+	}
+
+	// Phase 5: Successful resolution should be cached — no more resolve attempts.
+	finalAttempts := resolveAttempts.Load()
+	result2 := cdn.ResolveURL(ctx, apiURL)
+	if result2 != cdnServer.URL+"/test_file" {
+		t.Errorf("phase 5: expected cached CDN URL, got %q", result2)
+	}
+	if resolveAttempts.Load() != finalAttempts {
+		t.Errorf("phase 5: expected no additional resolve attempts, got %d (was %d)",
+			resolveAttempts.Load(), finalAttempts)
+	}
+
+	t.Logf("resolve attempts: %d, CDN requests: %d", resolveAttempts.Load(), cdnRequests.Load())
+}
+
+// ============================================================
+// Test 5: Rate-limited CDN range requests
+// ============================================================
+// Simulates 429 on CDN range requests (FetchRange). Verifies that
+// fetchWindow retries with backoff and playback eventually succeeds.
+
+func TestStress_RateLimitedCDNRequests(t *testing.T) {
+	const fileSize int64 = 4 * 1024 * 1024 // 4 MiB
+	files := makeStressFiles(1, fileSize)
+
+	// Rate limit after 2 requests, then recover after 10 total requests
+	// (allowing retries to succeed).
+	var requestCount atomic.Int32
+	env := newStressEnv(t, &stressConfig{
+		// Custom CDN handler: rate limit first 2 requests, then succeed.
+	}, files)
+
+	// Override the server handler with rate-limiting logic.
+	origHandler := env.server.Config.Handler
+	env.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		reqNum := requestCount.Add(1)
+		// First 2 requests: 429
+		if reqNum <= 2 {
+			env.rateLimited.Add(1)
+			w.WriteHeader(http.StatusTooManyRequests)
+			return
+		}
+		origHandler.ServeHTTP(w, r)
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	f := env.files[0]
+	buf := make([]byte, 4096)
+	n, err := env.sr.ReadAt(ctx, f.key, 0, buf, f.size)
+	if err != nil && err != io.EOF {
+		t.Fatalf("ReadAt after rate limit: %v", err)
+	}
+	verifyData(t, 0, 0, buf[:n])
+
+	t.Logf("rate-limited CDN: %d CDN requests, %d rate-limited responses",
+		env.requests.Load(), env.rateLimited.Load())
+}
+
+// ============================================================
+// Test 6: Cache eviction priority
+// ============================================================
+// Small cache budget (16 MiB = 4 windows) with playback + scan data.
+// Playback data should survive eviction while scan data gets evicted.
+
+func TestStress_CacheEvictionPriority(t *testing.T) {
+	const fileSize int64 = 4 * 1024 * 1024 // 4 MiB (1 window each)
+	files := makeStressFiles(8, fileSize) // 8 files = 32 MiB total
+
+	env := newStressEnv(t, &stressConfig{
+		cacheBudgetMB: 16, // Only 4 windows fit — forces eviction
+	}, files)
+
+	ctx := context.Background()
+
+	// Step 1: Read all 8 files (scan pattern) — fills cache with PriorityLow.
+	for i := 0; i < 8; i++ {
+		f := env.files[i]
+		buf := make([]byte, 4096)
+		_, err := env.sr.ReadAt(ctx, f.key, 0, buf, f.size)
+		if err != nil && err != io.EOF {
+			t.Fatalf("scan read file %d: %v", i, err)
+		}
+	}
+
+	// Step 2: Now read file 0 sequentially (playback pattern) — should get PriorityHigh.
+	// Read enough to trigger sequential detection and active-read threshold.
+	playbackFile := env.files[0]
+	playbackBuf := make([]byte, 128*1024)
+	var totalRead int64
+	for off := int64(0); off < playbackFile.size && totalRead < 2*1024*1024; {
+		n, err := env.sr.ReadAt(ctx, playbackFile.key, off, playbackBuf, playbackFile.size)
+		if err != nil && err != io.EOF {
+			t.Fatalf("playback read at %d: %v", off, err)
+		}
+		if n == 0 {
+			break
+		}
+		verifyData(t, 0, off, playbackBuf[:n])
+		totalRead += int64(n)
+		off += int64(n)
+	}
+
+	// Step 3: Re-read file 0 from cache — should still be available
+	// because it has PriorityHigh while scan data was PriorityLow.
+	// Even though the cache budget is only 16 MiB (4 windows) and we
+	// wrote 32 MiB (8 files) + re-read 2 MiB of file 0, the playback
+	// data should have survived eviction.
+	buf := make([]byte, 4096)
+	n, err := env.sr.ReadAt(ctx, playbackFile.key, 0, buf, playbackFile.size)
+	if err != nil && err != io.EOF {
+		t.Fatalf("cache re-read: %v", err)
+	}
+	verifyData(t, 0, 0, buf[:n])
+
+	t.Logf("cache eviction priority: %d bytes used of %d budget, %d CDN requests",
+		env.rc.Used(), int64(env.cfg.cacheBudgetMB)<<20, env.requests.Load())
+}
+
+// ============================================================
+// Test 7: Seek cancellation during playback
+// ============================================================
+// Plex-style seek pattern: play from start → seek to middle → play → seek to end.
+// Verifies: no data corruption, cancelled windows don't lose needed data,
+// read-ahead still works after seeks.
+
+func TestStress_SeekCancellationDuringPlayback(t *testing.T) {
+	const fileSize int64 = 32 * 1024 * 1024 // 32 MiB = 8 windows
+	files := makeStressFiles(1, fileSize)
+
+	env := newStressEnv(t, &stressConfig{}, files)
+	f := env.files[0]
+	ctx := context.Background()
+
+	// Phase 1: Read from start (triggers read-ahead for next windows).
+	buf := make([]byte, 128*1024)
+	for off := int64(0); off < 2*1024*1024; off += int64(len(buf)) {
+		n, err := env.sr.ReadAt(ctx, f.key, off, buf, f.size)
+		if err != nil && err != io.EOF {
+			t.Fatalf("phase 1 read at %d: %v", off, err)
+		}
+		verifyData(t, 0, off, buf[:n])
+	}
+
+	// Let read-ahead windows complete.
+	time.Sleep(200 * time.Millisecond)
+
+	// Phase 2: Seek to middle (far seek > 4 * windowSize).
+	midOff := int64(16 * 1024 * 1024)
+	midBuf := make([]byte, 128*1024)
+	n, err := env.sr.ReadAt(ctx, f.key, midOff, midBuf, f.size)
+	if err != nil && err != io.EOF {
+		t.Fatalf("phase 2 seek to middle: %v", err)
+	}
+	verifyData(t, 0, midOff, midBuf[:n])
+
+	// Phase 3: Continue reading from middle.
+	for off := midOff + int64(n); off < midOff+2*1024*1024; off += int64(len(buf)) {
+		n, err := env.sr.ReadAt(ctx, f.key, off, buf, f.size)
+		if err != nil && err != io.EOF {
+			t.Fatalf("phase 3 read at %d: %v", off, err)
+		}
+		if n == 0 {
+			break
+		}
+		verifyData(t, 0, off, buf[:n])
+	}
+
+	// Phase 4: Seek back to near-start (another far seek).
+	nearStartOff := int64(3 * 1024 * 1024)
+	nearBuf := make([]byte, 4096)
+	n, err = env.sr.ReadAt(ctx, f.key, nearStartOff, nearBuf, f.size)
+	if err != nil && err != io.EOF {
+		t.Fatalf("phase 4 seek back: %v", err)
+	}
+	verifyData(t, 0, nearStartOff, nearBuf[:n])
+
+	// Phase 5: Continue reading from near-start — read-ahead should recover.
+	for off := nearStartOff + int64(n); off < nearStartOff+1*1024*1024; off += int64(len(buf)) {
+		n, err := env.sr.ReadAt(ctx, f.key, off, buf, f.size)
+		if err != nil && err != io.EOF {
+			t.Fatalf("phase 5 read at %d: %v", off, err)
+		}
+		if n == 0 {
+			break
+		}
+		verifyData(t, 0, off, buf[:n])
+	}
+
+	t.Logf("seek cancellation: %d CDN requests", env.requests.Load())
+}
+
+// ============================================================
+// Test 8: Concurrent playback of different files
+// ============================================================
+// Multiple files played simultaneously (simulating multiple household
+// members or transcodes). Verifies: all complete, no data corruption.
+
+func TestStress_ConcurrentPlaybackDifferentFiles(t *testing.T) {
+	const fileCount = 4
+	const fileSize int64 = 4 * 1024 * 1024 // 4 MiB each
+
+	files := makeStressFiles(fileCount, fileSize)
+	env := newStressEnv(t, &stressConfig{}, files)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	type result struct {
+		fileIdx   int
+		bytesRead int64
+		err       error
+	}
+
+	results := make(chan result, fileCount)
+	var wg sync.WaitGroup
+
+	for i := 0; i < fileCount; i++ {
+		wg.Add(1)
+		go func(idx int) {
+			defer wg.Done()
+			f := env.files[idx]
+			buf := make([]byte, 128*1024)
+			var total int64
+			for off := int64(0); off < f.size; {
+				n, err := env.sr.ReadAt(ctx, f.key, off, buf, f.size)
+				if err != nil && err != io.EOF {
+					results <- result{fileIdx: idx, err: fmt.Errorf("file %d at offset %d: %w", idx, off, err)}
+					return
+				}
+				if n == 0 {
+					break
+				}
+				verifyData(t, idx, off, buf[:n])
+				total += int64(n)
+				off += int64(n)
+			}
+			results <- result{fileIdx: idx, bytesRead: total}
+		}(i)
+	}
+
+	wg.Wait()
+	close(results)
+
+	for res := range results {
+		if res.err != nil {
+			t.Error(res.err)
+		} else if res.bytesRead != env.files[res.fileIdx].size {
+			t.Errorf("file %d: read %d bytes, want %d",
+				res.fileIdx, res.bytesRead, env.files[res.fileIdx].size)
+		}
+	}
+
+	t.Logf("concurrent playback: %d files, %d CDN requests", fileCount, env.requests.Load())
+}

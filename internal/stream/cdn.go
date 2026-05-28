@@ -32,11 +32,19 @@ func (e *HTTPStatusError) Error() string {
 	return fmt.Sprintf("cdn returned status %d", e.StatusCode)
 }
 
-// cdnURLCacheEntry stores a resolved CDN URL with its resolution time.
+// cdnURLCacheEntry stores a resolved CDN URL or a failed resolution with timing.
+// When failed is true, resolvedURL is empty and the entry represents a backoff
+// period during which we should not retry resolution.
 type cdnURLCacheEntry struct {
 	resolvedURL string
 	resolvedAt  time.Time
+	failed      bool // true if resolution returned 429/5xx — backoff, don't retry
 }
+
+// defaultRateLimitCooldown is how long to wait before retrying a URL that returned 429.
+// This prevents thundering-herd re-resolution storms when the API is rate-limiting
+// (e.g. at container startup when 30+ files resolve their CDN URLs simultaneously).
+const defaultRateLimitCooldown = 10 * time.Second
 
 // CDNClient performs HTTP range requests to TorBox CDN URLs with per-host
 // concurrency limits. Each CDN host gets its own semaphore, so requests to
@@ -47,14 +55,17 @@ type cdnURLCacheEntry struct {
 // to the CDN URL instead of hitting the TorBox API every time.
 // URL resolution uses singleflight to dedup concurrent requests for the same
 // API URL, preventing thundering-herd API rate limiting.
+// Rate-limited URLs (429) are blacklisted for rateLimitCooldown to avoid
+// overwhelming the API with retries during startup or burst scenarios.
 type CDNClient struct {
-	client          *http.Client
-	maxConnsPerHost int
-	hostSems        sync.Map          // string -> *hostSem - per-CDN-host semaphore
-	metrics         *metrics.Metrics
-	urlCache        sync.Map          // apiURL string -> *cdnURLCacheEntry
-	urlCacheTTL     time.Duration
-	resolveGroup    singleflight.Group // dedup parallel URL resolution requests
+	client            *http.Client
+	maxConnsPerHost   int
+	hostSems          sync.Map          // string -> *hostSem - per-CDN-host semaphore
+	metrics           *metrics.Metrics
+	urlCache          sync.Map          // apiURL string -> *cdnURLCacheEntry
+	urlCacheTTL       time.Duration
+	rateLimitCooldown time.Duration     // backoff for 429/5xx URL resolution failures
+	resolveGroup      singleflight.Group // dedup parallel URL resolution requests
 }
 
 // NewCDNClient creates a CDNClient that allows at most maxConns concurrent
@@ -80,9 +91,10 @@ func NewCDNClient(maxConns int, m *metrics.Metrics, urlCacheTTL time.Duration) *
 				DisableCompression: true,
 			},
 		},
-		maxConnsPerHost: maxConns,
-		metrics:         m,
-		urlCacheTTL:     urlCacheTTL,
+		maxConnsPerHost:   maxConns,
+		metrics:           m,
+		urlCacheTTL:       urlCacheTTL,
+		rateLimitCooldown: defaultRateLimitCooldown,
 	}
 }
 
@@ -108,13 +120,15 @@ func hostFromURL(rawURL string) string {
 }
 
 // ResolveURL resolves an API redirect URL to the direct CDN URL. It caches
-// successful resolutions and re-resolves after urlCacheTTL expires. Failed
-// resolutions (including 429 rate-limit responses) are NOT cached, so
-// subsequent requests will retry resolution.
+// successful resolutions for urlCacheTTL and failed resolutions (429/5xx)
+// for rateLimitBackoff. This prevents thundering-herd API requests when the
+// container starts and Plex opens 30+ files simultaneously — the first 429
+// is cached as a negative result, and subsequent requests for the same URL
+// fall back to the API URL without hammering the API again until the backoff
+// expires.
 //
 // Uses singleflight to dedup concurrent resolution requests for the same
-// API URL, preventing thundering-herd API rate limiting when multiple files
-// are opened simultaneously.
+// API URL, preventing parallel requests from all hitting the API at once.
 //
 // Falls back to the API URL on resolution failure, so streaming still works
 // (just slower - the request goes through the API redirect each time).
@@ -123,10 +137,18 @@ func (c *CDNClient) ResolveURL(ctx context.Context, apiURL string) string {
 		return apiURL
 	}
 
-	// Check cache first.
+	// Check cache first — covers both successful and failed resolutions.
 	if v, ok := c.urlCache.Load(apiURL); ok {
 		entry := v.(*cdnURLCacheEntry)
-		if time.Since(entry.resolvedAt) < c.urlCacheTTL {
+		if entry.failed {
+			// Failed resolution (429/5xx) — check if backoff period has elapsed.
+			if time.Since(entry.resolvedAt) < c.rateLimitCooldown {
+				// Still in backoff — fall back to API URL without retrying.
+				return apiURL
+			}
+			// Backoff expired — fall through to re-resolve.
+		} else if time.Since(entry.resolvedAt) < c.urlCacheTTL {
+			// Successful resolution still valid.
 			return entry.resolvedURL
 		}
 	}
@@ -135,11 +157,15 @@ func (c *CDNClient) ResolveURL(ctx context.Context, apiURL string) string {
 	result, err, _ := c.resolveGroup.Do(apiURL, func() (interface{}, error) {
 		resolved, resolveErr := c.resolveRedirect(ctx, apiURL)
 		if resolveErr != nil {
+			// Cache the failure for rateLimitCooldown to prevent API hammering.
+			c.urlCache.Store(apiURL, &cdnURLCacheEntry{
+				resolvedAt: time.Now(),
+				failed:     true,
+			})
 			return nil, resolveErr
 		}
 
 		slog.Debug("cdn url resolved", "apiURL", apiURL, "cdnURL", resolved)
-		// Only cache successful resolutions - 429/bad responses should be retried.
 		c.urlCache.Store(apiURL, &cdnURLCacheEntry{
 			resolvedURL: resolved,
 			resolvedAt:  time.Now(),
