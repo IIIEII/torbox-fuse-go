@@ -52,6 +52,13 @@ const (
 	// This threshold ensures that only actively-streamed files get cache priority
 	// over metadata-scan files.
 	activeReadThreshold = 4
+
+	// recentReadTTL is the time window within which recentReads must have occurred
+	// for the file to qualify as PriorityHigh. After this duration without reads,
+	// recentReads is considered stale and the file drops to PriorityLow.
+	// Library scans open many files but read each for only a few seconds;
+	// playback reads the same file continuously for minutes.
+	recentReadTTL = 5 * time.Second
 )
 
 // PermalinkBuilder returns the CDN URL for a given fileKey.
@@ -105,7 +112,8 @@ type fileSession struct {
 	lastReadOff       atomic.Int64  // offset of last ReadAt call
 	sequentialReads    atomic.Int32  // count of sequential reads (resets on seek/random)
 	randomReads       atomic.Int32  // count of random-access reads (for small-read eligibility)
-	recentReads       atomic.Int32  // total reads in this session (for active-playback detection)
+	recentReads       atomic.Int32  // reads within the recentReadTTL window (for active-playback detection)
+	lastReadTime      atomic.Int64  // unix nano timestamp of last ReadAt call
 }
 
 // NewStreamReader creates a StreamReader with the given dependencies.
@@ -147,6 +155,7 @@ func (sr *StreamReader) ReadAt(ctx context.Context, fileKey string, off int64, p
 	sess := sr.getOrCreateSession(fileKey)
 	sr.updateAccessPattern(fileKey, off, int64(len(p)), sess)
 	sess.recentReads.Add(1)
+	sess.lastReadTime.Store(time.Now().UnixNano())
 
 	// Small reads (metadata scans, EOF probes) from random-access patterns
 	// bypass the window system to avoid fetching 16 MiB for a 64 KiB request.
@@ -569,14 +578,17 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 	}
 
 	// Determine cache priority: active playback data survives eviction
-	// longer than metadata-scan data. A file needs both sequential access
-	// AND sufficient read volume to qualify — library scans open many files
-	// but read only 1-2 windows each, while playback reads many windows
-	// from a single file continuously.
+	// longer than metadata-scan data. A file qualifies as PriorityHigh only
+	// if it has sequential access, sufficient read volume, AND recent activity
+	// (last read within recentReadTTL). The TTL ensures that files from a
+	// completed library scan lose their priority once Plex moves on.
 	sess := sr.getOrCreateSession(fileKey)
 	cachePriority := uint8(cache.PriorityLow)
 	if isSequential(sess) && sess.recentReads.Load() >= activeReadThreshold {
-		cachePriority = cache.PriorityHigh
+		lastRead := time.Unix(0, sess.lastReadTime.Load())
+		if time.Since(lastRead) < recentReadTTL {
+			cachePriority = cache.PriorityHigh
+		}
 	}
 
 	var lastErr error
