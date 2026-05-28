@@ -45,6 +45,13 @@ const (
 	// offset 0) enables read-ahead, while random metadata scans that jump
 	// around never accumulate enough sequential streaks.
 	sequentialReadsRequired = 1
+
+	// activeReadThreshold is the number of ReadAt calls on a file before its
+	// cache priority is promoted to PriorityHigh. Playback typically makes 10+
+	// reads per second, while library scans make 1-3 reads per file and move on.
+	// This threshold ensures that only actively-streamed files get cache priority
+	// over metadata-scan files.
+	activeReadThreshold = 4
 )
 
 // PermalinkBuilder returns the CDN URL for a given fileKey.
@@ -98,6 +105,7 @@ type fileSession struct {
 	lastReadOff       atomic.Int64  // offset of last ReadAt call
 	sequentialReads    atomic.Int32  // count of sequential reads (resets on seek/random)
 	randomReads       atomic.Int32  // count of random-access reads (for small-read eligibility)
+	recentReads       atomic.Int32  // total reads in this session (for active-playback detection)
 }
 
 // NewStreamReader creates a StreamReader with the given dependencies.
@@ -138,6 +146,7 @@ func (sr *StreamReader) ReadAt(ctx context.Context, fileKey string, off int64, p
 	// Track access pattern for read-ahead decisions.
 	sess := sr.getOrCreateSession(fileKey)
 	sr.updateAccessPattern(fileKey, off, int64(len(p)), sess)
+	sess.recentReads.Add(1)
 
 	// Small reads (metadata scans, EOF probes) from random-access patterns
 	// bypass the window system to avoid fetching 16 MiB for a 64 KiB request.
@@ -559,10 +568,14 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 		winEnd = win.fileSize
 	}
 
-	// Determine cache priority: sequential playback data survives eviction
-	// longer than metadata-scan data.
+	// Determine cache priority: active playback data survives eviction
+	// longer than metadata-scan data. A file needs both sequential access
+	// AND sufficient read volume to qualify — library scans open many files
+	// but read only 1-2 windows each, while playback reads many windows
+	// from a single file continuously.
+	sess := sr.getOrCreateSession(fileKey)
 	cachePriority := uint8(cache.PriorityLow)
-	if sess := sr.getOrCreateSession(fileKey); isSequential(sess) {
+	if isSequential(sess) && sess.recentReads.Load() >= activeReadThreshold {
 		cachePriority = cache.PriorityHigh
 	}
 
