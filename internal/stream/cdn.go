@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/iiieii/torbox-fuse-go/internal/metrics"
+	"golang.org/x/sync/singleflight"
 )
 
 // hostSem holds a per-CDN-host concurrency semaphore.
@@ -44,13 +45,16 @@ type cdnURLCacheEntry struct {
 // nexus-128, etc.).
 // It caches API redirect resolutions so subsequent range requests go directly
 // to the CDN URL instead of hitting the TorBox API every time.
+// URL resolution uses singleflight to dedup concurrent requests for the same
+// API URL, preventing thundering-herd API rate limiting.
 type CDNClient struct {
 	client          *http.Client
 	maxConnsPerHost int
-	hostSems        sync.Map // string -> *hostSem — per-CDN-host semaphore
+	hostSems        sync.Map          // string -> *hostSem - per-CDN-host semaphore
 	metrics         *metrics.Metrics
-	urlCache        sync.Map // apiURL string -> *cdnURLCacheEntry
+	urlCache        sync.Map          // apiURL string -> *cdnURLCacheEntry
 	urlCacheTTL     time.Duration
+	resolveGroup    singleflight.Group // dedup parallel URL resolution requests
 }
 
 // NewCDNClient creates a CDNClient that allows at most maxConns concurrent
@@ -103,18 +107,23 @@ func hostFromURL(rawURL string) string {
 	return u.Host
 }
 
-// ResolveURL resolves an API redirect URL to the direct CDN URL. It caches the
-// result and re-resolves after urlCacheTTL expires. Falls back to the API URL
-// on resolution failure, so streaming still works (just slower).
+// ResolveURL resolves an API redirect URL to the direct CDN URL. It caches
+// successful resolutions and re-resolves after urlCacheTTL expires. Failed
+// resolutions (including 429 rate-limit responses) are NOT cached, so
+// subsequent requests will retry resolution.
 //
-// Resolution uses a GET request with Range: bytes=0-0 to follow the redirect
-// chain while transferring minimal data. HEAD is not used because some CDNs
-// don't support it for redirect URLs.
+// Uses singleflight to dedup concurrent resolution requests for the same
+// API URL, preventing thundering-herd API rate limiting when multiple files
+// are opened simultaneously.
+//
+// Falls back to the API URL on resolution failure, so streaming still works
+// (just slower - the request goes through the API redirect each time).
 func (c *CDNClient) ResolveURL(ctx context.Context, apiURL string) string {
 	if c.urlCacheTTL <= 0 {
 		return apiURL
 	}
 
+	// Check cache first.
 	if v, ok := c.urlCache.Load(apiURL); ok {
 		entry := v.(*cdnURLCacheEntry)
 		if time.Since(entry.resolvedAt) < c.urlCacheTTL {
@@ -122,18 +131,28 @@ func (c *CDNClient) ResolveURL(ctx context.Context, apiURL string) string {
 		}
 	}
 
-	resolved, err := c.resolveRedirect(ctx, apiURL)
+	// Dedup concurrent resolution requests for the same URL.
+	result, err, _ := c.resolveGroup.Do(apiURL, func() (interface{}, error) {
+		resolved, resolveErr := c.resolveRedirect(ctx, apiURL)
+		if resolveErr != nil {
+			return nil, resolveErr
+		}
+
+		slog.Debug("cdn url resolved", "apiURL", apiURL, "cdnURL", resolved)
+		// Only cache successful resolutions - 429/bad responses should be retried.
+		c.urlCache.Store(apiURL, &cdnURLCacheEntry{
+			resolvedURL: resolved,
+			resolvedAt:  time.Now(),
+		})
+		return resolved, nil
+	})
+
 	if err != nil {
 		slog.Warn("cdn url resolution failed, using api url directly", "url", apiURL, "err", err)
 		return apiURL
 	}
 
-	slog.Debug("cdn url resolved", "apiURL", apiURL, "cdnURL", resolved)
-	c.urlCache.Store(apiURL, &cdnURLCacheEntry{
-		resolvedURL: resolved,
-		resolvedAt:  time.Now(),
-	})
-	return resolved
+	return result.(string)
 }
 
 // InvalidateURL removes the cached CDN URL for the given API URL. Call this
@@ -146,6 +165,9 @@ func (c *CDNClient) InvalidateURL(apiURL string) {
 // resolveRedirect follows the redirect chain for the given URL and returns
 // the final resolved URL. Uses a GET with Range: bytes=0-0 to minimize data
 // transfer while ensuring CDN compatibility.
+//
+// Returns an error for 429 (rate limited) and 5xx (server error) responses
+// so that ResolveURL does NOT cache the unresolved API URL.
 func (c *CDNClient) resolveRedirect(ctx context.Context, rawURL string) (string, error) {
 	currentURL := rawURL
 	for redirects := 0; redirects < maxRedirects; redirects++ {
@@ -179,11 +201,26 @@ func (c *CDNClient) resolveRedirect(ctx context.Context, rawURL string) (string,
 			continue
 		}
 
+		// Rate-limited: do NOT treat as successful resolution.
+		// Returning an error prevents ResolveURL from caching the bad URL.
+		if resp.StatusCode == http.StatusTooManyRequests {
+			resp.Body.Close()
+			slog.Warn("cdn url resolution rate limited", "url", rawURL, "status", resp.StatusCode)
+			return "", fmt.Errorf("rate limited: status %d", resp.StatusCode)
+		}
+
+		// Server errors: do NOT treat as successful resolution.
+		if resp.StatusCode >= 500 {
+			resp.Body.Close()
+			slog.Warn("cdn url resolution server error", "url", rawURL, "status", resp.StatusCode)
+			return "", fmt.Errorf("server error: status %d", resp.StatusCode)
+		}
+
 		resp.Body.Close()
 
-		// Any non-redirect response means we've reached the final URL.
+		// Any other non-redirect response means we've reached the final URL.
 		// 206 (range accepted), 200, 416 (range not satisfiable for 0-0 on
-		// empty file) — all mean the URL resolved successfully.
+		// empty file) - all mean the URL resolved successfully.
 		return currentURL, nil
 	}
 
@@ -211,7 +248,7 @@ func (c *CDNClient) resolveRedirect(ctx context.Context, rawURL string) (string,
 //   - 200 OK only when start == 0 (full response fallback)
 //   - 429, 5xx: returns HTTPStatusError (caller decides whether to retry)
 func (c *CDNClient) FetchRange(ctx context.Context, rawURL string, start, end int64) (*http.Response, error) {
-	// Resolve API URL to direct CDN URL first — we need the host for per-host
+	// Resolve API URL to direct CDN URL first - we need the host for per-host
 	// rate limiting, and we need the resolved URL for the request anyway.
 	resolvedURL := c.ResolveURL(ctx, rawURL)
 
