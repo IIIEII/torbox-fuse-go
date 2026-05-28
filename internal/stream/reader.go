@@ -559,6 +559,13 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 		winEnd = win.fileSize
 	}
 
+	// Determine cache priority: sequential playback data survives eviction
+	// longer than metadata-scan data.
+	cachePriority := uint8(cache.PriorityLow)
+	if sess := sr.getOrCreateSession(fileKey); isSequential(sess) {
+		cachePriority = cache.PriorityHigh
+	}
+
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
@@ -607,11 +614,11 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 			win.readyTo.Store(win.total)
 			win.readyCond.Broadcast()
 			win.readyCond.L.Unlock()
-			sr.cache.Put(fileKey, winStart, win.buf)
+			sess := sr.getOrCreateSession(fileKey)
+			sr.cache.PutWithPriority(fileKey, winStart, win.buf, cachePriority)
 			win.readyCond.L.Lock()
 			win.done.Store(true)
 			win.readyCond.L.Unlock()
-			sess := sr.getOrCreateSession(fileKey)
 			sr.maybeReadAhead(fileKey, winStart+sr.windowSize, winStart, win.fileSize, sess)
 			go sr.cleanupWindow(win)
 			return
@@ -667,7 +674,7 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 			win.readyCond.L.Lock()
 			cachedBuf := win.buf
 			win.readyCond.L.Unlock()
-			sr.cache.Put(fileKey, winStart, cachedBuf)
+			sr.cache.PutWithPriority(fileKey, winStart, cachedBuf, cachePriority)
 		}
 
 		if success && bufLen > 0 {

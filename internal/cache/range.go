@@ -36,12 +36,21 @@ type cacheKey struct {
 	start   int64
 }
 
+// Priority levels for cache eviction.
+// Low-priority blocks (from metadata scans) are evicted before
+// high-priority blocks (from sequential playback).
+const (
+	PriorityLow  = 0 // metadata scans, random access probes
+	PriorityHigh = 1 // sequential playback data
+)
+
 // RangeBlock holds a contiguous byte range for a file.
 type RangeBlock struct {
 	start      int64
 	end        int64
 	data       []byte
 	sessionID  int64
+	priority   uint8 // PriorityLow or PriorityHigh
 	lastAccess atomic.Int64
 }
 
@@ -117,21 +126,30 @@ func (rc *RangeCache) CachedPrefixLen(fileKey string, off int64) (int64, bool) {
 	return 0, false
 }
 
-// Put inserts a block at (fileKey, start). The data slice is copied so the
+// Put inserts a block at (fileKey, start) with low priority (suitable for
+// metadata scans and random-access probes). The data slice is copied so the
 // caller may reuse their buffer. Empty data is silently ignored.
-// If the total cached size exceeds the budget after insertion, the
-// oldest-accessed blocks are evicted until under budget.
+// If the total cached size exceeds the budget after insertion, the oldest-
+// accessed blocks are evicted (low-priority first) until under budget.
 func (rc *RangeCache) Put(fileKey string, start int64, data []byte) {
-	rc.putBlock(fileKey, start, data, 0)
+	rc.putBlock(fileKey, start, data, 0, PriorityLow)
+}
+
+// PutWithPriority inserts a block at (fileKey, start) with the given priority.
+// PriorityHigh blocks (sequential playback) are kept longer during eviction —
+// low-priority blocks (metadata scans) are evicted first when the budget is
+// exceeded.
+func (rc *RangeCache) PutWithPriority(fileKey string, start int64, data []byte, priority uint8) {
+	rc.putBlock(fileKey, start, data, 0, priority)
 }
 
 // PutWithSession is like Put but tags the block with a session ID for later
-// stale eviction via EvictStale.
+// stale eviction via EvictStale. Blocks are stored with low priority.
 func (rc *RangeCache) PutWithSession(fileKey string, start int64, data []byte, sessionID int64) {
-	rc.putBlock(fileKey, start, data, sessionID)
+	rc.putBlock(fileKey, start, data, sessionID, PriorityLow)
 }
 
-func (rc *RangeCache) putBlock(fileKey string, start int64, data []byte, sessionID int64) {
+func (rc *RangeCache) putBlock(fileKey string, start int64, data []byte, sessionID int64, priority uint8) {
 	if len(data) == 0 {
 		return
 	}
@@ -144,6 +162,7 @@ func (rc *RangeCache) putBlock(fileKey string, start int64, data []byte, session
 		end:        start + int64(len(data)),
 		data:       buf,
 		sessionID:  sessionID,
+		priority:   priority,
 	}
 	blk.lastAccess.Store(nowNano())
 
@@ -213,41 +232,54 @@ func (rc *RangeCache) evict() {
 	}
 }
 
-// evictOne finds and removes the single block with the oldest lastAccess
-// across all shards.
+// evictOne removes the best eviction candidate across all shards.
+// Low-priority blocks (metadata scans) are evicted before high-priority blocks
+// (sequential playback). Within the same priority, the oldest-accessed block
+// is evicted first (LRU).
 func (rc *RangeCache) evictOne() {
-	var oldestKey cacheKey
-	var oldestShard uint32
-	var oldestTime int64 = -1
+	type candidate struct {
+		key       cacheKey
+		shard     uint32
+		lastAccess int64
+	}
 
-	// First pass: find the oldest block (read locks only).
+	// Find the oldest low-priority block and the oldest high-priority block.
+	var lowCand, highCand *candidate
+
 	for i := range rc.shards {
 		sh := &rc.shards[i]
 		sh.mu.RLock()
 		for key, blk := range sh.blocks {
 			la := blk.lastAccess.Load()
-			if oldestTime == -1 || la < oldestTime {
-				oldestTime = la
-				oldestKey = key
-				oldestShard = uint32(i)
+			cand := &candidate{key: key, shard: uint32(i), lastAccess: la}
+			if blk.priority == PriorityLow {
+				if lowCand == nil || la < lowCand.lastAccess {
+					lowCand = cand
+				}
+			} else {
+				if highCand == nil || la < highCand.lastAccess {
+					highCand = cand
+				}
 			}
 		}
 		sh.mu.RUnlock()
 	}
 
-	if oldestTime == -1 {
+	// Prefer evicting low-priority blocks first.
+	evict := lowCand
+	if evict == nil {
+		evict = highCand
+	}
+	if evict == nil {
 		return // nothing to evict
 	}
 
-	// Second pass: delete the oldest block (write lock on its shard).
-	sh := &rc.shards[oldestShard]
+	// Delete the chosen block (write lock on its shard).
+	sh := &rc.shards[evict.shard]
 	sh.mu.Lock()
-	// Re-verify the block is still present (a concurrent writer may have
-	// replaced or removed it).
-	if blk, ok := sh.blocks[oldestKey]; ok {
+	if blk, ok := sh.blocks[evict.key]; ok {
 		size := int64(len(blk.data))
-		delete(sh.blocks, oldestKey)
-		// Prevent underflow: if used has drifted below size, reset to 0.
+		delete(sh.blocks, evict.key)
 		current := rc.used.Load()
 		if current >= size {
 			rc.used.Add(-size)
