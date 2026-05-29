@@ -185,7 +185,7 @@ func setupLogger(level string) error {
 		}
 	}
 
-	handler := slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})
+	handler := slog.NewJSONHandler(os.Stderr, &slog.HandlerOptions{Level: lvl})
 	slog.SetDefault(slog.New(handler))
 	return nil
 }
