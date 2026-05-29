@@ -59,10 +59,134 @@ const (
 	// Library scans open many files but read each for only a few seconds;
 	// playback reads the same file continuously for minutes.
 	recentReadTTL = 5 * time.Second
+
+	// budgetPriorityThreshold is the minimum read size (in bytes) that qualifies
+	// a first-access read for PriorityHigh in the global budget semaphore. Metadata
+	// scans typically read 1-4 KiB; playback reads 64 KiB or more. A 16 KiB
+	// threshold ensures playback buffer fills jump the queue while scan probes wait.
+	budgetPriorityThreshold = 16 * 1024 // 16 KiB
 )
 
 // PermalinkBuilder returns the CDN URL for a given fileKey.
 type PermalinkBuilder func(fileKey string) string
+
+// budgetSem is a priority-aware global inflight window limit.
+// High-priority requests (playback) are served before low-priority ones (scan)
+// when both are waiting for a budget slot. This prevents global budget starvation:
+// without priority, a library scan filling all slots causes playback to wait
+// behind the entire FIFO queue.
+//
+// Implementation: sync.Cond-based queue where waiters are sorted by priority.
+// When a slot is released, the highest-priority waiter is signaled.
+// Identical pattern to hostSem in cdn.go, but global (not per-CDN-host).
+type budgetSem struct {
+	mu      sync.Mutex
+	cond    *sync.Cond
+	limit   int // max concurrent holders
+	holding int // current number of holders
+	waiters []*budgetWaiter
+}
+
+// budgetWaiter represents a goroutine waiting for a budget slot.
+type budgetWaiter struct {
+	priority uint8 // 0=low, 1=high (higher value = higher priority)
+	ready    bool  // set to true when this waiter has been granted a slot
+}
+
+// newBudgetSem creates a priority-aware budget semaphore with the given limit.
+func newBudgetSem(limit int) *budgetSem {
+	bs := &budgetSem{limit: limit}
+	bs.cond = sync.NewCond(&bs.mu)
+	return bs
+}
+
+// acquire blocks until a budget slot is available, respecting priority.
+// Higher-priority requests are served first when multiple goroutines are waiting.
+// Returns an error if ctx is cancelled while waiting.
+func (bs *budgetSem) acquire(ctx context.Context, priority uint8) error {
+	bs.mu.Lock()
+
+	// Fast path: slot available, no waiters to jump ahead of.
+	if bs.holding < bs.limit && len(bs.waiters) == 0 {
+		bs.holding++
+		bs.mu.Unlock()
+		return nil
+	}
+
+	// Slow path: enqueue and wait.
+	w := &budgetWaiter{priority: priority}
+	// Insert in priority order (high priority at front).
+	insertPos := len(bs.waiters)
+	for i, existing := range bs.waiters {
+		if existing.priority < priority {
+			insertPos = i
+			break
+		}
+	}
+	if insertPos == len(bs.waiters) {
+		bs.waiters = append(bs.waiters, w)
+	} else {
+		bs.waiters = append(bs.waiters[:insertPos+1], bs.waiters[insertPos:]...)
+		bs.waiters[insertPos] = w
+	}
+
+	// Wait loop: Cond.Wait requires bs.mu to be locked on entry.
+	// It unlocks during wait and re-locks before returning.
+	done := ctx.Done()
+	for !w.ready {
+		if err := ctx.Err(); err != nil {
+			// Context cancelled — remove our waiter from the queue.
+			for i, existing := range bs.waiters {
+				if existing == w {
+					bs.waiters = append(bs.waiters[:i], bs.waiters[i+1:]...)
+					break
+				}
+			}
+			bs.mu.Unlock()
+			return err
+		}
+		bs.cond.Wait()
+		// After Wait returns, bs.mu is held again. Check if context is done
+		// before the next loop iteration checks w.ready.
+		select {
+		case <-done:
+			if w.ready {
+				// Granted just before cancellation — take the slot.
+				bs.mu.Unlock()
+				return nil
+			}
+			// Remove waiter and return error.
+			for i, existing := range bs.waiters {
+				if existing == w {
+					bs.waiters = append(bs.waiters[:i], bs.waiters[i+1:]...)
+					break
+				}
+			}
+			bs.mu.Unlock()
+			return ctx.Err()
+		default:
+		}
+	}
+	bs.mu.Unlock()
+	return nil
+}
+
+// release returns a budget slot and wakes the highest-priority waiter.
+func (bs *budgetSem) release() {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+
+	bs.holding--
+
+	if len(bs.waiters) > 0 {
+		// Grant slot to the highest-priority waiter (front of queue).
+		w := bs.waiters[0]
+		bs.waiters = bs.waiters[1:]
+		w.ready = true
+		bs.holding++
+		bs.cond.Broadcast() // wake all waiters so the granted one can proceed
+	}
+}
 
 // StreamReader manages inflight windows and delegates to the cache and CDN client.
 // It supports early return (readers return as soon as their requested bytes are
@@ -75,7 +199,7 @@ type StreamReader struct {
 	sessions     sync.Map // fileKey -> *fileSession
 	windowSize   int64
 	maxInflight  int
-	globalBudget chan struct{} // limits total inflight windows across all files
+	budget       *budgetSem // priority-aware global inflight window limit
 	permalinkFor PermalinkBuilder
 	metrics      *metrics.Metrics
 }
@@ -126,7 +250,7 @@ func NewStreamReader(rc *cache.RangeCache, cdn *CDNClient, maxInflight, maxGloba
 		cdn:          cdn,
 		windowSize:   windowSize,
 		maxInflight:  maxInflight,
-		globalBudget: make(chan struct{}, maxGlobalWindows),
+		budget:       newBudgetSem(maxGlobalWindows),
 		permalinkFor: permalinkFor,
 		metrics:      m,
 	}
@@ -314,8 +438,14 @@ func (sr *StreamReader) readWindow(ctx context.Context, fileKey string, off int6
 	// Determine which window this read falls in.
 	ws := sr.windowStart(off)
 
+	// Compute budget priority before creating the window — it determines
+	// global budget acquisition order. Large reads (playback buffers) and
+	// active streaming files jump the queue ahead of tiny metadata probes.
+	sess := sr.getOrCreateSession(fileKey)
+	budgetPriority := sr.computeBudgetPriority(sess, int64(len(p)))
+
 	// Find or create an inflight window.
-	win, created := sr.getOrCreateWindow(fileKey, ws, fileSize)
+	win, created := sr.getOrCreateWindow(fileKey, ws, fileSize, budgetPriority)
 
 	if sr.metrics != nil {
 		if created {
@@ -340,7 +470,6 @@ func (sr *StreamReader) readWindow(ctx context.Context, fileKey string, off int6
 	}
 
 	// Trigger read-ahead if conditions are met.
-	sess := sr.getOrCreateSession(fileKey)
 	sr.maybeReadAhead(fileKey, off+int64(n), ws, fileSize, sess)
 
 	return n, nil
@@ -437,10 +566,44 @@ func (sr *StreamReader) getOrCreateSession(fileKey string) *fileSession {
 	return actual.(*fileSession)
 }
 
+// computeCachePriority returns the cache priority for a file based on its
+// access pattern. Active playback (sequential + recent reads) gets PriorityHigh;
+// everything else (metadata scans, idle files) gets PriorityLow.
+func (sr *StreamReader) computeCachePriority(sess *fileSession) uint8 {
+	if isSequential(sess) && sess.recentReads.Load() >= activeReadThreshold {
+		lastRead := time.Unix(0, sess.lastReadTime.Load())
+		if time.Since(lastRead) < recentReadTTL {
+			return uint8(cache.PriorityHigh)
+		}
+	}
+	return uint8(cache.PriorityLow)
+}
+
+// computeBudgetPriority returns the priority for acquiring a global budget slot.
+// Budget priority is slightly more generous than cache eviction priority:
+// a read that's large enough to be a playback request (not a tiny metadata probe)
+// gets PriorityHigh immediately, even on first access. This prevents a library
+// scan's tiny 4 KiB probes from starving a player's 128 KiB+ playback buffer.
+func (sr *StreamReader) computeBudgetPriority(sess *fileSession, readSize int64) uint8 {
+	// If the file already qualifies as active playback, it's high priority.
+	if sr.computeCachePriority(sess) == uint8(cache.PriorityHigh) {
+		return uint8(cache.PriorityHigh)
+	}
+	// First read of a new file: reads above budgetPriorityThreshold are likely
+	// playback (128 KiB+ FUSE reads), while tiny 4 KiB probes are metadata scans.
+	// This threshold is intentionally much lower than smallReadThreshold (256 KiB)
+	// because even a 128 KiB playback buffer fill should jump the budget queue
+	// ahead of dozens of 4 KiB metadata probes.
+	if readSize > budgetPriorityThreshold {
+		return uint8(cache.PriorityHigh)
+	}
+	return uint8(cache.PriorityLow)
+}
+
 // getOrCreateWindow finds an existing inflight window or creates a new one.
 // It returns the window and whether a new one was created (true) or an
 // existing one was found (false).
-func (sr *StreamReader) getOrCreateWindow(fileKey string, ws int64, fileSize int64) (*inflightWindow, bool) {
+func (sr *StreamReader) getOrCreateWindow(fileKey string, ws int64, fileSize int64, budgetPriority uint8) (*inflightWindow, bool) {
 	ik := inflightKey{fileKey: fileKey, start: ws}
 
 	if v, ok := sr.inflight.Load(ik); ok {
@@ -478,7 +641,7 @@ func (sr *StreamReader) getOrCreateWindow(fileKey string, ws int64, fileSize int
 	}
 
 	// Start the CDN fetch in a goroutine.
-	go sr.fetchWindow(wctx, fileKey, ws, win)
+	go sr.fetchWindow(wctx, fileKey, ws, win, budgetPriority)
 
 	if sr.metrics != nil {
 		sr.metrics.InflightWindows.Add(1)
@@ -548,14 +711,13 @@ func (sr *StreamReader) waitForBytes(ctx context.Context, win *inflightWindow, o
 //
 // Synchronization: buf and err are modified under readyCond.L so that
 // waitForBytes can safely read them while holding the same lock.
-func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStart int64, win *inflightWindow) {
-	// Acquire global budget slot — blocks if too many windows are inflight.
+func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStart int64, win *inflightWindow, budgetPriority uint8) {
+	// Acquire global budget slot — priority-aware so high-priority playback
+	// windows don't queue behind low-priority scan windows.
 	// This prevents OOM when many files are opened simultaneously.
-	select {
-	case sr.globalBudget <- struct{}{}:
-	case <-ctx.Done():
+	if err := sr.budget.acquire(ctx, budgetPriority); err != nil {
 		win.readyCond.L.Lock()
-		win.err = ctx.Err()
+		win.err = err
 		win.done.Store(true)
 		win.readyCond.Broadcast()
 		win.readyCond.L.Unlock()
@@ -564,31 +726,23 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 	}
 
 	defer func() {
-		<-sr.globalBudget
+		sr.budget.release()
 		win.readyCond.L.Lock()
 		win.done.Store(true)
 		win.readyCond.Broadcast()
 		win.readyCond.L.Unlock()
 	}()
 
+	// Compute cache eviction priority separately from budget priority.
+	// Budget priority controls queue order (playback jumps ahead of scan),
+	// while cache priority controls how long data survives in the LRU cache.
+	sess := sr.getOrCreateSession(fileKey)
+	cachePrio := sr.computeCachePriority(sess)
+
 	url := sr.permalinkFor(fileKey)
 	winEnd := winStart + sr.windowSize
 	if winEnd > win.fileSize {
 		winEnd = win.fileSize
-	}
-
-	// Determine cache priority: active playback data survives eviction
-	// longer than metadata-scan data. A file qualifies as PriorityHigh only
-	// if it has sequential access, sufficient read volume, AND recent activity
-	// (last read within recentReadTTL). The TTL ensures that files from a
-	// completed library scan lose their priority once Plex moves on.
-	sess := sr.getOrCreateSession(fileKey)
-	cachePriority := uint8(cache.PriorityLow)
-	if isSequential(sess) && sess.recentReads.Load() >= activeReadThreshold {
-		lastRead := time.Unix(0, sess.lastReadTime.Load())
-		if time.Since(lastRead) < recentReadTTL {
-			cachePriority = cache.PriorityHigh
-		}
 	}
 
 	var lastErr error
@@ -640,7 +794,7 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 			win.readyCond.Broadcast()
 			win.readyCond.L.Unlock()
 			sess := sr.getOrCreateSession(fileKey)
-			sr.cache.PutWithPriority(fileKey, winStart, win.buf, cachePriority)
+			sr.cache.PutWithPriority(fileKey, winStart, win.buf, cachePrio)
 			win.readyCond.L.Lock()
 			win.done.Store(true)
 			win.readyCond.L.Unlock()
@@ -673,7 +827,7 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 
 		slog.Debug("fetching window", "fileKey", fileKey, "start", winStart, "end", winEnd, "fetchStart", fetchStart, "url", url)
 
-		resp, err := sr.cdn.FetchRange(ctx, url, fetchStart, fetchEnd, cachePriority)
+		resp, err := sr.cdn.FetchRange(ctx, url, fetchStart, fetchEnd, budgetPriority)
 		if err != nil {
 			slog.Warn("fetch window error", "fileKey", fileKey, "start", winStart, "err", err)
 			lastErr = err
@@ -699,7 +853,7 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 			win.readyCond.L.Lock()
 			cachedBuf := win.buf
 			win.readyCond.L.Unlock()
-			sr.cache.PutWithPriority(fileKey, winStart, cachedBuf, cachePriority)
+			sr.cache.PutWithPriority(fileKey, winStart, cachedBuf, cachePrio)
 		}
 
 		if success && bufLen > 0 {
@@ -888,6 +1042,10 @@ func (sr *StreamReader) maybeReadAhead(fileKey string, endOff, winStart, fileSiz
 		return
 	}
 
-	// Create read-ahead window.
-	_, _ = sr.getOrCreateWindow(fileKey, nextStart, fileSize)
+	// Create read-ahead window. Read-ahead inherits the same priority
+	// as the triggering file — sequential playback data should not wait
+	// behind scan windows in the global budget.
+	// Read-ahead always uses high budget priority — it's triggered by sequential
+	// playback, so it should not queue behind scan windows.
+	_, _ = sr.getOrCreateWindow(fileKey, nextStart, fileSize, uint8(cache.PriorityHigh))
 }

@@ -922,7 +922,145 @@ func TestCDNClient_PrioritySemaphore(t *testing.T) {
 }
 
 // ============================================================
-// Test 9: Concurrent playback of different files
+// Test 9: Priority global budget — playback must not wait
+//         behind scan for inflight window slots
+// ============================================================
+// This test exposes the production bug where playback cache misses
+// block on the globalBudget channel behind queued scan fetches.
+//
+// Production uses maxGlobalWindows=16, but the stress tests use 100.
+// With 100 slots, scan can never fill them all, so playback always
+// finds a free slot. With 16 (or fewer), scan easily saturates all
+// slots and playback starves.
+//
+// The test works by:
+// 1. Setting maxGlobalWindows=4 (tight budget to force contention).
+// 2. Launching 20 scan goroutines that each read the first window of
+//    a different file — this fills all 4 budget slots and queues 16.
+// 3. After a short delay (scan slots are saturated), starting a
+//    sequential playback ReadAt on a separate file.
+// 4. Measuring how long playback's first ReadAt takes.
+//
+// WITHOUT priority budget: playback's fetchWindow blocks on
+//   globalBudget behind 16 queued scan fetches. With cdnLatency=100ms
+//   and 4 slots, draining 16 queued takes 4 rounds × 100ms = ~400ms.
+//   Playback waits ~400ms before it even starts fetching.
+//
+// WITH priority budget: playback jumps the queue and gets the next
+//   available slot (~25-50ms = one slot rotation with 4 slots).
+//   Total: ~50-100ms.
+
+func TestStreamReader_PriorityGlobalBudget(t *testing.T) {
+	const maxGlobalWindows = 4
+	const scanFileCount = 20
+	const fileSize int64 = 4 * 1024 * 1024 // 4 MiB = 1 window each
+	const cdnLatency = 100 * time.Millisecond
+
+	// Scan files: one window each, 4 MiB.
+	scanFiles := makeStressFiles(scanFileCount, fileSize)
+	// Playback file: separate, also 4 MiB.
+	playbackData := make([]byte, fileSize)
+	for j := range playbackData {
+		playbackData[j] = byte(j % 256)
+	}
+	allFiles := append(scanFiles, stressFile{key: "playback", data: playbackData, size: fileSize})
+
+	env := newStressEnv(t, &stressConfig{
+		maxGlobalWindows: maxGlobalWindows,
+		cdnLatency:       cdnLatency,
+		// Small cache so playback data is not retained between rounds
+		cacheBudgetMB: 4,
+	}, allFiles)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Step 1: Launch scan goroutines. Each reads offset 0 of a scan file,
+	// which creates 1 inflight window per file. With maxGlobalWindows=4,
+	// 4 windows start fetching immediately; 16 queue on the budget.
+	scanResults := make(chan error, scanFileCount)
+	var scanStarted sync.WaitGroup
+	scanStarted.Add(scanFileCount)
+
+	for i := 0; i < scanFileCount; i++ {
+		go func(idx int) {
+			scanStarted.Done()
+			// Small delay after signaling so goroutines group up.
+			time.Sleep(2 * time.Millisecond)
+			f := env.files[idx]
+			buf := make([]byte, 4096)
+			_, err := env.sr.ReadAt(ctx, f.key, 0, buf, f.size)
+			if err != nil && err != io.EOF {
+				scanResults <- fmt.Errorf("scan file %d: %w", idx, err)
+				return
+			}
+			scanResults <- nil
+		}(i)
+	}
+
+	// Wait for all scan goroutines to be ready.
+	scanStarted.Wait()
+	// Give scan goroutines time to acquire budget slots and queue up.
+	// With 4 slots and cdnLatency=100ms, the first 4 goroutines enter
+	// the CDN handler and hold slots for 100ms each. The remaining 16
+	// are blocked on globalBudget.
+	time.Sleep(150 * time.Millisecond)
+
+	// Step 2: Start playback. This is a sequential read on a file not
+	// being scanned, so it needs its own inflight window — which needs
+	// a globalBudget slot. Without priority, it waits behind 16 queued
+	// scan windows. With priority, it jumps the queue.
+	playbackStart := time.Now()
+	playbackBuf := make([]byte, 128*1024)
+	n, err := env.sr.ReadAt(ctx, "playback", 0, playbackBuf, fileSize)
+	playbackWait := time.Since(playbackStart)
+
+	if err != nil && err != io.EOF {
+		t.Fatalf("playback ReadAt: %v", err)
+	}
+	if n == 0 {
+		t.Fatal("playback ReadAt returned 0 bytes")
+	}
+
+	// Verify data.
+	for i := 0; i < n; i++ {
+		if playbackBuf[i] != byte(i%256) {
+			t.Fatalf("playback data mismatch at byte %d: got 0x%02x, want 0x%02x",
+				i, playbackBuf[i], byte(i%256))
+		}
+	}
+
+	// Drain scan results.
+	for i := 0; i < scanFileCount; i++ {
+		if err := <-scanResults; err != nil {
+			t.Error(err)
+		}
+	}
+
+	// Expected wait times:
+	// WITHOUT priority (FIFO): playback is request #21. 4 slots active,
+	//   16 queued ahead. 16/4 = 4 rounds × 100ms = 400ms minimum.
+	//   Plus partial first round = ~50ms. Total: ~450ms.
+	//
+	// WITH priority: playback jumps the queue of waiting scan requests.
+	//   It still waits for one in-progress CDN request to finish
+	//   (~0-100ms remaining) plus its own CDN latency (100ms).
+	//   Total: ~200-350ms depending on scheduling.
+	//
+	// We use 350ms as the threshold — well below FIFO wait (~450ms)
+	// but generous enough for scheduling jitter and CDN timing.
+	t.Logf("playback first-read wait: %v (threshold: 350ms)", playbackWait)
+
+	if playbackWait > 350*time.Millisecond {
+		t.Errorf("playback ReadAt waited %v — global budget starvation detected! "+
+			"PriorityHigh playback should not wait behind PriorityLow scan windows. "+
+			"Expected < 350ms (priority budget), got FIFO-style delay.",
+			playbackWait)
+	}
+}
+
+// ============================================================
+// Test 10: Concurrent playback of different files
 // ============================================================
 // Multiple files played simultaneously (simulating multiple household
 // members or transcodes). Verifies: all complete, no data corruption.
