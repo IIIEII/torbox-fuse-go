@@ -231,7 +231,7 @@ func (sr *StreamReader) smallRead(ctx context.Context, fileKey string, off int64
 	}
 
 	url := sr.permalinkFor(fileKey)
-	resp, err := sr.cdn.FetchRange(ctx, url, off, end)
+	resp, err := sr.cdn.FetchRange(ctx, url, off, end, uint8(cache.PriorityLow))
 	if err != nil {
 		slog.Debug("small read fetch error", "fileKey", fileKey, "offset", off, "err", err)
 		return 0, err
@@ -673,7 +673,7 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 
 		slog.Debug("fetching window", "fileKey", fileKey, "start", winStart, "end", winEnd, "fetchStart", fetchStart, "url", url)
 
-		resp, err := sr.cdn.FetchRange(ctx, url, fetchStart, fetchEnd)
+		resp, err := sr.cdn.FetchRange(ctx, url, fetchStart, fetchEnd, cachePriority)
 		if err != nil {
 			slog.Warn("fetch window error", "fileKey", fileKey, "start", winStart, "err", err)
 			lastErr = err

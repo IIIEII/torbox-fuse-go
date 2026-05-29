@@ -47,7 +47,7 @@ func TestFetchRange_206PartialContent(t *testing.T) {
 	defer ts.Close()
 
 	cdn := NewCDNClient(4, nil, 0)
-	resp, err := cdn.FetchRange(context.Background(), ts.URL, 100, 199)
+	resp, err := cdn.FetchRange(context.Background(), ts.URL, 100, 199, 0)
 	if err != nil {
 		t.Fatalf("FetchRange returned error: %v", err)
 	}
@@ -85,7 +85,7 @@ func TestFetchRange_200OK_ZeroOffset(t *testing.T) {
 	defer ts.Close()
 
 	cdn := NewCDNClient(4, nil, 0)
-	resp, err := cdn.FetchRange(context.Background(), ts.URL, 0, int64(len(body)-1))
+	resp, err := cdn.FetchRange(context.Background(), ts.URL, 0, int64(len(body)-1), 0)
 	if err != nil {
 		t.Fatalf("FetchRange returned error: %v", err)
 	}
@@ -108,7 +108,7 @@ func TestFetchRange_200OK_NonZeroOffset(t *testing.T) {
 	defer ts.Close()
 
 	cdn := NewCDNClient(4, nil, 0)
-	_, err := cdn.FetchRange(context.Background(), ts.URL, 100, 199)
+	_, err := cdn.FetchRange(context.Background(), ts.URL, 100, 199, 0)
 	if err == nil {
 		t.Fatal("expected error for 200 OK at non-zero offset, got nil")
 	}
@@ -143,7 +143,7 @@ func TestFetchRange_ConcurrencyLimit(t *testing.T) {
 	errCh := make(chan error, totalReqs)
 	for i := 0; i < totalReqs; i++ {
 		go func() {
-			resp, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0)
+				resp, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0, 0)
 			if err != nil {
 				errCh <- err
 				return
@@ -197,7 +197,7 @@ func TestFetchRange_FollowsRedirect(t *testing.T) {
 	defer redirect.Close()
 
 	client := NewCDNClient(4, nil, 0)
-	resp, err := client.FetchRange(context.Background(), redirect.URL, 0, 99)
+	resp, err := client.FetchRange(context.Background(), redirect.URL, 0, 99, 0)
 	if err != nil {
 		t.Fatalf("FetchRange after redirect: %v", err)
 	}
@@ -226,7 +226,7 @@ func TestFetchRange_TooManyRedirects(t *testing.T) {
 	defer redirect.Close()
 
 	client := NewCDNClient(4, nil, 0)
-	_, err := client.FetchRange(context.Background(), redirect.URL, 0, 99)
+	_, err := client.FetchRange(context.Background(), redirect.URL, 0, 99, 0)
 	if err == nil {
 		t.Fatal("expected error for redirect loop, got nil")
 	}
@@ -244,7 +244,7 @@ func TestFetchRange_IncrementsCDNRequestCount(t *testing.T) {
 
 	cdn := NewCDNClient(4, m, 0)
 
-	resp, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0)
+	resp, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("FetchRange returned error: %v", err)
 	}
@@ -254,7 +254,7 @@ func TestFetchRange_IncrementsCDNRequestCount(t *testing.T) {
 		t.Errorf("CDNRequestCount = %d, want 1", got)
 	}
 
-	resp, err = cdn.FetchRange(context.Background(), ts.URL, 0, 0)
+	resp, err = cdn.FetchRange(context.Background(), ts.URL, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("second FetchRange returned error: %v", err)
 	}
@@ -277,7 +277,7 @@ func TestFetchRange_IncCDNStatusCode(t *testing.T) {
 
 	cdn := NewCDNClient(4, m, 0)
 
-	resp, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0)
+	resp, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("FetchRange returned error: %v", err)
 	}
@@ -302,7 +302,7 @@ func TestFetchRange_NilMetricsNoPanic(t *testing.T) {
 
 	cdn := NewCDNClient(4, nil, 0)
 
-	resp, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0)
+	resp, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("FetchRange with nil metrics returned error: %v", err)
 	}
@@ -316,7 +316,7 @@ func TestFetchRange_HTTPStatusError(t *testing.T) {
 	defer ts.Close()
 
 	cdn := NewCDNClient(4, nil, 0)
-	_, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0)
+	_, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0, 0)
 	if err == nil {
 		t.Fatal("expected error for 429, got nil")
 	}
@@ -495,7 +495,7 @@ func TestFetchRange_ExpiredCDNURLRetry(t *testing.T) {
 	}
 
 	// Now fetch range from the resolved URL should work.
-	resp, err := c.FetchRange(context.Background(), apiServer.URL, 0, 0)
+	resp, err := c.FetchRange(context.Background(), apiServer.URL, 0, 0, 0)
 	if err != nil {
 		t.Fatalf("FetchRange error: %v", err)
 	}

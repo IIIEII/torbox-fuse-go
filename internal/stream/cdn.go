@@ -15,9 +15,114 @@ import (
 	"golang.org/x/sync/singleflight"
 )
 
-// hostSem holds a per-CDN-host concurrency semaphore.
+// hostSem holds a per-CDN-host priority-aware concurrency semaphore.
+// High-priority requests (playback) are served before low-priority ones (scan)
+// when both are waiting for a slot. This prevents connection starvation:
+// without priority, a library scan filling all slots causes playback to wait
+// behind the entire FIFO queue.
+//
+// Implementation: sync.Cond-based queue where waiters are sorted by priority.
+// When a slot is released, the highest-priority waiter is signaled.
 type hostSem struct {
-	sem chan struct{}
+	mu      sync.Mutex
+	cond    *sync.Cond
+	limit   int  // max concurrent holders
+	holding int  // current number of holders
+	waiters []*semWaiter
+}
+
+// semWaiter represents a goroutine waiting for a semaphore slot.
+type semWaiter struct {
+	priority uint8 // 0=low, 1=high (higher value = higher priority)
+	ready    bool  // set to true when this waiter has been granted a slot
+}
+
+// acquire blocks until a semaphore slot is available, respecting priority.
+// Higher-priority requests are served first when multiple goroutines are waiting.
+// Returns an error if ctx is cancelled while waiting.
+func (hs *hostSem) acquire(ctx context.Context, priority uint8) error {
+	hs.mu.Lock()
+
+	// Fast path: slot available, no waiters to jump ahead of.
+	if hs.holding < hs.limit && len(hs.waiters) == 0 {
+		hs.holding++
+		hs.mu.Unlock()
+		return nil
+	}
+
+	// Slow path: enqueue and wait.
+	w := &semWaiter{priority: priority}
+	// Insert in priority order (high priority at front).
+	insertPos := len(hs.waiters)
+	for i, existing := range hs.waiters {
+		if existing.priority < priority {
+			insertPos = i
+			break
+		}
+	}
+	if insertPos == len(hs.waiters) {
+		hs.waiters = append(hs.waiters, w)
+	} else {
+		hs.waiters = append(hs.waiters[:insertPos+1], hs.waiters[insertPos:]...)
+		hs.waiters[insertPos] = w
+	}
+
+	// Wait loop: Cond.Wait requires hs.mu to be locked on entry.
+	// It unlocks during wait and re-locks before returning.
+	done := ctx.Done()
+	for !w.ready {
+		if err := ctx.Err(); err != nil {
+			// Context cancelled — remove our waiter from the queue.
+			for i, existing := range hs.waiters {
+				if existing == w {
+					hs.waiters = append(hs.waiters[:i], hs.waiters[i+1:]...)
+					break
+				}
+			}
+			hs.mu.Unlock()
+			return err
+		}
+		hs.cond.Wait()
+		// After Wait returns, hs.mu is held again. Check if context is done
+		// before the next loop iteration checks w.ready.
+		select {
+		case <-done:
+			if w.ready {
+				// Granted just before cancellation — take the slot.
+				hs.mu.Unlock()
+				return nil
+			}
+			// Remove waiter and return error.
+			for i, existing := range hs.waiters {
+				if existing == w {
+					hs.waiters = append(hs.waiters[:i], hs.waiters[i+1:]...)
+					break
+				}
+			}
+			hs.mu.Unlock()
+			return ctx.Err()
+		default:
+		}
+	}
+	hs.mu.Unlock()
+	return nil
+}
+
+// release returns a semaphore slot and wakes the highest-priority waiter.
+func (hs *hostSem) release() {
+	hs.mu.Lock()
+	defer hs.mu.Unlock()
+
+	hs.holding--
+
+	if len(hs.waiters) > 0 {
+		// Grant slot to the highest-priority waiter (front of queue).
+		w := hs.waiters[0]
+		hs.waiters = hs.waiters[1:]
+		w.ready = true
+		hs.holding++
+		hs.cond.Broadcast() // wake all waiters so the granted one can proceed
+	}
 }
 
 // maxRedirects is the maximum number of HTTP redirects to follow.
@@ -104,7 +209,8 @@ func (c *CDNClient) getHostSem(host string) *hostSem {
 	if v, ok := c.hostSems.Load(host); ok {
 		return v.(*hostSem)
 	}
-	hs := &hostSem{sem: make(chan struct{}, c.maxConnsPerHost)}
+	hs := &hostSem{limit: c.maxConnsPerHost}
+	hs.cond = sync.NewCond(&hs.mu)
 	actual, _ := c.hostSems.LoadOrStore(host, hs)
 	return actual.(*hostSem)
 }
@@ -258,6 +364,10 @@ func (c *CDNClient) resolveRedirect(ctx context.Context, rawURL string) (string,
 // the request, and returns the HTTP response with the body still open for streaming.
 // The caller must close resp.Body when done reading.
 //
+// Priority controls the queue order when the per-host semaphore is full:
+//   - cache.PriorityHigh (1): playback requests jump ahead of queued scan requests
+//   - cache.PriorityLow (0): scan/metadata requests wait in FIFO order
+//
 // Concurrency is limited per CDN host: each host gets its own semaphore with
 // maxConnsPerHost slots. This means requests to different CDN servers (e.g.
 // nexus-040 vs nexus-128) don't compete for the same slots, maximizing
@@ -273,16 +383,20 @@ func (c *CDNClient) resolveRedirect(ctx context.Context, rawURL string) (string,
 //   - 206 Partial Content (expected)
 //   - 200 OK only when start == 0 (full response fallback)
 //   - 429, 5xx: returns HTTPStatusError (caller decides whether to retry)
-func (c *CDNClient) FetchRange(ctx context.Context, rawURL string, start, end int64) (*http.Response, error) {
+func (c *CDNClient) FetchRange(ctx context.Context, rawURL string, start, end int64, priority uint8) (*http.Response, error) {
 	// Resolve API URL to direct CDN URL first - we need the host for per-host
 	// rate limiting, and we need the resolved URL for the request anyway.
 	resolvedURL := c.ResolveURL(ctx, rawURL)
 
 	// Acquire per-host semaphore: limits concurrent requests to each CDN host.
+	// Priority-aware: high-priority requests (playback) jump ahead of
+	// low-priority ones (scan) in the wait queue.
 	host := hostFromURL(resolvedURL)
 	hs := c.getHostSem(host)
-	hs.sem <- struct{}{}
-	defer func() { <-hs.sem }()
+	if err := hs.acquire(ctx, priority); err != nil {
+		return nil, fmt.Errorf("semaphore: %w", err)
+	}
+	defer hs.release()
 
 	if c.metrics != nil {
 		c.metrics.CDNRequestCount.Add(1)

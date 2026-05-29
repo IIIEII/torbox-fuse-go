@@ -42,6 +42,7 @@ type stressConfig struct {
 	serverErrorsAfter  int           // return 5xx after this many requests (0 = never)
 	serverErrorStatus  int           // HTTP status for server errors (default: 500)
 	cdnLatency         time.Duration // artificial delay per CDN response (0 = none)
+	cdnChunkDelay      time.Duration // delay between chunks when sending response body (0 = send instantly)
 	redirectCDN         bool          // if true, API URL redirects to a CDN URL
 
 	// StreamReader configuration
@@ -191,7 +192,7 @@ func (env *stressTestEnv) serveCDN(w http.ResponseWriter, r *http.Request, fileD
 		return
 	}
 
-	// Apply latency.
+	// Apply pre-response latency (simulates network round-trip).
 	if env.cfg.cdnLatency > 0 {
 		time.Sleep(env.cfg.cdnLatency)
 	}
@@ -201,7 +202,7 @@ func (env *stressTestEnv) serveCDN(w http.ResponseWriter, r *http.Request, fileD
 	if rangeHdr == "" {
 		w.Header().Set("Content-Length", fmt.Sprintf("%d", len(data)))
 		w.WriteHeader(http.StatusOK)
-		w.Write(data)
+		writeChunked(w, data, env.cfg.cdnChunkDelay)
 		return
 	}
 	var start, end int64
@@ -220,7 +221,35 @@ func (env *stressTestEnv) serveCDN(w http.ResponseWriter, r *http.Request, fileD
 	w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
 	w.Header().Set("Content-Length", fmt.Sprintf("%d", end-start+1))
 	w.WriteHeader(http.StatusPartialContent)
-	w.Write(data[start : end+1])
+	writeChunked(w, data[start:end+1], env.cfg.cdnChunkDelay)
+}
+
+// writeChunked writes data to w in chunks with an optional delay between chunks.
+// This simulates realistic CDN transfer behavior where a 4 MiB window takes
+// hundreds of milliseconds to transfer over the network, holding the connection
+// semaphore slot for the entire duration — not just the initial latency.
+func writeChunked(w http.ResponseWriter, data []byte, chunkDelay time.Duration) {
+	if chunkDelay <= 0 {
+		w.Write(data)
+		return
+	}
+	// Write in 256 KiB chunks with delay between each.
+	// At 5ms/chunk, a 4 MiB window takes ~80ms to transfer,
+	// closely modeling real CDN behavior.
+	const chunkSize = 256 * 1024
+	for offset := 0; offset < len(data); offset += chunkSize {
+		end := offset + chunkSize
+		if end > len(data) {
+			end = len(data)
+		}
+		w.Write(data[offset:end])
+		if flusher, ok := w.(http.Flusher); ok {
+			flusher.Flush()
+		}
+		if end < len(data) {
+			time.Sleep(chunkDelay)
+		}
+	}
 }
 
 // makeStressFiles creates count files of the given size with deterministic data.
@@ -781,7 +810,119 @@ func TestStress_SeekCancellationDuringPlayback(t *testing.T) {
 }
 
 // ============================================================
-// Test 8: Concurrent playback of different files
+// Test 8: Priority semaphore — high-priority requests must not
+//         wait behind low-priority requests
+// ============================================================
+// This is a DIRECT unit test for the CDN connection semaphore.
+// It exposes the production bug: when a library scan hogs all
+// per-CDN-host connection slots, playback data arrives too slowly
+// because FetchRange treats all requests equally — there's no
+// priority queue.
+//
+// The test works by:
+// 1. Launching N "scan" goroutines that each acquire a semaphore
+//    slot and hold it for holdTime (simulating a slow CDN transfer).
+// 2. Once all scan goroutines are blocking on the semaphore, launching
+//    1 "playback" goroutine.
+// 3. Measuring how long the playback goroutine waits before getting
+//    a semaphore slot.
+//
+// WITHOUT priority: playback waits behind ALL queued scan requests.
+//   With concurrency=2, holdTime=100ms, and 10 scan requests queued:
+//   playback waits ~10 * (100ms / 2) = 500ms.
+//
+// WITH priority: playback jumps the queue and gets a slot as soon
+//   as one of the 2 active requests finishes (~50ms wait).
+
+func TestCDNClient_PrioritySemaphore(t *testing.T) {
+	const maxConns = 2
+	const holdTime = 100 * time.Millisecond
+	const scanCount = 10 // queued scan requests
+
+	// Server that holds the connection for holdTime, simulating a
+	// real CDN transfer that keeps the semaphore slot occupied.
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		time.Sleep(holdTime)
+		w.Header().Set("Content-Range", "bytes 0-0/*")
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write([]byte{0x00})
+	}))
+	defer ts.Close()
+
+	cdn := NewCDNClient(maxConns, nil, 0)
+	ctx := context.Background()
+
+	// Step 1: Launch scan requests that saturate the semaphore.
+	// We launch more than maxConns so some will queue up.
+	scanResults := make(chan error, scanCount)
+	var started sync.WaitGroup // signals when goroutines are about to call FetchRange
+	started.Add(scanCount)
+
+	for i := 0; i < scanCount; i++ {
+		go func() {
+			started.Done()
+			resp, err := cdn.FetchRange(ctx, ts.URL, 0, 0, cache.PriorityLow)
+			if err != nil {
+				scanResults <- err
+				return
+			}
+			resp.Body.Close()
+			scanResults <- nil
+		}()
+	}
+
+	// Wait for all scan goroutines to be launched. They'll race to
+	// acquire the 2 semaphore slots — 2 get slots, 8 queue up.
+	started.Wait()
+	// Give a tiny moment for the 2 active goroutines to enter the handler.
+	time.Sleep(5 * time.Millisecond)
+
+	// Step 2: Launch playback request. It must wait for a semaphore slot.
+	// Without priority: it joins the back of the FIFO queue behind 8 scan requests.
+	// With priority: it jumps to the front and gets the next available slot.
+	playbackStart := time.Now()
+	resp, err := cdn.FetchRange(ctx, ts.URL, 0, 0, 1) // PriorityHigh = 1 (playback)
+	if err != nil {
+		t.Fatalf("playback FetchRange error: %v", err)
+	}
+	resp.Body.Close()
+	playbackWait := time.Since(playbackStart)
+
+	// Drain scan results.
+	for i := 0; i < scanCount; i++ {
+		if err := <-scanResults; err != nil {
+			t.Errorf("scan FetchRange error: %v", err)
+		}
+	}
+
+	// Calculate expected wait times:
+	// Without priority (FIFO): playback is request #11 in queue.
+	//   With 2 slots and holdTime=100ms per request:
+	//   8 queued ahead / 2 slots = 4 rounds * 100ms = ~400ms minimum wait.
+	//   Plus the partial round from the 2 active requests = ~50-100ms.
+	//   Total: ~450-500ms.
+	//
+	// With priority: playback jumps the queue.
+	//   It gets the very next slot that opens (~50ms = half of holdTime,
+	//   since 2 slots are active and one could finish any moment).
+	//   Total: ~50-100ms.
+	//
+	// We use 250ms as the threshold:
+	// - With priority: < 250ms (one slot rotation + scheduling jitter)
+	// - Without priority: ~450ms (must wait for 8+ scan requests)
+
+	t.Logf("playback wait time: %v (threshold: 250ms)", playbackWait)
+
+	if playbackWait > 250*time.Millisecond {
+		t.Errorf("playback request waited %v — connection starvation detected! "+
+			"PriorityHigh requests should not wait behind PriorityLow scan requests. "+
+			"Expected < 250ms (priority queue), got FIFO-style delay.",
+			playbackWait)
+	}
+}
+
+// ============================================================
+// Test 9: Concurrent playback of different files
 // ============================================================
 // Multiple files played simultaneously (simulating multiple household
 // members or transcodes). Verifies: all complete, no data corruption.
