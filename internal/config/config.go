@@ -97,11 +97,12 @@ func Load() (*Config, error) {
 		AttrTimeoutSec:        envInt("FUSE_ATTR_TIMEOUT_SEC", 1),
 		EntryTimeoutSec:       envInt("FUSE_ENTRY_TIMEOUT_SEC", 1),
 		CDNURLCacheTTLSec:      envInt("FUSE_CDN_URL_CACHE_TTL_SEC", 300),
-			StreamMaxGlobalWindows: envInt("FUSE_STREAM_MAX_GLOBAL_WINDOWS", 16),
+		StreamMaxGlobalWindows: envInt("FUSE_STREAM_MAX_GLOBAL_WINDOWS", 16),
 		CatalogRefreshInterval: envDuration("CATALOG_REFRESH_INTERVAL", 3*time.Hour),
 		MetricsListenAddr:      env("METRICS_LISTEN_ADDR", "127.0.0.1:9080"),
 		StateDBPath:            env("STATE_DB_PATH", "/config/state.db"),
 		LogLevel:               env("LOG_LEVEL", "info"),
+		DashboardEnabled:       envBool("DASHBOARD_ENABLED", true),
 		UID:                   uint32(os.Getuid()),
 		GID:                   uint32(os.Getgid()),
 	}, nil
