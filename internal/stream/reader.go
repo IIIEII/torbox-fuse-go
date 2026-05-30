@@ -70,6 +70,14 @@ const (
 // PermalinkBuilder returns the CDN URL for a given fileKey.
 type PermalinkBuilder func(fileKey string) string
 
+// budgetLimiter is the interface for a priority-aware global inflight window limiter.
+// This interface allows tests to wrap the real implementation with tracking decorators.
+type budgetLimiter interface {
+	acquire(ctx context.Context, priority uint8) error
+	release()
+	holding() int32
+}
+
 // budgetSem is a priority-aware global inflight window limit.
 // High-priority requests (playback) are served before low-priority ones (scan)
 // when both are waiting for a budget slot. This prevents global budget starvation:
@@ -83,7 +91,7 @@ type budgetSem struct {
 	mu      sync.Mutex
 	cond    *sync.Cond
 	limit   int // max concurrent holders
-	holding int // current number of holders
+	held int // current number of holders
 	waiters []*budgetWaiter
 }
 
@@ -107,8 +115,8 @@ func (bs *budgetSem) acquire(ctx context.Context, priority uint8) error {
 	bs.mu.Lock()
 
 	// Fast path: slot available, no waiters to jump ahead of.
-	if bs.holding < bs.limit && len(bs.waiters) == 0 {
-		bs.holding++
+	if bs.held < bs.limit && len(bs.waiters) == 0 {
+		bs.held++
 		bs.mu.Unlock()
 		return nil
 	}
@@ -176,16 +184,23 @@ func (bs *budgetSem) release() {
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
 
-	bs.holding--
+	bs.held--
 
 	if len(bs.waiters) > 0 {
 		// Grant slot to the highest-priority waiter (front of queue).
 		w := bs.waiters[0]
 		bs.waiters = bs.waiters[1:]
 		w.ready = true
-		bs.holding++
+		bs.held++
 		bs.cond.Broadcast() // wake all waiters so the granted one can proceed
 	}
+}
+
+// holding returns the current number of budget slots held.
+func (bs *budgetSem) holding() int32 {
+	bs.mu.Lock()
+	defer bs.mu.Unlock()
+	return int32(bs.held)
 }
 
 // StreamReader manages inflight windows and delegates to the cache and CDN client.
@@ -199,7 +214,7 @@ type StreamReader struct {
 	sessions     sync.Map // fileKey -> *fileSession
 	windowSize   int64
 	maxInflight  int
-	budget       *budgetSem // priority-aware global inflight window limit
+	budget       budgetLimiter // priority-aware global inflight window limit
 	permalinkFor PermalinkBuilder
 	metrics      *metrics.Metrics
 }
@@ -418,6 +433,13 @@ func isSequential(sess *fileSession) bool {
 // window is less than len(p). The caller (ReadAt) handles spanning multiple
 // windows.
 func (sr *StreamReader) readWindow(ctx context.Context, fileKey string, off int64, p []byte, fileSize int64) (int, error) {
+	// Compute budget priority early — needed for both cache-hit read-ahead and
+	// window creation. Large reads (playback buffers) and active streaming files
+	// jump the queue ahead of tiny metadata probes.
+	ws := sr.windowStart(off)
+	sess := sr.getOrCreateSession(fileKey)
+	budgetPriority := sr.computeBudgetPriority(sess, int64(len(p)))
+
 	// Try cache first — zero-alloc hot path.
 	if n, ok := sr.cache.CopyTo(fileKey, off, p); ok {
 		slog.Debug("stream read cache hit", "fileKey", fileKey, "offset", off, "size", len(p), "n", n)
@@ -427,22 +449,11 @@ func (sr *StreamReader) readWindow(ctx context.Context, fileKey string, off int6
 		// Trigger read-ahead on cache hits too — sequential playback
 		// typically hits cached data, and skipping read-ahead here means
 		// the next window is never prefetched.
-		ws := sr.windowStart(off)
-		sess := sr.getOrCreateSession(fileKey)
-		sr.maybeReadAhead(fileKey, off+int64(n), ws, fileSize, sess)
+		sr.maybeReadAhead(fileKey, off+int64(n), ws, fileSize, sess, budgetPriority)
 		return n, nil
 	}
 
 	slog.Debug("stream read cache miss", "fileKey", fileKey, "offset", off, "size", len(p))
-
-	// Determine which window this read falls in.
-	ws := sr.windowStart(off)
-
-	// Compute budget priority before creating the window — it determines
-	// global budget acquisition order. Large reads (playback buffers) and
-	// active streaming files jump the queue ahead of tiny metadata probes.
-	sess := sr.getOrCreateSession(fileKey)
-	budgetPriority := sr.computeBudgetPriority(sess, int64(len(p)))
 
 	// Find or create an inflight window.
 	win, created := sr.getOrCreateWindow(fileKey, ws, fileSize, budgetPriority)
@@ -470,7 +481,7 @@ func (sr *StreamReader) readWindow(ctx context.Context, fileKey string, off int6
 	}
 
 	// Trigger read-ahead if conditions are met.
-	sr.maybeReadAhead(fileKey, off+int64(n), ws, fileSize, sess)
+	sr.maybeReadAhead(fileKey, off+int64(n), ws, fileSize, sess, budgetPriority)
 
 	return n, nil
 }
@@ -798,7 +809,7 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 			win.readyCond.L.Lock()
 			win.done.Store(true)
 			win.readyCond.L.Unlock()
-			sr.maybeReadAhead(fileKey, winStart+sr.windowSize, winStart, win.fileSize, sess)
+			sr.maybeReadAhead(fileKey, winStart+sr.windowSize, winStart, win.fileSize, sess, budgetPriority)
 			go sr.cleanupWindow(win)
 			return
 		}
@@ -864,7 +875,7 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 			win.readyCond.L.Unlock()
 
 			sess := sr.getOrCreateSession(fileKey)
-			sr.maybeReadAhead(fileKey, winStart+sr.windowSize, winStart, win.fileSize, sess)
+			sr.maybeReadAhead(fileKey, winStart+sr.windowSize, winStart, win.fileSize, sess, budgetPriority)
 			go sr.cleanupWindow(win)
 			return
 		}
@@ -989,7 +1000,7 @@ func isRetryable(err error) bool {
 //   - The next window is not cached and not already inflight
 //   - Per-file inflight count < maxInflight
 //   - No recent far seek for this file
-func (sr *StreamReader) maybeReadAhead(fileKey string, endOff, winStart, fileSize int64, sess *fileSession) {
+func (sr *StreamReader) maybeReadAhead(fileKey string, endOff, winStart, fileSize int64, sess *fileSession, budgetPriority uint8) {
 	nextStart := winStart + sr.windowSize
 
 	// Don't prefetch beyond EOF — there's nothing to fetch.
@@ -1042,10 +1053,8 @@ func (sr *StreamReader) maybeReadAhead(fileKey string, endOff, winStart, fileSiz
 		return
 	}
 
-	// Create read-ahead window. Read-ahead inherits the same priority
-	// as the triggering file — sequential playback data should not wait
-	// behind scan windows in the global budget.
-	// Read-ahead always uses high budget priority — it's triggered by sequential
-	// playback, so it should not queue behind scan windows.
-	_, _ = sr.getOrCreateWindow(fileKey, nextStart, fileSize, uint8(cache.PriorityHigh))
+	// Create read-ahead window. Read-ahead inherits the same budget priority
+	// as the triggering read — sequential playback data should not wait behind
+	// scan windows in the global budget.
+	_, _ = sr.getOrCreateWindow(fileKey, nextStart, fileSize, budgetPriority)
 }
