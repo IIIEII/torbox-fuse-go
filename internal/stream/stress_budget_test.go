@@ -381,3 +381,7 @@ func (pt *priorityTrackingBudget) release() {
 	pt.inner.release()
 }
 
+func (pt *priorityTrackingBudget) budgetLimit() int {
+	return pt.inner.budgetLimit()
+}
+

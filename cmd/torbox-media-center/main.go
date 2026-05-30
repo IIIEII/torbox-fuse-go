@@ -15,6 +15,7 @@ import (
 	"github.com/iiieii/torbox-fuse-go/internal/cache"
 	"github.com/iiieii/torbox-fuse-go/internal/catalog"
 	"github.com/iiieii/torbox-fuse-go/internal/config"
+	"github.com/iiieii/torbox-fuse-go/internal/dashboard"
 	"github.com/iiieii/torbox-fuse-go/internal/fusefs"
 	"github.com/iiieii/torbox-fuse-go/internal/metrics"
 	"github.com/iiieii/torbox-fuse-go/internal/state"
@@ -94,6 +95,14 @@ func main() {
 
 	// Set up metrics server with refresh handler.
 	metricsServer := metrics.NewServer(m, cfg.MetricsListenAddr, cat.Refresh)
+
+	// Create and register dashboard for live cache visualization.
+	if cfg.DashboardEnabled {
+		dash := dashboard.New(streamer, rc, stateDB, m)
+		dashServer := dashboard.NewServer(dash)
+		dashServer.RegisterRoutes(metricsServer.Mux())
+		slog.Info("dashboard registered", "addr", cfg.MetricsListenAddr)
+	}
 
 	// Start metrics HTTP server.
 	if err := metricsServer.Start(); err != nil {

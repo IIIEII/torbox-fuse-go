@@ -6,6 +6,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"sync/atomic"
 	"syscall"
 
 	"github.com/hanwen/go-fuse/v2/fs"
@@ -260,6 +261,10 @@ func (d *DirNode) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.E
 // FileNode
 // ---------------------------------------------------------------------------
 
+// nextReaderID is a monotonically increasing counter for unique FUSE handle IDs.
+// Each Open call gets a unique readerID for dashboard read-position tracking.
+var nextReaderID atomic.Uint64
+
 // FileNode represents a read-only regular file backed by the TorBox CDN via
 // the stream.StreamReader. Reads are served directly into the FUSE buffer
 // for zero-alloc cache hits.
@@ -271,6 +276,7 @@ type FileNode struct {
 	size         uint64
 	streamer     *stream.StreamReader
 	cfg          *config.Config
+	readerID     uint64 // unique per FUSE handle, assigned in Open
 }
 
 // Getattr returns file attributes.
@@ -285,13 +291,15 @@ func (f *FileNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.Attr
 	return 0
 }
 
-// Open rejects non-readonly opens.
+// Open rejects non-readonly opens and assigns a unique reader ID for
+// dashboard read-position tracking.
 func (f *FileNode) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
 	slog.Debug("fuse open", "fileKey", f.fileKey, "flags", flags)
 	if flags&syscall.O_ACCMODE != syscall.O_RDONLY {
 		slog.Warn("fuse open rejected: not read-only", "fileKey", f.fileKey, "flags", flags)
 		return nil, 0, syscall.EACCES
 	}
+	f.readerID = nextReaderID.Add(1)
 	return nil, fuse.FOPEN_KEEP_CACHE, 0
 }
 
@@ -303,6 +311,10 @@ func (f *FileNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off 
 	if err != nil && err != io.EOF {
 		slog.Warn("fuse read error", "fileKey", f.fileKey, "offset", off, "reqSize", len(dest), "err", err)
 		return nil, syscall.EIO
+	}
+	// Track read position for dashboard visualization.
+	if f.readerID > 0 {
+		f.streamer.TrackReader(f.fileKey, f.readerID, off+int64(n))
 	}
 	slog.Debug("fuse read", "fileKey", f.fileKey, "offset", off, "reqSize", len(dest), "n", n, "eof", err == io.EOF)
 	return fuse.ReadResultData(dest[:n]), 0
@@ -334,6 +346,7 @@ func (f *FileNode) Fsync(ctx context.Context, fh fs.FileHandle, flags uint32) sy
 // long after Plex has closed the file — wasting bandwidth for minutes or hours.
 func (f *FileNode) Release(ctx context.Context, fh fs.FileHandle) syscall.Errno {
 	slog.Debug("fuse release, cancelling inflight windows", "fileKey", f.fileKey)
+	f.streamer.UntrackReader(f.fileKey, f.readerID)
 	f.streamer.CancelFile(f.fileKey)
 	return 0
 }

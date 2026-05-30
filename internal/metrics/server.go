@@ -37,6 +37,12 @@ func NewServer(m *Metrics, listenAddr string, refreshFn func(ctx context.Context
 	return s
 }
 
+// Mux returns the ServeMux so that callers can register additional routes
+// (e.g. dashboard endpoints) before the server starts.
+func (s *Server) Mux() *http.ServeMux {
+	return s.mux
+}
+
 // NewHandler returns an http.Handler with the metrics, healthz, and refresh
 // endpoints. This is useful for testing with httptest.NewServer.
 func NewHandler(m *Metrics, refreshFn func(ctx context.Context) error) http.Handler {

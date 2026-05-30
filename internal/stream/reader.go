@@ -76,6 +76,7 @@ type budgetLimiter interface {
 	acquire(ctx context.Context, priority uint8) error
 	release()
 	holding() int32
+	budgetLimit() int
 }
 
 // budgetSem is a priority-aware global inflight window limit.
@@ -203,6 +204,11 @@ func (bs *budgetSem) holding() int32 {
 	return int32(bs.held)
 }
 
+// budgetLimit returns the maximum number of budget slots.
+func (bs *budgetSem) budgetLimit() int {
+	return bs.limit
+}
+
 // StreamReader manages inflight windows and delegates to the cache and CDN client.
 // It supports early return (readers return as soon as their requested bytes are
 // ready, not when the full window completes), read-ahead of the next window,
@@ -214,9 +220,11 @@ type StreamReader struct {
 	sessions     sync.Map // fileKey -> *fileSession
 	windowSize   int64
 	maxInflight  int
-	budget       budgetLimiter // priority-aware global inflight window limit
-	permalinkFor PermalinkBuilder
-	metrics      *metrics.Metrics
+	budget          budgetLimiter // priority-aware global inflight window limit
+	permalinkFor    PermalinkBuilder
+	metrics         *metrics.Metrics
+	readers         sync.Map // fileKey -> *readersMap (active FUSE handle positions)
+	recentlyClosed  sync.Map // fileKey -> *closedEntry (recently closed files for dashboard)
 }
 
 // inflightKey identifies an inflight window by file key and window start offset.
@@ -255,12 +263,25 @@ type fileSession struct {
 	lastReadTime      atomic.Int64  // unix nano timestamp of last ReadAt call
 }
 
+// readersMap tracks per-file read positions from active FUSE handles.
+type readersMap struct {
+	mu  sync.Mutex
+	pos map[uint64]int64 // readerID -> last read offset
+}
+
+// closedEntry tracks a recently closed file for dashboard visualization.
+type closedEntry struct {
+	fileKey  string
+	fileSize int64
+	closedAt time.Time
+}
+
 // NewStreamReader creates a StreamReader with the given dependencies.
 // windowSize controls the size of each CDN fetch window (e.g. 16 MiB).
 // maxGlobalWindows limits the total number of inflight windows across all files,
 // capping inflight buffer memory at maxGlobalWindows x windowSize.
 func NewStreamReader(rc *cache.RangeCache, cdn *CDNClient, maxInflight, maxGlobalWindows int, windowSize int64, permalinkFor PermalinkBuilder, m *metrics.Metrics) *StreamReader {
-	return &StreamReader{
+	sr := &StreamReader{
 		cache:        rc,
 		cdn:          cdn,
 		windowSize:   windowSize,
@@ -269,6 +290,8 @@ func NewStreamReader(rc *cache.RangeCache, cdn *CDNClient, maxInflight, maxGloba
 		permalinkFor: permalinkFor,
 		metrics:      m,
 	}
+	sr.startCleanup()
+	return sr
 }
 
 // ReadAt reads len(p) bytes from offset off for the given fileKey.
@@ -978,25 +1001,41 @@ func (sr *StreamReader) cleanupWindowOnError(win *inflightWindow) {
 // fetchWindow goroutine to detect context cancellation and exit. The goroutine
 // will release its budget slot via defer and clean up the window.
 func (sr *StreamReader) CancelFile(fileKey string) {
+	// Record the file in recentlyClosed for dashboard visualization before
+	// we lose the session data. Capture file size from any inflight window.
+	var fileSize int64
 	sr.inflight.Range(func(key, value any) bool {
 		ik := key.(inflightKey)
-		if ik.fileKey != fileKey {
-			return true
+		if ik.fileKey == fileKey {
+			win := value.(*inflightWindow)
+			win.cancelFunc()
+			// Mark as done so that any late joiners in waitForBytes return
+			// immediately, and so maybeReadAhead doesn't chain off this window.
+			win.readyCond.L.Lock()
+			win.done.Store(true)
+			win.readyCond.Broadcast()
+			win.readyCond.L.Unlock()
+			if win.fileSize > fileSize {
+				fileSize = win.fileSize
+			}
 		}
-		win := value.(*inflightWindow)
-		win.cancelFunc()
-		// Mark as done so that any late joiners in waitForBytes return
-		// immediately, and so maybeReadAhead doesn't chain off this window.
-		win.readyCond.L.Lock()
-		win.done.Store(true)
-		win.readyCond.Broadcast()
-		win.readyCond.L.Unlock()
 		return true
 	})
+
+	// If we had any activity on this file, record it in recentlyClosed.
+	if fileSize > 0 {
+		sr.recentlyClosed.Store(fileKey, &closedEntry{
+			fileKey:  fileKey,
+			fileSize: fileSize,
+			closedAt: time.Now(),
+		})
+	}
+
 	// Remove the file session so future reads start fresh if the file is
 	// reopened. The inflight windows will be cleaned up by their goroutines
 	// after detecting the cancellation.
 	sr.sessions.Delete(fileKey)
+	sr.readers.Delete(fileKey)
 }
 
 // maybeCleanupSession removes the file session if no inflight windows remain.
@@ -1030,6 +1069,209 @@ func isRetryable(err error) bool {
 	}
 	// Unknown errors (network failures, DNS, etc.) are retryable.
 	return true
+}
+
+// FileSnapshot holds a point-in-time view of a file's streaming state for
+// dashboard visualization. It contains no data — only offset, size, and
+// priority metadata.
+type FileSnapshot struct {
+	FileKey      string
+	FileSize     int64
+	CachedBlocks []cache.BlockInfo
+	Inflight     []InflightInfo
+	ReadOffsets  []int64 // positions of active FUSE readers
+	Pattern      string  // "sequential", "random", or "idle"
+	Priority     uint8   // PriorityLow or PriorityHigh
+}
+
+// InflightInfo holds metadata about an in-progress CDN fetch window.
+type InflightInfo struct {
+	Start   int64
+	ReadyTo int64 // how far the download has progressed within the window
+	Done    bool
+}
+
+// SnapshotFiles returns current state of all files that have activity
+// (inflight windows, active sessions, or cached data). It iterates sync.Maps
+// (lock-free snapshots) and reads atomics — no locks are held on the hot path.
+func (sr *StreamReader) SnapshotFiles() []FileSnapshot {
+	// Collect file keys from all sources: inflight, sessions, cache, and readers.
+	fileKeys := make(map[string]struct{})
+
+	sr.inflight.Range(func(key, value any) bool {
+		ik := key.(inflightKey)
+		fileKeys[ik.fileKey] = struct{}{}
+		return true
+	})
+
+	sr.sessions.Range(func(key, value any) bool {
+		fk := key.(string)
+		fileKeys[fk] = struct{}{}
+		return true
+	})
+
+	for _, fk := range sr.cache.AllFileKeys() {
+		fileKeys[fk] = struct{}{}
+	}
+
+	// Also include files that have active readers but no inflight/session/cache yet.
+	sr.readers.Range(func(key, value any) bool {
+		fk := key.(string)
+		fileKeys[fk] = struct{}{}
+		return true
+	})
+
+	snapshots := make([]FileSnapshot, 0, len(fileKeys))
+	for fk := range fileKeys {
+		snap := sr.snapshotFile(fk)
+		snapshots = append(snapshots, snap)
+	}
+	return snapshots
+}
+
+// snapshotFile collects the full state for a single file.
+func (sr *StreamReader) snapshotFile(fileKey string) FileSnapshot {
+	snap := FileSnapshot{
+		FileKey:      fileKey,
+		CachedBlocks: sr.cache.FileBlocks(fileKey),
+	}
+
+	// Collect inflight windows.
+	sr.inflight.Range(func(key, value any) bool {
+		ik := key.(inflightKey)
+		if ik.fileKey != fileKey {
+			return true
+		}
+		win := value.(*inflightWindow)
+		snap.Inflight = append(snap.Inflight, InflightInfo{
+			Start:   ik.start,
+			ReadyTo: win.readyTo.Load(),
+			Done:    win.done.Load(),
+		})
+		snap.FileSize = win.fileSize // may be 0 for windows created before fileSize was set
+		return true
+	})
+
+	// Read session state (access pattern, priority).
+	if v, ok := sr.sessions.Load(fileKey); ok {
+		sess := v.(*fileSession)
+		if isSequential(sess) {
+			snap.Pattern = "sequential"
+		} else if sess.randomReads.Load() > 0 {
+			snap.Pattern = "random"
+		}
+		snap.Priority = sr.computeCachePriority(sess)
+	} else {
+		snap.Pattern = "idle"
+	}
+
+	// Collect read positions from tracked readers.
+	if v, ok := sr.readers.Load(fileKey); ok {
+		rm := v.(*readersMap)
+		rm.mu.Lock()
+		for _, off := range rm.pos {
+			snap.ReadOffsets = append(snap.ReadOffsets, off)
+		}
+		rm.mu.Unlock()
+	}
+
+	// Infer file size from cached blocks if not set by inflight.
+	if snap.FileSize == 0 && len(snap.CachedBlocks) > 0 {
+		for _, b := range snap.CachedBlocks {
+			if b.End > snap.FileSize {
+				snap.FileSize = b.End
+			}
+		}
+	}
+
+	return snap
+}
+
+// TrackReader records an active FUSE reader position for the given file.
+// Called from FileNode.Read to track where each open file handle is reading.
+func (sr *StreamReader) TrackReader(fileKey string, readerID uint64, off int64) {
+	v, _ := sr.readers.LoadOrStore(fileKey, &readersMap{pos: make(map[uint64]int64)})
+	rm := v.(*readersMap)
+	rm.mu.Lock()
+	rm.pos[readerID] = off
+	rm.mu.Unlock()
+}
+
+// UntrackReader removes a FUSE reader position. Called from FileNode.Release.
+func (sr *StreamReader) UntrackReader(fileKey string, readerID uint64) {
+	if v, ok := sr.readers.Load(fileKey); ok {
+		rm := v.(*readersMap)
+		rm.mu.Lock()
+		delete(rm.pos, readerID)
+		empty := len(rm.pos) == 0
+		rm.mu.Unlock()
+		if empty {
+			sr.readers.Delete(fileKey)
+		}
+	}
+}
+
+// RecentlyClosedFiles returns metadata for files that were recently closed
+// (had CancelFile called) within the retention period.
+func (sr *StreamReader) RecentlyClosedFiles() []ClosedFileInfo {
+	var result []ClosedFileInfo
+	sr.recentlyClosed.Range(func(key, value any) bool {
+		entry := value.(*closedEntry)
+		result = append(result, ClosedFileInfo{
+			FileKey:  entry.fileKey,
+			FileSize: entry.fileSize,
+			ClosedAt: entry.closedAt,
+		})
+		return true
+	})
+	return result
+}
+
+// BudgetLimit returns the configured maximum number of concurrent inflight windows
+// (the global budget). Used by the dashboard to display slot usage.
+func (sr *StreamReader) BudgetLimit() int {
+	return sr.budget.budgetLimit()
+}
+
+// BudgetHolding returns the current number of inflight windows holding budget slots.
+// Used by the dashboard to display slot usage.
+func (sr *StreamReader) BudgetHolding() int32 {
+	return sr.budget.holding()
+}
+
+// cleanupRecentlyClosed removes entries older than the retention period.
+// Called periodically by the background cleanup goroutine.
+func (sr *StreamReader) cleanupRecentlyClosed() {
+	cutoff := time.Now().Add(-recentlyClosedTTL)
+	sr.recentlyClosed.Range(func(key, value any) bool {
+		entry := value.(*closedEntry)
+		if entry.closedAt.Before(cutoff) {
+			sr.recentlyClosed.Delete(key)
+		}
+		return true
+	})
+}
+
+// ClosedFileInfo is the exported version of closedEntry for dashboard snapshots.
+type ClosedFileInfo struct {
+	FileKey  string
+	FileSize int64
+	ClosedAt time.Time
+}
+
+// recentlyClosedTTL is how long closed file entries remain visible in the dashboard.
+const recentlyClosedTTL = 1 * time.Hour
+
+// startCleanup launches the background goroutine that periodically removes
+// stale entries from the recently-closed registry.
+func (sr *StreamReader) startCleanup() {
+	go func() {
+		ticker := time.NewTicker(5 * time.Minute)
+		defer ticker.Stop()
+		for range ticker.C {
+			sr.cleanupRecentlyClosed()
+		}
+	}()
 }
 
 // maybeReadAhead triggers a prefetch of the next window if conditions are met:

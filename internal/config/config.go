@@ -23,6 +23,7 @@ type Config struct {
 	MetricsListenAddr      string
 	StateDBPath            string
 	LogLevel               string
+	DashboardEnabled       bool
 	UID                   uint32
 	GID                   uint32
 }
@@ -47,6 +48,15 @@ func envDuration(key string, def time.Duration) time.Duration {
 	if v := os.Getenv(key); v != "" {
 		if d, err := time.ParseDuration(v); err == nil {
 			return d
+		}
+	}
+	return def
+}
+
+func envBool(key string, def bool) bool {
+	if v := os.Getenv(key); v != "" {
+		if b, err := strconv.ParseBool(v); err == nil {
+			return b
 		}
 	}
 	return def

@@ -44,6 +44,14 @@ const (
 	PriorityHigh = 1 // sequential playback data
 )
 
+// BlockInfo holds metadata about a cached byte range for dashboard visualization.
+// It contains no data — only offset, size, and priority.
+type BlockInfo struct {
+	Start    int64
+	End      int64
+	Priority uint8 // PriorityLow or PriorityHigh
+}
+
 // RangeBlock holds a contiguous byte range for a file.
 type RangeBlock struct {
 	start      int64
@@ -298,6 +306,51 @@ func (rc *RangeCache) evictOne() {
 // Used returns the current total bytes stored in the cache.
 func (rc *RangeCache) Used() int64 {
 	return rc.used.Load()
+}
+
+// FileBlocks returns cached block metadata for a single file.
+// Uses RLock per shard — minimal contention with hot-path reads.
+func (rc *RangeCache) FileBlocks(fileKey string) []BlockInfo {
+	var blocks []BlockInfo
+	for i := range rc.shards {
+		sh := &rc.shards[i]
+		sh.mu.RLock()
+		for key, blk := range sh.blocks {
+			if key.fileKey == fileKey {
+				blocks = append(blocks, BlockInfo{
+					Start:    blk.start,
+					End:      blk.end,
+					Priority: blk.priority,
+				})
+			}
+		}
+		sh.mu.RUnlock()
+	}
+	return blocks
+}
+
+// AllFileKeys returns deduplicated file keys across all shards.
+// Uses RLock per shard.
+func (rc *RangeCache) AllFileKeys() []string {
+	seen := make(map[string]struct{})
+	for i := range rc.shards {
+		sh := &rc.shards[i]
+		sh.mu.RLock()
+		for key := range sh.blocks {
+			seen[key.fileKey] = struct{}{}
+		}
+		sh.mu.RUnlock()
+	}
+	keys := make([]string, 0, len(seen))
+	for k := range seen {
+		keys = append(keys, k)
+	}
+	return keys
+}
+
+// Budget returns the configured byte budget for the cache.
+func (rc *RangeCache) Budget() int64 {
+	return rc.budget
 }
 
 // cacheEpoch is the monotonic time reference for LRU comparisons.

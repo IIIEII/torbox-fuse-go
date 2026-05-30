@@ -1,0 +1,1 @@
+When context usage exceeds 70%, proactively run /compact.
