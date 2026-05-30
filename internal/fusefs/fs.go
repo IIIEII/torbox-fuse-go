@@ -328,6 +328,16 @@ func (f *FileNode) Fsync(ctx context.Context, fh fs.FileHandle, flags uint32) sy
 	return 0
 }
 
+// Release is called by the FUSE kernel when the last file handle is closed.
+// This is the correct place to cancel any remaining read-ahead goroutines for
+// this file. Without this, the readAhead pipeline continues downloading data
+// long after Plex has closed the file — wasting bandwidth for minutes or hours.
+func (f *FileNode) Release(ctx context.Context, fh fs.FileHandle) syscall.Errno {
+	slog.Debug("fuse release, cancelling inflight windows", "fileKey", f.fileKey)
+	f.streamer.CancelFile(f.fileKey)
+	return 0
+}
+
 // Getxattr returns ENOATTR for all xattr queries. This silences the macOS
 // "Unimplemented opcode OPCODE-60" spam for com.apple.FinderInfo etc.
 func (f *FileNode) Getxattr(ctx context.Context, attr string, dest []byte) (uint32, syscall.Errno) {
@@ -369,6 +379,7 @@ var (
 	_ fs.NodeWriter         = (*FileNode)(nil)
 	_ fs.NodeAllocater      = (*FileNode)(nil)
 	_ fs.NodeFsyncer        = (*FileNode)(nil)
+	_ fs.NodeReleaser       = (*FileNode)(nil)
 	_ fs.NodeGetxattrer     = (*FileNode)(nil)
 	_ fs.NodeListxattrer    = (*FileNode)(nil)
 )

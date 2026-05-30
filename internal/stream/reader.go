@@ -853,7 +853,8 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 		}
 
 		// Stream CDN response body into win.buf starting after the cached prefix.
-		fetched, success := sr.streamInto(resp, cachedLen, win, fileKey, winStart)
+		// ctx is checked in streamInto to abort early when CancelFile cancels inflight windows.
+		fetched, success := sr.streamInto(ctx, resp, cachedLen, win, fileKey, winStart)
 		resp.Body.Close()
 
 		win.readyCond.L.Lock()
@@ -904,10 +905,11 @@ func (sr *StreamReader) fetchWindow(ctx context.Context, fileKey string, winStar
 
 // streamInto reads the CDN response body into win.buf, appending chunks starting
 // at the given buffer offset (bufOff). It updates readyTo as data arrives and
-// broadcasts to wake waiting readers. After each chunk, it checks whether all
-// waiters have left (waiters == 0) and if so, cancels the remaining fetch to
-// avoid downloading data that nobody needs. Returns (bytesRead, success).
-func (sr *StreamReader) streamInto(resp *http.Response, bufOff int64, win *inflightWindow, fileKey string, winStart int64) (int64, bool) {
+// broadcasts to wake waiting readers. It checks ctx for cancellation after each
+// chunk so that CancelFile (triggered by FUSE Release) stops the download promptly,
+// avoiding wasted bandwidth on files nobody is reading anymore.
+// Returns (bytesRead, success).
+func (sr *StreamReader) streamInto(ctx context.Context, resp *http.Response, bufOff int64, win *inflightWindow, fileKey string, winStart int64) (int64, bool) {
 	chunk := make([]byte, readChunkSize)
 	var totalRead int64
 	for {
@@ -928,7 +930,15 @@ func (sr *StreamReader) streamInto(resp *http.Response, bufOff int64, win *infli
 			slog.Warn("stream read error", "fileKey", fileKey, "start", winStart, "err", readErr)
 			return totalRead, false
 		}
-
+		// Check if the context was cancelled (e.g. by CancelFile when the
+		// FUSE file handle is released). This stops the readAhead pipeline
+		// from downloading data that no reader will ever consume.
+		select {
+		case <-ctx.Done():
+			slog.Debug("stream readahead cancelled: context done", "fileKey", fileKey, "start", winStart, "bytesRead", totalRead)
+			return totalRead, true
+		default:
+		}
 	}
 }
 
@@ -958,6 +968,35 @@ func (sr *StreamReader) cleanupWindowOnError(win *inflightWindow) {
 		}
 	}
 	sr.maybeCleanupSession(win.key.fileKey)
+}
+
+// CancelFile cancels all inflight windows for the given fileKey and removes
+// the file session. This is called when a FUSE file handle is released (closed)
+// to stop downloading data that no reader needs anymore.
+//
+// It cancels inflight windows by calling their cancelFunc, which causes the
+// fetchWindow goroutine to detect context cancellation and exit. The goroutine
+// will release its budget slot via defer and clean up the window.
+func (sr *StreamReader) CancelFile(fileKey string) {
+	sr.inflight.Range(func(key, value any) bool {
+		ik := key.(inflightKey)
+		if ik.fileKey != fileKey {
+			return true
+		}
+		win := value.(*inflightWindow)
+		win.cancelFunc()
+		// Mark as done so that any late joiners in waitForBytes return
+		// immediately, and so maybeReadAhead doesn't chain off this window.
+		win.readyCond.L.Lock()
+		win.done.Store(true)
+		win.readyCond.Broadcast()
+		win.readyCond.L.Unlock()
+		return true
+	})
+	// Remove the file session so future reads start fresh if the file is
+	// reopened. The inflight windows will be cleaned up by their goroutines
+	// after detecting the cancellation.
+	sr.sessions.Delete(fileKey)
 }
 
 // maybeCleanupSession removes the file session if no inflight windows remain.

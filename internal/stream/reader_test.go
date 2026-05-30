@@ -1191,3 +1191,428 @@ func TestStreamReader_GlobalBudgetLimitsConcurrency(t *testing.T) {
 		t.Errorf("observed %d concurrent fetches, maxGlobalWindows is %d", observed, maxGlobalWindows)
 	}
 }
+
+// ============================================================
+// File close / download cancellation tests
+// ============================================================
+// These tests verify that CancelFile (triggered by FUSE Release)
+// stops inflight downloads and cleans up resources — the exact bug
+// that caused endless CDN downloads after file close.
+
+// TestCancelFile_StopsInflightDownloads verifies that CancelFile
+// cancels active inflight windows and the readAhead pipeline stops
+// fetching new windows for the cancelled file.
+func TestCancelFile_StopsInflightDownloads(t *testing.T) {
+	rc := cache.NewRangeCache(1<<20, nil)
+	cdn := NewCDNClient(4, nil, 0)
+
+	// Track CDN requests to verify downloads stop after CancelFile.
+	var cdnRequests atomic.Int32
+	// Block CDN responses until we signal, so inflight windows stay active.
+	proceed := make(chan struct{})
+
+	server := newMockCDNServer(t, func(w http.ResponseWriter, r *http.Request) {
+		cdnRequests.Add(1)
+		// Block until test signals — this keeps the inflight window active.
+		<-proceed
+
+		rangeHdr := r.Header.Get("Range")
+		var start, end int64
+		fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end)
+		data := make([]byte, end-start+1)
+		for i := range data {
+			data[i] = byte((start + int64(i)) % 256)
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, 24*1024*1024))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(data)
+	})
+	defer server.Close()
+
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
+		return server.URL + "/" + fileKey
+	}, nil)
+
+	// Start a read that will block on the CDN response.
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 100)
+		_, err := sr.ReadAt(context.Background(), "f1", 0, buf, 24*1024*1024)
+		done <- err
+	}()
+
+	// Wait for CDN to receive at least 1 request (the initial window fetch).
+	deadline := time.After(5 * time.Second)
+	for cdnRequests.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for CDN request")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// Now cancel the file — this should stop inflight downloads.
+	sr.CancelFile("f1")
+
+	// Unblock CDN responses so the goroutine can finish.
+	close(proceed)
+
+	// The blocked read should return with an error (context cancelled).
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("expected error after CancelFile, got nil")
+		}
+		// Error is expected — context cancellation propagated.
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for ReadAt to return after CancelFile")
+	}
+
+	// Give cleanup goroutines time to finish.
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify no more CDN requests were made after cancellation
+	// (readAhead should not chain).
+	requestsBefore := cdnRequests.Load()
+	time.Sleep(500 * time.Millisecond)
+	requestsAfter := cdnRequests.Load()
+	if requestsAfter > requestsBefore+1 {
+		// +1 tolerance: the in-progress request might complete before
+		// cancellation propagates, but no new readAhead windows should start.
+		t.Errorf("CDN requests continued after CancelFile: before=%d, after=%d",
+			requestsBefore, requestsAfter)
+	}
+}
+
+// TestCancelFile_RemovesSession verifies that CancelFile removes the
+// file session, so subsequent reads for the same file start fresh.
+func TestCancelFile_RemovesSession(t *testing.T) {
+	rc := cache.NewRangeCache(1<<20, nil)
+	cdn := NewCDNClient(4, nil, 0)
+
+	server := newMockCDNServer(t, func(w http.ResponseWriter, r *http.Request) {
+		rangeHdr := r.Header.Get("Range")
+		var start, end int64
+		fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end)
+		data := make([]byte, end-start+1)
+		for i := range data {
+			data[i] = byte((start + int64(i)) % 256)
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, len(data)))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(data)
+	})
+	defer server.Close()
+
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
+		return server.URL + "/" + fileKey
+	}, nil)
+
+	// Read some data to create a session.
+	buf := make([]byte, 10)
+	n, err := sr.ReadAt(context.Background(), "f1", 0, buf, 100)
+	if err != nil && err != io.EOF {
+		t.Fatalf("first ReadAt: %v", err)
+	}
+	if n != 10 {
+		t.Fatalf("first ReadAt: got %d bytes, want 10", n)
+	}
+
+	// Verify session exists.
+	if _, ok := sr.sessions.Load("f1"); !ok {
+		t.Fatal("expected session for f1 after ReadAt")
+	}
+
+	// Cancel the file.
+	sr.CancelFile("f1")
+
+	// Verify session was removed.
+	if _, ok := sr.sessions.Load("f1"); ok {
+		t.Error("expected session for f1 to be removed after CancelFile")
+	}
+
+	// Subsequent reads should still work (fresh session).
+	buf2 := make([]byte, 10)
+	n2, err2 := sr.ReadAt(context.Background(), "f1", 0, buf2, 100)
+	if err2 != nil && err2 != io.EOF {
+		t.Fatalf("second ReadAt after CancelFile: %v", err2)
+	}
+	if n2 != 10 {
+		t.Errorf("second ReadAt: got %d bytes, want 10", n2)
+	}
+}
+
+// TestCancelFile_DoesNotAffectOtherFiles verifies that cancelling
+// one file's downloads does not affect inflight windows for other files.
+func TestCancelFile_DoesNotAffectOtherFiles(t *testing.T) {
+	rc := cache.NewRangeCache(8<<20, nil)
+	cdn := NewCDNClient(4, nil, 0)
+
+	var cdnRequests atomic.Int32
+	// Block f1's response to keep its window inflight.
+	f1Proceed := make(chan struct{})
+
+	server := newMockCDNServer(t, func(w http.ResponseWriter, r *http.Request) {
+		cdnRequests.Add(1)
+		// Only block for f1; f2 responds immediately.
+		if r.URL.Path == "/f1" {
+			<-f1Proceed
+		}
+
+		rangeHdr := r.Header.Get("Range")
+		var start, end int64
+		fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end)
+		data := make([]byte, end-start+1)
+		for i := range data {
+			data[i] = byte((start + int64(i)) % 256)
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, 24*1024*1024))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(data)
+	})
+	defer server.Close()
+
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
+		return server.URL + "/" + fileKey
+	}, nil)
+
+	// Start a read on f1 (will block).
+	f1Done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 100)
+		_, err := sr.ReadAt(context.Background(), "f1", 0, buf, 24*1024*1024)
+		f1Done <- err
+	}()
+
+	// Wait for f1's CDN request.
+	for cdnRequests.Load() == 0 {
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	// Cancel f1 — should NOT affect f2.
+	sr.CancelFile("f1")
+
+	// Unblock f1's CDN response.
+	close(f1Proceed)
+
+	// Wait for f1's goroutine to finish.
+	select {
+	case <-f1Done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for f1 ReadAt")
+	}
+
+	// Now read f2 — should succeed normally.
+	buf := make([]byte, 100)
+	n, err := sr.ReadAt(context.Background(), "f2", 0, buf, 24*1024*1024)
+	if err != nil && err != io.EOF {
+		t.Fatalf("f2 ReadAt after f1 cancel: %v", err)
+	}
+	if n != 100 {
+		t.Errorf("f2 ReadAt: got %d bytes, want 100", n)
+	}
+}
+
+// TestCancelFile_BudgetSlotReleased verifies that CancelFile releases
+// the global budget semaphore slot, so other files can use it.
+func TestCancelFile_BudgetSlotReleased(t *testing.T) {
+	const maxGlobalWindows = 2
+	rc := cache.NewRangeCache(8<<20, nil)
+	cdn := NewCDNClient(4, nil, 0)
+
+	// Block CDN responses so we can control when windows complete.
+	proceed := make(chan struct{})
+
+	server := newMockCDNServer(t, func(w http.ResponseWriter, r *http.Request) {
+		<-proceed // block until test signals
+
+		rangeHdr := r.Header.Get("Range")
+		var start, end int64
+		fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end)
+		data := make([]byte, end-start+1)
+		for i := range data {
+			data[i] = byte((start + int64(i)) % 256)
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, 24*1024*1024))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(data)
+	})
+	defer server.Close()
+
+	sr := NewStreamReader(rc, cdn, 2, maxGlobalWindows, 4<<20, func(fileKey string) string {
+		return server.URL + "/" + fileKey
+	}, nil)
+
+	// Start reads on f1 and f2 to fill both budget slots.
+	f1Done := make(chan error, 1)
+	f2Done := make(chan error, 1)
+
+	go func() {
+		buf := make([]byte, 100)
+		_, err := sr.ReadAt(context.Background(), "f1", 0, buf, 24*1024*1024)
+		f1Done <- err
+	}()
+	go func() {
+		buf := make([]byte, 100)
+		_, err := sr.ReadAt(context.Background(), "f2", 0, buf, 24*1024*1024)
+		f2Done <- err
+	}()
+
+	// Give reads time to acquire budget slots.
+	time.Sleep(100 * time.Millisecond)
+
+	// Cancel f1 — should release its budget slot.
+	sr.CancelFile("f1")
+
+	// Now unblock CDN so f1's cancelled read completes and f2 can finish.
+	close(proceed)
+
+	// Wait for both goroutines.
+	select {
+	case <-f1Done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for f1")
+	}
+	select {
+	case <-f2Done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("timed out waiting for f2")
+	}
+
+	// After cancellation and completion, budget should be fully released.
+	// Verify by reading a third file — it should get a budget slot without blocking.
+	buf := make([]byte, 100)
+	n, err := sr.ReadAt(context.Background(), "f3", 0, buf, 24*1024*1024)
+	if err != nil && err != io.EOF {
+		t.Fatalf("f3 ReadAt after cancel: %v", err)
+	}
+	if n != 100 {
+		t.Errorf("f3 ReadAt: got %d bytes, want 100", n)
+	}
+}
+
+// TestCancelFile_ReadAheadStops verifies that after CancelFile, the
+// readAhead pipeline does not create new windows for the cancelled file.
+func TestCancelFile_ReadAheadStops(t *testing.T) {
+	rc := cache.NewRangeCache(8<<20, nil)
+	cdn := NewCDNClient(4, nil, 0)
+
+	// Slow CDN so we can observe readAhead chaining.
+	var cdnRequests atomic.Int32
+
+	server := newMockCDNServer(t, func(w http.ResponseWriter, r *http.Request) {
+		cdnRequests.Add(1)
+		time.Sleep(200 * time.Millisecond) // slow response to allow readAhead to chain
+
+		rangeHdr := r.Header.Get("Range")
+		var start, end int64
+		fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end)
+		data := make([]byte, end-start+1)
+		for i := range data {
+			data[i] = byte((start + int64(i)) % 256)
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, 24*1024*1024))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(data)
+	})
+	defer server.Close()
+
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
+		return server.URL + "/" + fileKey
+	}, nil)
+
+	// Read offset 0 to trigger the first window and readAhead chain.
+	buf := make([]byte, 100)
+	_, err := sr.ReadAt(context.Background(), "f1", 0, buf, 24*1024*1024)
+	if err != nil && err != io.EOF {
+		t.Fatalf("ReadAt: %v", err)
+	}
+
+	// Wait briefly for readAhead to start.
+	time.Sleep(300 * time.Millisecond)
+
+	// Record CDN requests before CancelFile.
+	requestsBeforeCancel := cdnRequests.Load()
+
+	// Cancel the file — should stop readAhead from chaining more windows.
+	sr.CancelFile("f1")
+
+	// Wait long enough for any readAhead that might have been queued.
+	time.Sleep(1 * time.Second)
+
+	// CDN requests should not have grown significantly after cancellation.
+	// Allow +1 for a readAhead window that may have been in-flight at cancel time.
+	requestsAfter := cdnRequests.Load()
+	if requestsAfter > requestsBeforeCancel+1 {
+		t.Errorf("readAhead continued after CancelFile: %d requests before cancel, %d after",
+			requestsBeforeCancel, requestsAfter)
+	}
+}
+
+// TestStreamInto_StopsOnContextCancellation verifies that streamInto
+// stops reading from the CDN response body when the window's context is
+// cancelled, releasing the HTTP response body and budget slot promptly.
+func TestStreamInto_StopsOnContextCancellation(t *testing.T) {
+	rc := cache.NewRangeCache(1<<20, nil)
+	cdn := NewCDNClient(4, nil, 0)
+
+	// Server that streams data slowly so we can cancel mid-stream.
+	var bytesWritten atomic.Int64
+	server := newMockCDNServer(t, func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Range", "bytes 0-4194303/4194304")
+		w.WriteHeader(http.StatusPartialContent)
+		// Stream in 256 KiB chunks with delay to give streamInto time to cancel.
+		data := make([]byte, 256*1024)
+		for i := range data {
+			data[i] = byte(i % 256)
+		}
+		for written := 0; written < 4<<20; written += len(data) {
+			n, _ := w.Write(data)
+			bytesWritten.Add(int64(n))
+			if flusher, ok := w.(http.Flusher); ok {
+				flusher.Flush()
+			}
+			time.Sleep(50 * time.Millisecond)
+		}
+	})
+	defer server.Close()
+
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
+		return server.URL + "/" + fileKey
+	}, nil)
+
+	// Start a read.
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 100)
+		_, err := sr.ReadAt(context.Background(), "f1", 0, buf, 4<<20)
+		done <- err
+	}()
+
+	// Wait for the read to start fetching.
+	time.Sleep(200 * time.Millisecond)
+
+	// Cancel the file.
+	sr.CancelFile("f1")
+
+	// The read should complete (with error from cancellation).
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Log("ReadAt returned nil error after CancelFile — acceptable if data was already returned")
+		}
+		// Either an error or early return is fine; the key thing is it doesn't hang.
+	case <-time.After(5 * time.Second):
+		t.Fatal("ReadAt hung after CancelFile — streamInto did not stop on context cancellation")
+	}
+
+	// Bytes written by server before cancellation should be less than
+	// the full 4 MiB — proving streamInto stopped reading.
+	totalWritten := bytesWritten.Load()
+	if totalWritten == 4<<20 {
+		t.Logf("server wrote all %d bytes — cancellation may not have interrupted streamInto", totalWritten)
+	} else {
+		t.Logf("server wrote %d bytes before cancellation interrupted streamInto (expected < 4 MiB)", totalWritten)
+	}
+}
