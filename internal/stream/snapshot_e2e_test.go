@@ -629,3 +629,106 @@ func TestE2E_FileSizeFromCachedBlocksFallback(t *testing.T) {
 		t.Errorf("FileSize = %d, want %d (inferred from cached blocks)", f.FileSize, fileSize)
 	}
 }
+
+// TestE2E_ClosedFileInBothActiveAndRecentlyClosed verifies that after CancelFile,
+// a file with cached data still appears in SnapshotFiles() (because the cache
+// still has blocks for it) AND in RecentlyClosedFiles(). The dashboard must
+// deduplicate: show the file only in Recently Closed, not Active.
+func TestE2E_ClosedFileInBothActiveAndRecentlyClosed(t *testing.T) {
+	sr := newTestStreamReader(t)
+
+	fileKey := "torrent:1:closed"
+	fileSize := int64(32 * 1024 * 1024)
+
+	// Set up an active file with a reader and inflight window.
+	sr.TrackReader(fileKey, 1, 0)
+	sess := sr.getOrCreateSession(fileKey)
+	sess.sequentialReads.Store(5)
+	sess.recentReads.Store(5)
+	sess.lastReadOff.Store(0)
+	sess.lastReadTime.Store(time.Now().UnixNano())
+
+	_, cancel := context.WithCancel(context.Background())
+	addInflightWindow(sr, fileKey, 0, 4*1024*1024, fileSize, false, cancel)
+
+	// Cache some data so the file remains discoverable after CancelFile.
+	sr.cache.Put(fileKey, 0, make([]byte, 4*1024))
+
+	// Before closing: file is in SnapshotFiles, not in RecentlyClosed.
+	files := sr.SnapshotFiles()
+	if _, ok := findFileInSnapshot(files, fileKey); !ok {
+		t.Fatal("file should be in SnapshotFiles before closing")
+	}
+	closed := sr.RecentlyClosedFiles()
+	for _, cf := range closed {
+		if cf.FileKey == fileKey {
+			t.Error("file should NOT be in RecentlyClosed before closing")
+		}
+	}
+
+	// Close the file (simulates FUSE Release → CancelFile).
+	cancel()
+	sr.CancelFile(fileKey)
+
+	// After closing: file is in BOTH SnapshotFiles (cached data) AND RecentlyClosed.
+	// This is the root cause of the dashboard "appearing in both sections" bug.
+	// The dashboard's Snapshot() method must deduplicate.
+	files = sr.SnapshotFiles()
+	_, inSnapshot := findFileInSnapshot(files, fileKey)
+	closed = sr.RecentlyClosedFiles()
+	inClosed := false
+	for _, cf := range closed {
+		if cf.FileKey == fileKey {
+			inClosed = true
+		}
+	}
+
+	if !inClosed {
+		t.Error("file should be in RecentlyClosed after CancelFile")
+	}
+	if !inSnapshot {
+		t.Error("file should still be in SnapshotFiles (has cached data)")
+	}
+	// If both are true, the file would appear in both Active and Recently Closed
+	// sections on the dashboard without deduplication.
+}
+
+// TestE2E_ReopenedFileLeavesRecentlyClosed verifies that when a file is
+// reopened after being closed, TrackReader removes it from recentlyClosed
+// so the dashboard shows it only in Active.
+func TestE2E_ReopenedFileLeavesRecentlyClosed(t *testing.T) {
+	sr := newTestStreamReader(t)
+
+	fileKey := "torrent:1:reopen"
+	fileSize := int64(32 * 1024 * 1024)
+
+	// Phase 1: Open, then close.
+	sr.TrackReader(fileKey, 1, 0)
+	sess := sr.getOrCreateSession(fileKey)
+	sess.sequentialReads.Store(5)
+	sess.recentReads.Store(5)
+	sess.lastReadOff.Store(0)
+	sess.lastReadTime.Store(time.Now().UnixNano())
+
+	_, cancel1 := context.WithCancel(context.Background())
+	addInflightWindow(sr, fileKey, 0, 4*1024*1024, fileSize, false, cancel1)
+
+	cancel1()
+	sr.CancelFile(fileKey)
+
+	// Verify file is in RecentlyClosed.
+	closed := sr.RecentlyClosedFiles()
+	if len(closed) == 0 || closed[0].FileKey != fileKey {
+		t.Fatal("phase 1: file should be in RecentlyClosed after close")
+	}
+
+	// Phase 2: Reopen — TrackReader removes from recentlyClosed.
+	sr.TrackReader(fileKey, 2, fileSize/2)
+
+	closed = sr.RecentlyClosedFiles()
+	for _, cf := range closed {
+		if cf.FileKey == fileKey {
+			t.Error("phase 2: file should NOT be in RecentlyClosed after reopening")
+		}
+	}
+}

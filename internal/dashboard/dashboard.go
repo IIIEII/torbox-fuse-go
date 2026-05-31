@@ -99,21 +99,12 @@ func (d *Dashboard) resolvePath(fileKey string) string {
 func (d *Dashboard) Snapshot() *DashboardSnapshot {
 	activeSnapshots := d.streamer.SnapshotFiles()
 
-	// Build JSON snapshots for active files.
-	activeJSON := make([]FileSnapshotJSON, 0, len(activeSnapshots))
-	for _, fs := range activeSnapshots {
-		activeJSON = append(activeJSON, d.fileSnapshotToJSON(fs))
-	}
-
-	// Sort active files by file path for stable ordering.
-	sort.Slice(activeJSON, func(i, j int) bool {
-		return activeJSON[i].FilePath < activeJSON[j].FilePath
-	})
-
-	// Build recently closed file list.
+	// Build recently closed file list first so we can deduplicate.
 	closedFiles := d.streamer.RecentlyClosedFiles()
+	closedKeys := make(map[string]struct{}, len(closedFiles))
 	closedJSON := make([]ClosedFileInfoJSON, 0, len(closedFiles))
 	for _, cf := range closedFiles {
+		closedKeys[cf.FileKey] = struct{}{}
 		closedJSON = append(closedJSON, ClosedFileInfoJSON{
 			FileKey:  cf.FileKey,
 			FilePath: d.resolvePath(cf.FileKey),
@@ -121,6 +112,23 @@ func (d *Dashboard) Snapshot() *DashboardSnapshot {
 			ClosedAt: cf.ClosedAt.Format(time.RFC3339),
 		})
 	}
+
+	// Build JSON snapshots for active files, excluding any that are
+	// already in the recently-closed list. A file that was just closed
+	// may still have cached data (making it appear in SnapshotFiles),
+	// but it should only show in the Recently Closed section.
+	activeJSON := make([]FileSnapshotJSON, 0, len(activeSnapshots))
+	for _, fs := range activeSnapshots {
+		if _, inClosed := closedKeys[fs.FileKey]; inClosed {
+			continue
+		}
+		activeJSON = append(activeJSON, d.fileSnapshotToJSON(fs))
+	}
+
+	// Sort active files by file path for stable ordering.
+	sort.Slice(activeJSON, func(i, j int) bool {
+		return activeJSON[i].FilePath < activeJSON[j].FilePath
+	})
 
 	summary := SummaryInfo{
 		BudgetSlotsUsed:  d.streamer.BudgetHolding(),
