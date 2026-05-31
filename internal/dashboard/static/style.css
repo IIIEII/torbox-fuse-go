@@ -183,8 +183,8 @@ h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 4px; color: #f1f5f9; }
   50% { opacity: 0.5; }
 }
 
-/* Read position markers */
-.read-marker {
+/* Read position markers (scoped to file-bar to avoid affecting legend swatch) */
+.file-bar .read-marker {
   position: absolute;
   top: -2px;
   bottom: -2px;
@@ -193,7 +193,7 @@ h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 4px; color: #f1f5f9; }
   z-index: 10;
   border-radius: 1px;
 }
-.read-marker::before {
+.file-bar .read-marker::before {
   content: '';
   position: absolute;
   top: -3px;
@@ -241,7 +241,17 @@ h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 4px; color: #f1f5f9; }
 .legend-swatch.cached-low { background: #eab308; }
 .legend-swatch.inflight-progress { background: #3b82f6; }
 .legend-swatch.inflight-pending { background: #3b82f680; animation: pulse 1.5s ease-in-out infinite; }
-.legend-swatch.read-marker { background: #f97316; border-radius: 1px; }
+.legend-swatch.read-marker { background: #f97316; border-radius: 1px; position: relative; }
+.legend-swatch.read-marker::before {
+  content: '';
+  position: absolute;
+  top: -3px;
+  left: -3px;
+  width: 8px;
+  height: 8px;
+  background: #f97316;
+  border-radius: 50%;
+}
 
 /* Responsive */
 @media (max-width: 600px) {
