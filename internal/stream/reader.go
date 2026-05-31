@@ -1196,12 +1196,18 @@ func (sr *StreamReader) snapshotFile(fileKey string) FileSnapshot {
 
 // TrackReader records an active FUSE reader position for the given file.
 // Called from FileNode.Read to track where each open file handle is reading.
+// When a file is reopened after being closed, this also removes it from
+// recentlyClosed so the dashboard doesn't show it in both Active and
+// Recently Closed sections simultaneously.
 func (sr *StreamReader) TrackReader(fileKey string, readerID uint64, off int64) {
 	v, _ := sr.readers.LoadOrStore(fileKey, &readersMap{pos: make(map[uint64]int64)})
 	rm := v.(*readersMap)
 	rm.mu.Lock()
 	rm.pos[readerID] = off
 	rm.mu.Unlock()
+	// File is being actively read again — remove from recentlyClosed
+	// so the dashboard doesn't show it in both Active and Recently Closed.
+	sr.recentlyClosed.Delete(fileKey)
 }
 
 // UntrackReader removes a FUSE reader position. Called from FileNode.Release.

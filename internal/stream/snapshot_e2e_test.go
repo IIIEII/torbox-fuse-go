@@ -279,16 +279,13 @@ func TestE2E_FileReopenedReturnsToActive(t *testing.T) {
 		t.Fatal("expected inflight window after reopening")
 	}
 
-	// File should still be in RecentlyClosed too (both sections can overlap).
+	// File should NOT be in RecentlyClosed after being reopened.
+	// TrackReader removes the recentlyClosed entry when a file is re-accessed.
 	closed = sr.RecentlyClosedFiles()
-	stillClosed := false
 	for _, cf := range closed {
 		if cf.FileKey == fileKey {
-			stillClosed = true
+			t.Errorf("file %q should not be in RecentlyClosed after reopening, but found entry closed at %s", cf.FileKey, cf.ClosedAt)
 		}
-	}
-	if !stillClosed {
-		t.Log("note: file no longer in RecentlyClosed (acceptable — it was re-activated)")
 	}
 }
 
@@ -532,5 +529,14 @@ func TestE2E_FileLifecycleFullCycle(t *testing.T) {
 	}
 	if !foundNewWindow {
 		t.Error("phase 3: expected active inflight window at resume offset")
+	}
+
+	// Verify: file is NO LONGER in RecentlyClosed after being reopened.
+	// TrackReader removes the file from recentlyClosed when re-opened.
+	closedAfterReopen := sr.RecentlyClosedFiles()
+	for _, cf := range closedAfterReopen {
+		if cf.FileKey == fileKey {
+			t.Error("phase 3: file should NOT be in RecentlyClosed after being reopened")
+		}
 	}
 }
