@@ -153,7 +153,6 @@ h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 4px; color: #f1f5f9; }
   height: 20px;
   background: #334155;
   border-radius: 4px;
-  overflow: hidden;
   margin: 4px 0;
 }
 .file-bar {
@@ -183,8 +182,8 @@ h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 4px; color: #f1f5f9; }
   50% { opacity: 0.5; }
 }
 
-/* Read position markers (scoped to file-bar to avoid affecting legend swatch) */
-.file-bar .read-marker {
+/* Read position markers (scoped to file-bar-container to avoid affecting legend swatch) */
+.file-bar-container .read-marker {
   position: absolute;
   top: -2px;
   bottom: -2px;
@@ -193,7 +192,7 @@ h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 4px; color: #f1f5f9; }
   z-index: 10;
   border-radius: 1px;
 }
-.file-bar .read-marker::before {
+.file-bar-container .read-marker::before {
   content: '';
   position: absolute;
   top: -3px;

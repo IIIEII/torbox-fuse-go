@@ -255,12 +255,13 @@ type inflightWindow struct {
 
 // fileSession tracks per-file read patterns for read-ahead decisions.
 type fileSession struct {
-	lastSeek        atomic.Int64 // nano timestamp of last far-seek
-	lastReadOff     atomic.Int64 // offset of last ReadAt call
-	sequentialReads atomic.Int32 // count of sequential reads (resets on seek/random)
-	randomReads     atomic.Int32 // count of random-access reads (for small-read eligibility)
-	recentReads     atomic.Int32 // reads within the recentReadTTL window (for active-playback detection)
-	lastReadTime    atomic.Int64 // unix nano timestamp of last ReadAt call
+	lastSeek          atomic.Int64 // nano timestamp of last far-seek
+	lastReadOff       atomic.Int64 // offset of last ReadAt call
+	sequentialReads   atomic.Int32 // count of sequential reads (resets on seek/random)
+	randomReads       atomic.Int32 // count of random-access reads (for small-read eligibility)
+	recentReads       atomic.Int32 // reads within the recentReadTTL window (for active-playback detection)
+	lastReadTime      atomic.Int64 // unix nano timestamp of last ReadAt call
+	lastKnownFileSize atomic.Int64 // largest file size seen for this file (survives after inflight windows complete)
 }
 
 // readersMap tracks per-file read positions from active FUSE handles.
@@ -318,6 +319,13 @@ func (sr *StreamReader) ReadAt(ctx context.Context, fileKey string, off int64, p
 	sr.updateAccessPattern(fileKey, off, int64(len(p)), sess)
 	sess.recentReads.Add(1)
 	sess.lastReadTime.Store(time.Now().UnixNano())
+	// Remember file size for dashboard visualization — needed after inflight
+	// windows complete and their goroutines clean up, so SnapshotFiles can
+	// still report the correct total file size rather than inferring it
+	// from cached block ranges (which only cover the downloaded portion).
+	if fileSize > sess.lastKnownFileSize.Load() {
+		sess.lastKnownFileSize.Store(fileSize)
+	}
 
 	// Small reads (metadata scans, EOF probes) from random-access patterns
 	// bypass the window system to avoid fetching 16 MiB for a 64 KiB request.
@@ -999,7 +1007,9 @@ func (sr *StreamReader) cleanupWindowOnError(win *inflightWindow) {
 // will release its budget slot via defer and clean up the window.
 func (sr *StreamReader) CancelFile(fileKey string) {
 	// Record the file in recentlyClosed for dashboard visualization before
-	// we lose the session data. Capture file size from any inflight window.
+	// we lose the session data. Capture file size from inflight windows first,
+	// then fall back to the session's lastKnownFileSize (which persists after
+	// windows complete), and finally infer from cached blocks.
 	var fileSize int64
 	sr.inflight.Range(func(key, value any) bool {
 		ik := key.(inflightKey)
@@ -1018,6 +1028,22 @@ func (sr *StreamReader) CancelFile(fileKey string) {
 		}
 		return true
 	})
+
+	// Fall back to session's lastKnownFileSize when all windows already completed.
+	if fileSize == 0 {
+		if v, ok := sr.sessions.Load(fileKey); ok {
+			sess := v.(*fileSession)
+			fileSize = sess.lastKnownFileSize.Load()
+		}
+	}
+	// Last resort: infer file size from cached blocks.
+	if fileSize == 0 {
+		for _, b := range sr.cache.FileBlocks(fileKey) {
+			if b.End > fileSize {
+				fileSize = b.End
+			}
+		}
+	}
 
 	// If we had any activity on this file, record it in recentlyClosed.
 	if fileSize > 0 {
@@ -1191,7 +1217,17 @@ func (sr *StreamReader) snapshotFile(fileKey string) FileSnapshot {
 		rm.mu.Unlock()
 	}
 
-	// Infer file size from cached blocks if not set by inflight.
+	// Use the session's lastKnownFileSize as the primary source of truth
+	// for FileSize — it's recorded from ReadAt and persists after inflight
+	// windows complete. This prevents the dashboard from showing a shrinking
+	// file size when cached blocks only cover a partial range.
+	if v, ok := sr.sessions.Load(fileKey); ok {
+		if sessFS := v.(*fileSession).lastKnownFileSize.Load(); sessFS > snap.FileSize {
+			snap.FileSize = sessFS
+		}
+	}
+
+	// Infer file size from cached blocks if not set by any other source.
 	if snap.FileSize == 0 && len(snap.CachedBlocks) > 0 {
 		for _, b := range snap.CachedBlocks {
 			if b.End > snap.FileSize {
