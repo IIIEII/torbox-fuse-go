@@ -4,6 +4,7 @@ package cache
 
 import (
 	"hash/fnv"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -166,11 +167,11 @@ func (rc *RangeCache) putBlock(fileKey string, start int64, data []byte, session
 	copy(buf, data)
 
 	blk := &RangeBlock{
-		start:      start,
-		end:        start + int64(len(data)),
-		data:       buf,
-		sessionID:  sessionID,
-		priority:   priority,
+		start:     start,
+		end:       start + int64(len(data)),
+		data:      buf,
+		sessionID: sessionID,
+		priority:  priority,
 	}
 	blk.lastAccess.Store(nowNano())
 
@@ -246,8 +247,8 @@ func (rc *RangeCache) evict() {
 // is evicted first (LRU).
 func (rc *RangeCache) evictOne() {
 	type candidate struct {
-		key       cacheKey
-		shard     uint32
+		key        cacheKey
+		shard      uint32
 		lastAccess int64
 	}
 
@@ -326,6 +327,15 @@ func (rc *RangeCache) FileBlocks(fileKey string) []BlockInfo {
 		}
 		sh.mu.RUnlock()
 	}
+	slices.SortFunc(blocks, func(a, b BlockInfo) int {
+		if a.Start < b.Start {
+			return -1
+		}
+		if a.Start > b.Start {
+			return 1
+		}
+		return 0
+	})
 	return blocks
 }
 

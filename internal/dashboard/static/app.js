@@ -236,6 +236,20 @@
     return segments;
   }
 
+  // Compute what percentage of the file is cached (done inflight + cached blocks).
+  // Inflight-progress and inflight-pending segments are NOT counted.
+  function computeCachePercent(segments, fileSize) {
+    if (fileSize <= 0 || !segments || segments.length === 0) return 0;
+    var cachedBytes = 0;
+    for (var i = 0; i < segments.length; i++) {
+      var s = segments[i];
+      if (s.type === 'cached-high' || s.type === 'cached-low') {
+        cachedBytes += s.end - s.start;
+      }
+    }
+    return cachedBytes / fileSize * 100;
+  }
+
   // Render a progress bar from segments
   function renderBar(segments, fileSize) {
     if (fileSize <= 0) return '<div class="file-bar"></div>';
