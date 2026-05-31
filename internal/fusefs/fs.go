@@ -138,11 +138,11 @@ func (r *RootNode) addFileNode(ctx context.Context, parent *fs.Inode, name, cata
 	)
 
 	fileNode := &FileNode{
-		fileKey:     contentKey,
+		fileKey:      contentKey,
 		permalinkURL: permalinkURL,
-		size:        uint64(f.Size),
-		streamer:    r.streamer,
-		cfg:         r.cfg,
+		size:         uint64(f.Size),
+		streamer:     r.streamer,
+		cfg:          r.cfg,
 	}
 	child := parent.NewPersistentInode(ctx, fileNode, fs.StableAttr{
 		Mode: syscall.S_IFREG | 0444,
@@ -265,6 +265,13 @@ func (d *DirNode) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.E
 // Each Open call gets a unique readerID for dashboard read-position tracking.
 var nextReaderID atomic.Uint64
 
+// fileHandle is a per-open-instance FUSE file handle that carries a unique
+// readerID for dashboard read-position tracking. Each Open call creates a new
+// fileHandle; each Release call cleans up exactly its own readerID.
+type fileHandle struct {
+	readerID uint64 // unique per-open, assigned in Open
+}
+
 // FileNode represents a read-only regular file backed by the TorBox CDN via
 // the stream.StreamReader. Reads are served directly into the FUSE buffer
 // for zero-alloc cache hits.
@@ -276,7 +283,6 @@ type FileNode struct {
 	size         uint64
 	streamer     *stream.StreamReader
 	cfg          *config.Config
-	readerID     uint64 // unique per FUSE handle, assigned in Open
 }
 
 // Getattr returns file attributes.
@@ -291,16 +297,19 @@ func (f *FileNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.Attr
 	return 0
 }
 
-// Open rejects non-readonly opens and assigns a unique reader ID for
-// dashboard read-position tracking.
+// Open rejects non-readonly opens and returns a per-handle fileHandle
+// with a unique reader ID for dashboard read-position tracking.
+// Each Open call gets its own readerID so that multiple concurrent FUSE
+// handles on the same file (e.g. Plex header read + EOF probe + playback)
+// are tracked independently and cleaned up correctly in Release.
 func (f *FileNode) Open(ctx context.Context, flags uint32) (fh fs.FileHandle, fuseFlags uint32, errno syscall.Errno) {
 	slog.Debug("fuse open", "fileKey", f.fileKey, "flags", flags)
 	if flags&syscall.O_ACCMODE != syscall.O_RDONLY {
 		slog.Warn("fuse open rejected: not read-only", "fileKey", f.fileKey, "flags", flags)
 		return nil, 0, syscall.EACCES
 	}
-	f.readerID = nextReaderID.Add(1)
-	return nil, fuse.FOPEN_KEEP_CACHE, 0
+	handle := &fileHandle{readerID: nextReaderID.Add(1)}
+	return handle, fuse.FOPEN_KEEP_CACHE, 0
 }
 
 // Read reads file data from the stream reader directly into the FUSE
@@ -312,9 +321,9 @@ func (f *FileNode) Read(ctx context.Context, fh fs.FileHandle, dest []byte, off 
 		slog.Warn("fuse read error", "fileKey", f.fileKey, "offset", off, "reqSize", len(dest), "err", err)
 		return nil, syscall.EIO
 	}
-	// Track read position for dashboard visualization.
-	if f.readerID > 0 {
-		f.streamer.TrackReader(f.fileKey, f.readerID, off+int64(n))
+	// Track read position for dashboard visualization using the per-handle readerID.
+	if h, ok := fh.(*fileHandle); ok && h.readerID > 0 {
+		f.streamer.TrackReader(f.fileKey, h.readerID, off+int64(n))
 	}
 	slog.Debug("fuse read", "fileKey", f.fileKey, "offset", off, "reqSize", len(dest), "n", n, "eof", err == io.EOF)
 	return fuse.ReadResultData(dest[:n]), 0
@@ -340,14 +349,19 @@ func (f *FileNode) Fsync(ctx context.Context, fh fs.FileHandle, flags uint32) sy
 	return 0
 }
 
-// Release is called by the FUSE kernel when the last file handle is closed.
-// This is the correct place to cancel any remaining read-ahead goroutines for
-// this file. Without this, the readAhead pipeline continues downloading data
-// long after Plex has closed the file — wasting bandwidth for minutes or hours.
+// Release is called by the FUSE kernel when a file handle is closed.
+// Each Open creates a unique fileHandle with its own readerID; Release
+// untracks exactly that reader and cancels inflight windows only when the
+// last handle for this file is closed (preventing stale read cursors and
+// orphaned downloads after seek or stop).
 func (f *FileNode) Release(ctx context.Context, fh fs.FileHandle) syscall.Errno {
-	slog.Debug("fuse release, cancelling inflight windows", "fileKey", f.fileKey)
-	f.streamer.UntrackReader(f.fileKey, f.readerID)
-	f.streamer.CancelFile(f.fileKey)
+	h := fh.(*fileHandle)
+	slog.Debug("fuse release", "fileKey", f.fileKey, "readerID", h.readerID)
+	f.streamer.UntrackReader(f.fileKey, h.readerID)
+	// Cancel inflight windows only if no other handles remain open for this file.
+	if !f.streamer.HasReaders(f.fileKey) {
+		f.streamer.CancelFile(f.fileKey)
+	}
 	return 0
 }
 
@@ -364,37 +378,37 @@ func (f *FileNode) Listxattr(ctx context.Context, dest []byte) (uint32, syscall.
 
 // Compile-time interface checks.
 var (
-	_ fs.InodeEmbedder      = (*RootNode)(nil)
-	_ fs.NodeOnAdder        = (*RootNode)(nil)
-	_ fs.NodeGetattrer      = (*RootNode)(nil)
-	_ fs.NodeStatfser       = (*RootNode)(nil)
-	_ fs.NodeGetxattrer     = (*RootNode)(nil)
-	_ fs.NodeListxattrer    = (*RootNode)(nil)
+	_ fs.InodeEmbedder   = (*RootNode)(nil)
+	_ fs.NodeOnAdder     = (*RootNode)(nil)
+	_ fs.NodeGetattrer   = (*RootNode)(nil)
+	_ fs.NodeStatfser    = (*RootNode)(nil)
+	_ fs.NodeGetxattrer  = (*RootNode)(nil)
+	_ fs.NodeListxattrer = (*RootNode)(nil)
 
-	_ fs.InodeEmbedder      = (*DirNode)(nil)
-	_ fs.NodeGetattrer      = (*DirNode)(nil)
-	_ fs.NodeMkdirer        = (*DirNode)(nil)
-	_ fs.NodeUnlinker       = (*DirNode)(nil)
-	_ fs.NodeRmdirer        = (*DirNode)(nil)
-	_ fs.NodeRenamer        = (*DirNode)(nil)
-	_ fs.NodeCreater        = (*DirNode)(nil)
-	_ fs.NodeSymlinker      = (*DirNode)(nil)
-	_ fs.NodeLinker         = (*DirNode)(nil)
-	_ fs.NodeSetattrer      = (*DirNode)(nil)
-	_ fs.NodeGetxattrer     = (*DirNode)(nil)
-	_ fs.NodeListxattrer    = (*DirNode)(nil)
+	_ fs.InodeEmbedder   = (*DirNode)(nil)
+	_ fs.NodeGetattrer   = (*DirNode)(nil)
+	_ fs.NodeMkdirer     = (*DirNode)(nil)
+	_ fs.NodeUnlinker    = (*DirNode)(nil)
+	_ fs.NodeRmdirer     = (*DirNode)(nil)
+	_ fs.NodeRenamer     = (*DirNode)(nil)
+	_ fs.NodeCreater     = (*DirNode)(nil)
+	_ fs.NodeSymlinker   = (*DirNode)(nil)
+	_ fs.NodeLinker      = (*DirNode)(nil)
+	_ fs.NodeSetattrer   = (*DirNode)(nil)
+	_ fs.NodeGetxattrer  = (*DirNode)(nil)
+	_ fs.NodeListxattrer = (*DirNode)(nil)
 
-	_ fs.InodeEmbedder      = (*FileNode)(nil)
-	_ fs.NodeGetattrer      = (*FileNode)(nil)
-	_ fs.NodeOpener         = (*FileNode)(nil)
-	_ fs.NodeReader         = (*FileNode)(nil)
-	_ fs.NodeSetattrer      = (*FileNode)(nil)
-	_ fs.NodeWriter         = (*FileNode)(nil)
-	_ fs.NodeAllocater      = (*FileNode)(nil)
-	_ fs.NodeFsyncer        = (*FileNode)(nil)
-	_ fs.NodeReleaser       = (*FileNode)(nil)
-	_ fs.NodeGetxattrer     = (*FileNode)(nil)
-	_ fs.NodeListxattrer    = (*FileNode)(nil)
+	_ fs.InodeEmbedder   = (*FileNode)(nil)
+	_ fs.NodeGetattrer   = (*FileNode)(nil)
+	_ fs.NodeOpener      = (*FileNode)(nil)
+	_ fs.NodeReader      = (*FileNode)(nil)
+	_ fs.NodeSetattrer   = (*FileNode)(nil)
+	_ fs.NodeWriter      = (*FileNode)(nil)
+	_ fs.NodeAllocater   = (*FileNode)(nil)
+	_ fs.NodeFsyncer     = (*FileNode)(nil)
+	_ fs.NodeReleaser    = (*FileNode)(nil)
+	_ fs.NodeGetxattrer  = (*FileNode)(nil)
+	_ fs.NodeListxattrer = (*FileNode)(nil)
 )
 
 // permalinkBuilderFor creates a PermalinkBuilder function that resolves

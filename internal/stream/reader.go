@@ -1218,6 +1218,20 @@ func (sr *StreamReader) UntrackReader(fileKey string, readerID uint64) {
 	}
 }
 
+// HasReaders returns true if any FUSE file handle is still open for the given
+// fileKey. Used by Release to decide whether to cancel inflight windows — if
+// other handles are still open, cancelling would disrupt their reads.
+func (sr *StreamReader) HasReaders(fileKey string) bool {
+	if v, ok := sr.readers.Load(fileKey); ok {
+		rm := v.(*readersMap)
+		rm.mu.Lock()
+		n := len(rm.pos)
+		rm.mu.Unlock()
+		return n > 0
+	}
+	return false
+}
+
 // RecentlyClosedFiles returns metadata for files that were recently closed
 // (had CancelFile called) within the retention period.
 func (sr *StreamReader) RecentlyClosedFiles() []ClosedFileInfo {

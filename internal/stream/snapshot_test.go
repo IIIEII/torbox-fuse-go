@@ -183,11 +183,116 @@ func TestSnapshotFilesWithInflight(t *testing.T) {
 	}
 }
 
+func TestHasReaders(t *testing.T) {
+	sr := newTestStreamReader(t)
+
+	// No readers initially.
+	if sr.HasReaders("file1") {
+		t.Fatal("expected HasReaders=false with no readers")
+	}
+
+	// Add two readers for file1 (simulating two open handles).
+	sr.TrackReader("file1", 1, 100)
+	sr.TrackReader("file1", 2, 500)
+
+	if !sr.HasReaders("file1") {
+		t.Fatal("expected HasReaders=true with 2 readers")
+	}
+
+	// Remove one reader — still has readers.
+	sr.UntrackReader("file1", 1)
+	if !sr.HasReaders("file1") {
+		t.Fatal("expected HasReaders=true with 1 reader remaining")
+	}
+
+	// Remove last reader — no more readers.
+	sr.UntrackReader("file1", 2)
+	if sr.HasReaders("file1") {
+		t.Fatal("expected HasReaders=false after last reader removed")
+	}
+}
+
+func TestMultipleHandlesIndependentTracking(t *testing.T) {
+	sr := newTestStreamReader(t)
+
+	// Simulate the FUSE lifecycle: two Open calls for the same file,
+	// each getting its own readerID (1 and 2).
+	sr.TrackReader("movie.mkv", 1, 0)    // first handle reads at offset 0
+	sr.TrackReader("movie.mkv", 2, 4096) // second handle reads at offset 4096
+
+	// Snapshot should show 2 read offsets.
+	files := sr.SnapshotFiles()
+	var movie *FileSnapshot
+	for i := range files {
+		if files[i].FileKey == "movie.mkv" {
+			movie = &files[i]
+			break
+		}
+	}
+	if movie == nil {
+		t.Fatal("expected to find movie.mkv in snapshot")
+	}
+	if len(movie.ReadOffsets) != 2 {
+		t.Fatalf("expected 2 read offsets, got %d", len(movie.ReadOffsets))
+	}
+
+	// First handle closes (Release) — only untracks readerID 1.
+	sr.UntrackReader("movie.mkv", 1)
+	if !sr.HasReaders("movie.mkv") {
+		t.Fatal("expected HasReaders=true with 1 reader remaining after first close")
+	}
+
+	// Snapshot should show 1 read offset after first close.
+	files = sr.SnapshotFiles()
+	for i := range files {
+		if files[i].FileKey == "movie.mkv" {
+			movie = &files[i]
+			break
+		}
+	}
+	if len(movie.ReadOffsets) != 1 {
+		t.Fatalf("expected 1 read offset after first close, got %d", len(movie.ReadOffsets))
+	}
+
+	// Second handle closes — no more readers.
+	sr.UntrackReader("movie.mkv", 2)
+	if sr.HasReaders("movie.mkv") {
+		t.Fatal("expected HasReaders=false after last reader removed")
+	}
+}
+
+func TestCancelFileOnlyWhenNoReaders(t *testing.T) {
+	// This test verifies the Release pattern used by FileNode:
+	// UntrackReader is called first, then CancelFile only if no other
+	// readers remain. This prevents cancelling inflight windows when
+	// one of multiple handles closes but others are still reading.
+	sr := newTestStreamReader(t)
+
+	// Two handles open.
+	sr.TrackReader("movie.mkv", 1, 0)
+	sr.TrackReader("movie.mkv", 2, 4096)
+
+	// First handle closes: untrack, then check if CancelFile is needed.
+	sr.UntrackReader("movie.mkv", 1)
+	if !sr.HasReaders("movie.mkv") {
+		t.Fatal("should still have readers after first handle closes")
+	}
+	// Since HasReaders is true, CancelFile should NOT be called.
+	// (In production, the FUSE layer checks HasReaders before calling CancelFile.)
+
+	// Second handle closes.
+	sr.UntrackReader("movie.mkv", 2)
+	if sr.HasReaders("movie.mkv") {
+		t.Fatal("should have no readers after second handle closes")
+	}
+	// Now CancelFile can safely be called.
+}
+
 // newTestStreamReader creates a StreamReader with a test CDN for unit tests.
 func newTestStreamReader(t *testing.T) *StreamReader {
 	t.Helper()
 	rc := cache.NewRangeCache(4*1024*1024, nil) // 4 MiB budget
-	cdn := NewCDNClient(2, nil, 0)               // 2 concurrent, no URL caching
+	cdn := NewCDNClient(2, nil, 0)              // 2 concurrent, no URL caching
 	return NewStreamReader(rc, cdn, 2, 16, 1024*1024, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	}, nil)
