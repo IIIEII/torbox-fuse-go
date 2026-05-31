@@ -92,7 +92,7 @@ type budgetSem struct {
 	mu      sync.Mutex
 	cond    *sync.Cond
 	limit   int // max concurrent holders
-	held int // current number of holders
+	held    int // current number of holders
 	waiters []*budgetWaiter
 }
 
@@ -214,17 +214,17 @@ func (bs *budgetSem) budgetLimit() int {
 // ready, not when the full window completes), read-ahead of the next window,
 // and seek cancellation for far seeks.
 type StreamReader struct {
-	cache        *cache.RangeCache
-	cdn          *CDNClient
-	inflight     sync.Map // inflightKey -> *inflightWindow
-	sessions     sync.Map // fileKey -> *fileSession
-	windowSize   int64
-	maxInflight  int
-	budget          budgetLimiter // priority-aware global inflight window limit
-	permalinkFor    PermalinkBuilder
-	metrics         *metrics.Metrics
-	readers         sync.Map // fileKey -> *readersMap (active FUSE handle positions)
-	recentlyClosed  sync.Map // fileKey -> *closedEntry (recently closed files for dashboard)
+	cache          *cache.RangeCache
+	cdn            *CDNClient
+	inflight       sync.Map // inflightKey -> *inflightWindow
+	sessions       sync.Map // fileKey -> *fileSession
+	windowSize     int64
+	maxInflight    int
+	budget         budgetLimiter // priority-aware global inflight window limit
+	permalinkFor   PermalinkBuilder
+	metrics        *metrics.Metrics
+	readers        sync.Map // fileKey -> *readersMap (active FUSE handle positions)
+	recentlyClosed sync.Map // fileKey -> *closedEntry (recently closed files for dashboard)
 }
 
 // inflightKey identifies an inflight window by file key and window start offset.
@@ -255,12 +255,12 @@ type inflightWindow struct {
 
 // fileSession tracks per-file read patterns for read-ahead decisions.
 type fileSession struct {
-	lastSeek          atomic.Int64  // nano timestamp of last far-seek
-	lastReadOff       atomic.Int64  // offset of last ReadAt call
-	sequentialReads    atomic.Int32  // count of sequential reads (resets on seek/random)
-	randomReads       atomic.Int32  // count of random-access reads (for small-read eligibility)
-	recentReads       atomic.Int32  // reads within the recentReadTTL window (for active-playback detection)
-	lastReadTime      atomic.Int64  // unix nano timestamp of last ReadAt call
+	lastSeek        atomic.Int64 // nano timestamp of last far-seek
+	lastReadOff     atomic.Int64 // offset of last ReadAt call
+	sequentialReads atomic.Int32 // count of sequential reads (resets on seek/random)
+	randomReads     atomic.Int32 // count of random-access reads (for small-read eligibility)
+	recentReads     atomic.Int32 // reads within the recentReadTTL window (for active-playback detection)
+	lastReadTime    atomic.Int64 // unix nano timestamp of last ReadAt call
 }
 
 // readersMap tracks per-file read positions from active FUSE handles.
@@ -566,9 +566,6 @@ func (sr *StreamReader) maybeCancelOnSeek(fileKey string, off int64) {
 		if distance > seekThreshold && win.done.Load() && win.waiters.Load() == 0 {
 			win.cancelFunc()
 			cancelled = true
-			if sr.metrics != nil {
-				sr.metrics.InflightWindows.Add(-1)
-			}
 		}
 		return true
 	})
@@ -1086,9 +1083,10 @@ type FileSnapshot struct {
 
 // InflightInfo holds metadata about an in-progress CDN fetch window.
 type InflightInfo struct {
-	Start   int64
-	ReadyTo int64 // how far the download has progressed within the window
-	Done    bool
+	Start    int64 `json:"start"`
+	ReadyTo  int64 `json:"ready_to"` // how far the download has progressed within the window
+	Done     bool  `json:"done"`
+	Priority uint8 `json:"priority"` // cache priority: PriorityLow or PriorityHigh
 }
 
 // SnapshotFiles returns current state of all files that have activity
@@ -1136,6 +1134,14 @@ func (sr *StreamReader) snapshotFile(fileKey string) FileSnapshot {
 		CachedBlocks: sr.cache.FileBlocks(fileKey),
 	}
 
+	// Compute cache priority before collecting inflight windows so
+	// each window inherits the file's current priority.
+	var filePriority uint8
+	if v, ok := sr.sessions.Load(fileKey); ok {
+		sess := v.(*fileSession)
+		filePriority = sr.computeCachePriority(sess)
+	}
+
 	// Collect inflight windows.
 	sr.inflight.Range(func(key, value any) bool {
 		ik := key.(inflightKey)
@@ -1144,9 +1150,10 @@ func (sr *StreamReader) snapshotFile(fileKey string) FileSnapshot {
 		}
 		win := value.(*inflightWindow)
 		snap.Inflight = append(snap.Inflight, InflightInfo{
-			Start:   ik.start,
-			ReadyTo: win.readyTo.Load(),
-			Done:    win.done.Load(),
+			Start:    ik.start,
+			ReadyTo:  win.readyTo.Load(),
+			Done:     win.done.Load(),
+			Priority: filePriority,
 		})
 		snap.FileSize = win.fileSize // may be 0 for windows created before fileSize was set
 		return true
@@ -1233,10 +1240,21 @@ func (sr *StreamReader) BudgetLimit() int {
 	return sr.budget.budgetLimit()
 }
 
-// BudgetHolding returns the current number of inflight windows holding budget slots.
-// Used by the dashboard to display slot usage.
+// BudgetHolding returns the current number of inflight windows that are actively
+// fetching data (not yet done). This is the count the dashboard displays as
+// "budget slots used" — it reflects active downloads, not just semaphore occupancy,
+// because completed windows release their budget slot but stay on the inflight map
+// for a short time until cleanup removes them.
 func (sr *StreamReader) BudgetHolding() int32 {
-	return sr.budget.holding()
+	var count int32
+	sr.inflight.Range(func(key, value any) bool {
+		win := value.(*inflightWindow)
+		if !win.done.Load() {
+			count++
+		}
+		return true
+	})
+	return count
 }
 
 // cleanupRecentlyClosed removes entries older than the retention period.

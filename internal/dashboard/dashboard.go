@@ -36,15 +36,15 @@ type SummaryInfo struct {
 
 // FileSnapshotJSON is the JSON representation of a file's streaming state.
 type FileSnapshotJSON struct {
-	FileKey      string              `json:"file_key"`
-	FilePath     string              `json:"file_path"`
-	FileSize     int64               `json:"file_size"`
-	Priority     uint8               `json:"priority"`
-	PriorityName string              `json:"priority_name"`
-	Pattern      string              `json:"pattern"`
-	CachedBlocks []cache.BlockInfo   `json:"cached_blocks"`
+	FileKey      string                `json:"file_key"`
+	FilePath     string                `json:"file_path"`
+	FileSize     int64                 `json:"file_size"`
+	Priority     uint8                 `json:"priority"`
+	PriorityName string                `json:"priority_name"`
+	Pattern      string                `json:"pattern"`
+	CachedBlocks []cache.BlockInfo     `json:"cached_blocks"`
 	Inflight     []stream.InflightInfo `json:"inflight"`
-	ReadOffsets  []int64             `json:"read_offsets"`
+	ReadOffsets  []int64               `json:"read_offsets"`
 }
 
 // ClosedFileInfoJSON is the JSON representation of a recently closed file.
@@ -150,10 +150,10 @@ func (d *Dashboard) Snapshot() *DashboardSnapshot {
 	closedJSON := make([]ClosedFileInfoJSON, 0, len(closedFiles))
 	for _, cf := range closedFiles {
 		closedJSON = append(closedJSON, ClosedFileInfoJSON{
-			FileKey:   cf.FileKey,
-			FilePath:  d.resolvePath(cf.FileKey),
-			FileSize:  cf.FileSize,
-			ClosedAt:  cf.ClosedAt.Format(time.RFC3339),
+			FileKey:  cf.FileKey,
+			FilePath: d.resolvePath(cf.FileKey),
+			FileSize: cf.FileSize,
+			ClosedAt: cf.ClosedAt.Format(time.RFC3339),
 		})
 	}
 

@@ -1041,6 +1041,60 @@ func TestReadAt_SeekCancelsOrphanedWindow(t *testing.T) {
 	cancel()
 }
 
+// TestReadAt_FarSeekNoDoubleDecrement verifies that far-seek cancellation does
+// NOT double-decrement InflightWindows. The cleanupWindow goroutine already
+// handles the decrement, so maybeCancelFarSeek must not also decrement.
+func TestReadAt_FarSeekNoDoubleDecrement(t *testing.T) {
+	m := metrics.New()
+
+	server := newMockCDNServer(t, func(w http.ResponseWriter, r *http.Request) {
+		rangeHdr := r.Header.Get("Range")
+		var start, end int64
+		fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end)
+		data := make([]byte, end-start+1)
+		for i := range data {
+			data[i] = byte((start + int64(i)) % 256)
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, 24*1024*1024))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(data)
+	})
+	defer server.Close()
+
+	rc := cache.NewRangeCache(32<<20, nil)
+	cdn := NewCDNClient(4, nil, 0)
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
+		return server.URL + "/" + fileKey
+	}, m)
+
+	// Create an orphaned completed window at offset 0.
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	orphanWin := &inflightWindow{
+		key:       inflightKey{fileKey: "file1", start: 0},
+		buf:       make([]byte, windowSize),
+		readyCond: sync.NewCond(&sync.Mutex{}),
+		cancelFunc: cancel,
+	}
+	orphanWin.done.Store(true)
+	sr.inflight.Store(orphanWin.key, orphanWin)
+	m.InflightWindows.Add(1)
+
+	// Do a far seek (>16 MiB away) — this will trigger maybeCancelFarSeek
+	// which used to double-decrement InflightWindows.
+	buf := make([]byte, 100)
+	sr.ReadAt(context.Background(), "file1", 20*1024*1024, buf, 24*1024*1024)
+
+	// Wait for cleanupWindow goroutines to finish.
+	time.Sleep(500 * time.Millisecond)
+
+	// InflightWindows must never go negative.
+	count := m.InflightWindows.Load()
+	if count < 0 {
+		t.Errorf("InflightWindows went negative: %d (double-decrement bug)", count)
+	}
+}
+
 // TestReadAt_CrossWindowBoundary verifies that a read spanning a 4 MiB window
 // boundary returns the full requested number of bytes rather than a short read.
 // A short read at a window boundary would cause FUSE to treat it as EOF.

@@ -106,9 +106,32 @@ func TestBudgetLimitAndHolding(t *testing.T) {
 		t.Fatalf("expected budget limit 16, got %d", limit)
 	}
 
+	// No inflight windows — holding should be 0.
 	holding := sr.BudgetHolding()
 	if holding != 0 {
 		t.Fatalf("expected budget holding 0, got %d", holding)
+	}
+
+	// Add an inflight window that is NOT done — it should be counted.
+	win := &inflightWindow{
+		key:       inflightKey{fileKey: "budgettest:1:1", start: 0},
+		readyCond: sync.NewCond(&sync.Mutex{}),
+		fileSize:  1000,
+	}
+	win.readyTo.Store(500)
+	win.done.Store(false) // still in progress
+	sr.inflight.Store(win.key, win)
+
+	holding = sr.BudgetHolding()
+	if holding != 1 {
+		t.Fatalf("expected budget holding 1 with one active window, got %d", holding)
+	}
+
+	// Mark the window as done — it should no longer be counted.
+	win.done.Store(true)
+	holding = sr.BudgetHolding()
+	if holding != 0 {
+		t.Fatalf("expected budget holding 0 with all windows done, got %d", holding)
 	}
 }
 

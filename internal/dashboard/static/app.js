@@ -134,8 +134,14 @@
     // Build segments for the progress bar
     var segments = buildSegments(f, size);
 
+    // Calculate cache coverage percentage
+    var cachedPct = size > 0 ? computeCachePercent(segments, size) : 0;
+
     var meta = '';
     meta += formatBytes(size);
+    if (cachedPct > 0) {
+      meta += ' · ' + cachedPct.toFixed(0) + '% cached';
+    }
     if (f.pattern) {
       meta += ' · <span class="pattern pattern-' + esc(f.pattern) + '">' + esc(f.pattern) + '</span>';
     }
@@ -180,13 +186,33 @@
       }
     }
 
-    // Add inflight windows (blue, with progress indicator)
+    // Add inflight windows.
+    // ready_to is a relative offset within the window buffer (0 = start of window),
+    // so absolute positions are computed as w.start + w.ready_to.
+    // Done windows are shown as cached segments (using their priority color)
+    // since the data is fully downloaded but may not yet appear in cached_blocks
+    // due to cache eviction timing. Active windows show progress + pending.
+    var windowSize = 16 * 1024 * 1024; // must match reader.go windowSize
     if (f.inflight) {
       for (var i = 0; i < f.inflight.length; i++) {
         var w = f.inflight[i];
-        if (w.done) continue; // already covered by cached_blocks
-        // The inflight portion: from start to readyTo (or to start+windowSize if not started yet)
-        var progressEnd = w.ready_to > w.start ? w.ready_to : w.start;
+        // Compute absolute end of this window, clamped to file size
+        var windowEnd = f.file_size > 0 ? Math.min(w.start + windowSize, f.file_size) : w.start + windowSize;
+        // Absolute position of downloaded progress within the window
+        var progressEnd = w.start + w.ready_to;
+
+        if (w.done) {
+          // Completed download — show as cached using its priority color.
+          // This covers ranges that may be missing from cached_blocks
+          // due to eviction or merge timing.
+          segments.push({
+            start: w.start,
+            end: progressEnd > w.start ? progressEnd : w.start,
+            type: w.priority === 1 ? 'cached-high' : 'cached-low'
+          });
+          continue;
+        }
+        // Active download — show progress portion in blue
         if (progressEnd > w.start) {
           segments.push({
             start: w.start,
@@ -194,11 +220,11 @@
             type: 'inflight-progress'
           });
         }
-        // The remaining portion of the inflight window (not yet downloaded)
-        if (progressEnd < w.start + (f.file_size > 0 ? Math.min(16*1024*1024, f.file_size - w.start) : 16*1024*1024)) {
+        // Pending portion (not yet downloaded)
+        if (progressEnd < windowEnd) {
           segments.push({
             start: progressEnd,
-            end: w.start + Math.min(16*1024*1024, f.file_size - w.start),
+            end: windowEnd,
             type: 'inflight-pending'
           });
         }
