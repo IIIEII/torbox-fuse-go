@@ -1162,7 +1162,9 @@ func (sr *StreamReader) snapshotFile(fileKey string) FileSnapshot {
 			Done:     win.done.Load(),
 			Priority: filePriority,
 		})
-		snap.FileSize = win.fileSize // may be 0 for windows created before fileSize was set
+		if win.fileSize > snap.FileSize {
+			snap.FileSize = win.fileSize
+		}
 		return true
 	})
 

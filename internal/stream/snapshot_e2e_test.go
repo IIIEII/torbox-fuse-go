@@ -451,6 +451,49 @@ func TestE2E_DoneInflightWindowShowsAsCached(t *testing.T) {
 	// not as inflight-progress (blue). This is correct behavior.
 }
 
+// TestE2E_FileSizeStableWithZeroSizeWindow verifies that the snapshot's FileSize
+// does not fluctuate when a file has multiple inflight windows and some of
+// them have fileSize=0 (created before the file size was known). The dashboard
+// JS uses file_size to compute segment positions, so a zero file_size causes
+// the entire progress bar to collapse or jump erratically.
+func TestE2E_FileSizeStableWithZeroSizeWindow(t *testing.T) {
+	sr := newTestStreamReader(t)
+
+	fileKey := "torrent:1:jumper"
+	fileSize := int64(10 * 1024 * 1024 * 1024) // 10 GiB
+
+	sr.TrackReader(fileKey, 1, 0)
+	sess := sr.getOrCreateSession(fileKey)
+	sess.sequentialReads.Store(5)
+	sess.recentReads.Store(5)
+	sess.lastReadOff.Store(0)
+	sess.lastReadTime.Store(time.Now().UnixNano())
+
+	// Real inflight window with correct fileSize.
+	_, cancel1 := context.WithCancel(context.Background())
+	defer cancel1()
+	addInflightWindow(sr, fileKey, 0, 4*1024*1024, fileSize, false, cancel1)
+
+	// Zombie-like window with fileSize=0 (e.g. created during metadata scan
+	// before the actual file size was retrieved from the CDN).
+	_, cancel2 := context.WithCancel(context.Background())
+	defer cancel2()
+	addInflightWindow(sr, fileKey, 16*1024*1024, 20*1024*1024, 0, true, cancel2)
+
+	// Take multiple snapshots to ensure stability (sync.Map iteration order
+	// is non-deterministic, so the zero-size window might be visited last).
+	for i := 0; i < 5; i++ {
+		files := sr.SnapshotFiles()
+		f, ok := findFileInSnapshot(files, fileKey)
+		if !ok {
+			t.Fatalf("snapshot %d: file not found", i)
+		}
+		if f.FileSize != fileSize {
+			t.Errorf("snapshot %d: FileSize = %d, want %d (zero-size window must not overwrite)", i, f.FileSize, fileSize)
+		}
+	}
+}
+
 // TestE2E_FileLifecycleFullCycle exercises the complete file lifecycle:
 //  1. File opened → appears in Active with reader cursor
 //  2. File closed → disappears from Active, appears in RecentlyClosed
@@ -538,5 +581,51 @@ func TestE2E_FileLifecycleFullCycle(t *testing.T) {
 		if cf.FileKey == fileKey {
 			t.Error("phase 3: file should NOT be in RecentlyClosed after being reopened")
 		}
+	}
+}
+
+// TestE2E_FileSizeFromCachedBlocksFallback verifies that when all inflight
+// windows have fileSize=0 (e.g. created before file size was known), the
+// snapshot correctly infers file size from cached blocks instead of
+// reporting file_size=0 (which would make the JS progress bar disappear).
+func TestE2E_FileSizeFromCachedBlocksFallback(t *testing.T) {
+	sr := newTestStreamReader(t)
+
+	fileKey := "torrent:1:fallback"
+	fileSize := int64(32 * 1024 * 1024)
+
+	// Set up a reader and session.
+	sr.TrackReader(fileKey, 1, 0)
+	sess := sr.getOrCreateSession(fileKey)
+	sess.sequentialReads.Store(3)
+	sess.recentReads.Store(3)
+	sess.lastReadOff.Store(0)
+	sess.lastReadTime.Store(time.Now().UnixNano())
+
+	// Add small cached blocks that fit within the 4 MiB test budget.
+	// Block ends determine the inferred file size, not block data length.
+	sr.cache.Put(fileKey, 0, make([]byte, 4*1024))                   // 0..4KiB
+	sr.cache.Put(fileKey, 32*1024*1024-4*1024, make([]byte, 4*1024)) // ~32MiB..32MiB
+
+	// Add an inflight window with fileSize=0 (simulates window created
+	// before ReadAt received the real fileSize).
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	addInflightWindow(sr, fileKey, 16*1024*1024, 20*1024*1024, 0, false, cancel)
+
+	files := sr.SnapshotFiles()
+
+	f, ok := findFileInSnapshot(files, fileKey)
+	if !ok {
+		t.Fatal("file not found in snapshot")
+	}
+
+	// FileSize should be inferred from cached blocks (max block end = 32MiB),
+	// not stuck at 0 from the inflight window.
+	if f.FileSize == 0 {
+		t.Error("FileSize = 0, want inferred from cached blocks (>0)")
+	}
+	if f.FileSize != fileSize {
+		t.Errorf("FileSize = %d, want %d (inferred from cached blocks)", f.FileSize, fileSize)
 	}
 }
