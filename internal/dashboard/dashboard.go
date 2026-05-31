@@ -20,7 +20,6 @@ type DashboardSnapshot struct {
 	Timestamp      string               `json:"timestamp"`
 	Summary        SummaryInfo          `json:"summary"`
 	Active         []FileSnapshotJSON   `json:"active"`
-	Cached         []FileSnapshotJSON   `json:"cached"`
 	RecentlyClosed []ClosedFileInfoJSON `json:"recently_closed"`
 }
 
@@ -100,49 +99,15 @@ func (d *Dashboard) resolvePath(fileKey string) string {
 func (d *Dashboard) Snapshot() *DashboardSnapshot {
 	activeSnapshots := d.streamer.SnapshotFiles()
 
-	// Collect active file keys to find cached-only files.
-	activeKeys := make(map[string]struct{}, len(activeSnapshots))
-	for i := range activeSnapshots {
-		activeKeys[activeSnapshots[i].FileKey] = struct{}{}
-	}
-
-	// Find cached-only files (in cache but no active session/inflight).
-	allCacheKeys := d.cache.AllFileKeys()
-	var cachedSnapshots []stream.FileSnapshot
-	for _, key := range allCacheKeys {
-		if _, isActive := activeKeys[key]; isActive {
-			continue
-		}
-		blocks := d.cache.FileBlocks(key)
-		if len(blocks) == 0 {
-			continue
-		}
-		cachedSnapshots = append(cachedSnapshots, stream.FileSnapshot{
-			FileKey:      key,
-			FileSize:     blocks[len(blocks)-1].End,
-			CachedBlocks: blocks,
-			Pattern:      "idle",
-		})
-	}
-
 	// Build JSON snapshots for active files.
 	activeJSON := make([]FileSnapshotJSON, 0, len(activeSnapshots))
 	for _, fs := range activeSnapshots {
 		activeJSON = append(activeJSON, d.fileSnapshotToJSON(fs))
 	}
 
-	// Build JSON snapshots for cached-only files.
-	cachedJSON := make([]FileSnapshotJSON, 0, len(cachedSnapshots))
-	for _, fs := range cachedSnapshots {
-		cachedJSON = append(cachedJSON, d.fileSnapshotToJSON(fs))
-	}
-
-	// Sort both lists by file path for stable ordering.
+	// Sort active files by file path for stable ordering.
 	sort.Slice(activeJSON, func(i, j int) bool {
 		return activeJSON[i].FilePath < activeJSON[j].FilePath
-	})
-	sort.Slice(cachedJSON, func(i, j int) bool {
-		return cachedJSON[i].FilePath < cachedJSON[j].FilePath
 	})
 
 	// Build recently closed file list.
@@ -172,7 +137,6 @@ func (d *Dashboard) Snapshot() *DashboardSnapshot {
 		Timestamp:      time.Now().UTC().Format(time.RFC3339),
 		Summary:        summary,
 		Active:         activeJSON,
-		Cached:         cachedJSON,
 		RecentlyClosed: closedJSON,
 	}
 }

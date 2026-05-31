@@ -9,10 +9,8 @@
   // DOM references
   const summaryEl = document.getElementById('summary');
   const activeEl = document.getElementById('active-files');
-  const cachedEl = document.getElementById('cached-files');
   const closedEl = document.getElementById('closed-files');
   const activeCountEl = document.getElementById('active-count');
-  const cachedCountEl = document.getElementById('cached-count');
   const closedCountEl = document.getElementById('closed-count');
   const searchInput = document.getElementById('search');
   const statusDot = document.getElementById('status-dot');
@@ -54,7 +52,6 @@
   function renderSnapshot(snap) {
     renderSummary(snap.summary);
     renderFileList(activeEl, activeCountEl, snap.active, 'active');
-    renderFileList(cachedEl, cachedCountEl, snap.cached, 'cached');
     renderClosedList(closedEl, closedCountEl, snap.recently_closed);
   }
 
