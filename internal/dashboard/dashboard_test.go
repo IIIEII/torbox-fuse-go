@@ -13,7 +13,7 @@ import (
 func newTestStreamReader(t *testing.T) *stream.StreamReader {
 	t.Helper()
 	rc := cache.NewRangeCache(4*1024*1024, nil) // 4 MiB budget
-	cdn := stream.NewCDNClient(2, nil, 0)        // 2 concurrent, no URL caching
+	cdn := stream.NewCDNClient(2, nil, 0)       // 2 concurrent, no URL caching
 	return stream.NewStreamReader(rc, cdn, 2, 16, 1024*1024, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	}, nil)

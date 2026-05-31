@@ -16,9 +16,9 @@ import (
 var staticFS embed.FS
 
 var (
-	indexHTML  = mustReadStatic("static/index.html")
-	styleCSS   = mustReadStatic("static/style.css")
-	appJS      = mustReadStatic("static/app.js")
+	indexHTML = mustReadStatic("static/index.html")
+	styleCSS  = mustReadStatic("static/style.css")
+	appJS     = mustReadStatic("static/app.js")
 )
 
 func mustReadStatic(name string) []byte {
