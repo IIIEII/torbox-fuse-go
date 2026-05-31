@@ -48,9 +48,9 @@ const (
 // BlockInfo holds metadata about a cached byte range for dashboard visualization.
 // It contains no data — only offset, size, and priority.
 type BlockInfo struct {
-	Start    int64
-	End      int64
-	Priority uint8 // PriorityLow or PriorityHigh
+	Start    int64  `json:"start"`
+	End      int64  `json:"end"`
+	Priority uint8 `json:"priority"` // PriorityLow or PriorityHigh
 }
 
 // RangeBlock holds a contiguous byte range for a file.

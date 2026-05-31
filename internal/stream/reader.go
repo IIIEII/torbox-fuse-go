@@ -1149,9 +1149,16 @@ func (sr *StreamReader) snapshotFile(fileKey string) FileSnapshot {
 			return true
 		}
 		win := value.(*inflightWindow)
+		// Skip zombie windows: done=true with zero progress (cancelled before any data
+		// arrived, e.g. metadata scans). These would produce zero-width segments that
+		// clutter the dashboard without conveying useful information.
+		readyTo := win.readyTo.Load()
+		if win.done.Load() && readyTo <= ik.start {
+			return true
+		}
 		snap.Inflight = append(snap.Inflight, InflightInfo{
 			Start:    ik.start,
-			ReadyTo:  win.readyTo.Load(),
+			ReadyTo:  readyTo,
 			Done:     win.done.Load(),
 			Priority: filePriority,
 		})
