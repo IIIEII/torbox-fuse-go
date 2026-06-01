@@ -28,7 +28,7 @@ func newMockCDNServer(t *testing.T, handler http.HandlerFunc) *httptest.Server {
 // TestReadAt_CacheHit verifies that a ReadAt returns immediately when data
 // is already in the RangeCache without touching the CDN.
 func TestReadAt_CacheHit(t *testing.T) {
-	rc := cache.NewRangeCache(1 << 20, nil)
+	rc := cache.NewRangeCache(1<<20, nil)
 	sr := NewStreamReader(rc, NewCDNClient(4, nil, 0), 2, 100, 4<<20, func(fileKey string) string {
 		t.Fatal("permalinkFor should not be called on cache hit")
 		return ""
@@ -55,7 +55,7 @@ func TestReadAt_CacheHit(t *testing.T) {
 // an inflight window is created, data is fetched from the CDN, and
 // the result is returned to the caller and stored in the cache.
 func TestReadAt_CacheMissFetchesFromCDN(t *testing.T) {
-	rc := cache.NewRangeCache(1 << 20, nil)
+	rc := cache.NewRangeCache(1<<20, nil)
 	cdn := NewCDNClient(4, nil, 0)
 	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
@@ -118,7 +118,7 @@ func TestReadAt_CacheMissFetchesFromCDN(t *testing.T) {
 // reads at overlapping offsets join the same inflight window rather than
 // creating separate CDN requests.
 func TestReadAt_MultipleReadersJoinInflightWindow(t *testing.T) {
-	rc := cache.NewRangeCache(1 << 20, nil)
+	rc := cache.NewRangeCache(1<<20, nil)
 	cdn := NewCDNClient(4, nil, 0)
 	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
@@ -197,7 +197,7 @@ func TestReadAt_MultipleReadersJoinInflightWindow(t *testing.T) {
 // 3.1 Two reads for same range → one backend fetch: extend existing test to
 // assert requestCount == 1 (currently allows <=2).
 func TestReadAt_TwoReadersOneFetch(t *testing.T) {
-	rc := cache.NewRangeCache(1 << 20, nil)
+	rc := cache.NewRangeCache(1<<20, nil)
 	cdn := NewCDNClient(4, nil, 0)
 	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
@@ -253,7 +253,7 @@ func TestReadAt_TwoReadersOneFetch(t *testing.T) {
 // while inflight window is active, start a read at offset 100 (same window).
 // Both should succeed without a second CDN request.
 func TestReadAt_SubrangeJoinsInflight(t *testing.T) {
-	rc := cache.NewRangeCache(1 << 20, nil)
+	rc := cache.NewRangeCache(1<<20, nil)
 	cdn := NewCDNClient(4, nil, 0)
 	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
@@ -323,7 +323,7 @@ func TestReadAt_SubrangeJoinsInflight(t *testing.T) {
 // 3.3 Inflight state cleaned after success: after a read completes, verify the
 // inflight map has no entry for the key.
 func TestReadAt_InflightCleanedAfterSuccess(t *testing.T) {
-	rc := cache.NewRangeCache(1 << 20, nil)
+	rc := cache.NewRangeCache(1<<20, nil)
 	cdn := NewCDNClient(4, nil, 0)
 	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
@@ -365,7 +365,7 @@ func TestReadAt_InflightCleanedAfterSuccess(t *testing.T) {
 // 3.4 Inflight state cleaned after error: mock CDN returns 500, verify inflight
 // entry is removed and subsequent reads can retry (not stuck on a failed entry).
 func TestReadAt_InflightCleanedAfterError(t *testing.T) {
-	rc := cache.NewRangeCache(1 << 20, nil)
+	rc := cache.NewRangeCache(1<<20, nil)
 	cdn := NewCDNClient(4, nil, 0)
 	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
@@ -416,7 +416,7 @@ func TestReadAt_InflightCleanedAfterError(t *testing.T) {
 // 3.5 Inflight state cleaned after cancel: cancel context during inflight fetch,
 // verify inflight entry is removed and subsequent reads can retry.
 func TestReadAt_InflightCleanedAfterCancel(t *testing.T) {
-	rc := cache.NewRangeCache(1 << 20, nil)
+	rc := cache.NewRangeCache(1<<20, nil)
 	cdn := NewCDNClient(4, nil, 0)
 
 	var callCount atomic.Int32
@@ -472,7 +472,7 @@ func TestReadAt_InflightCleanedAfterCancel(t *testing.T) {
 // 5.1 Read fully from inflight data: start a read, verify data is returned
 // before the done channel closes (early-return via readyTo).
 func TestReadAt_EarlyReturnFromInflight(t *testing.T) {
-	rc := cache.NewRangeCache(1 << 20, nil)
+	rc := cache.NewRangeCache(1<<20, nil)
 	cdn := NewCDNClient(4, nil, 0)
 	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
@@ -512,7 +512,7 @@ func TestReadAt_EarlyReturnFromInflight(t *testing.T) {
 // 5.3 Short read near EOF: mock CDN returns fewer bytes than window size,
 // verify reader handles it correctly.
 func TestReadAt_ShortReadNearEOF(t *testing.T) {
-	rc := cache.NewRangeCache(1 << 20, nil)
+	rc := cache.NewRangeCache(1<<20, nil)
 	cdn := NewCDNClient(4, nil, 0)
 	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
@@ -561,7 +561,7 @@ func TestReadAt_ShortReadNearEOF(t *testing.T) {
 // 5.4 Exact byte correctness for requested range: read a 5-byte window at
 // various offsets within known data, verify each byte matches.
 func TestReadAt_ExactByteCorrectness(t *testing.T) {
-	rc := cache.NewRangeCache(1 << 20, nil)
+	rc := cache.NewRangeCache(1<<20, nil)
 	cdn := NewCDNClient(4, nil, 0)
 	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
@@ -629,7 +629,7 @@ func TestReadAt_ExactByteCorrectness(t *testing.T) {
 // 5.5 No off-by-one at boundaries: test reads at windowStart-1, windowStart,
 // windowStart+1, windowEnd-1, windowEnd, windowEnd+1.
 func TestReadAt_OffByOneAtBoundaries(t *testing.T) {
-	rc := cache.NewRangeCache(1 << 20, nil)
+	rc := cache.NewRangeCache(1<<20, nil)
 	cdn := NewCDNClient(4, nil, 0)
 	// Use a small window size for easier boundary testing
 	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
@@ -694,6 +694,7 @@ func TestReadAt_OffByOneAtBoundaries(t *testing.T) {
 		}
 	}
 }
+
 // TestReadAt_MetricsReadCount verifies that ReadAt increments the correct
 // metrics counters for read count, cache hits, stream misses, and stream joins.
 func TestReadAt_MetricsReadCount(t *testing.T) {
@@ -1010,9 +1011,9 @@ func TestReadAt_SeekCancelsOrphanedWindow(t *testing.T) {
 	// read-ahead window that no one is using anymore).
 	_, cancel := context.WithCancel(context.Background())
 	orphanWin := &inflightWindow{
-		key:       inflightKey{fileKey: "file1", start: 0},
-		buf:       make([]byte, windowSize),
-		readyCond: sync.NewCond(&sync.Mutex{}),
+		key:        inflightKey{fileKey: "file1", start: 0},
+		buf:        make([]byte, windowSize),
+		readyCond:  sync.NewCond(&sync.Mutex{}),
 		cancelFunc: cancel,
 	}
 	orphanWin.done.Store(true)
@@ -1071,9 +1072,9 @@ func TestReadAt_FarSeekNoDoubleDecrement(t *testing.T) {
 	_, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	orphanWin := &inflightWindow{
-		key:       inflightKey{fileKey: "file1", start: 0},
-		buf:       make([]byte, windowSize),
-		readyCond: sync.NewCond(&sync.Mutex{}),
+		key:        inflightKey{fileKey: "file1", start: 0},
+		buf:        make([]byte, windowSize),
+		readyCond:  sync.NewCond(&sync.Mutex{}),
 		cancelFunc: cancel,
 	}
 	orphanWin.done.Store(true)
@@ -1146,7 +1147,7 @@ func TestReadAt_CrossWindowBoundary(t *testing.T) {
 	// The cache hit for the first window will only return 16384 bytes (the
 	// remainder of the window). The loop in ReadAt must then fetch the next
 	// window and fill the rest of the buffer.
-	off := windowSize - 16384 // 4 MiB - 16 KiB
+	off := windowSize - 16384   // 4 MiB - 16 KiB
 	buf := make([]byte, 131072) // 128 KiB request
 	n, err = sr.ReadAt(context.Background(), "f1", off, buf, int64(len(testData)))
 	if err != nil && err != io.EOF {
@@ -1168,7 +1169,6 @@ func TestReadAt_CrossWindowBoundary(t *testing.T) {
 		}
 	}
 }
-
 
 func TestStreamReader_GlobalBudgetLimitsConcurrency(t *testing.T) {
 	// Verify that the global budget limits the number of concurrently
@@ -1604,6 +1604,163 @@ func TestCancelFile_ReadAheadStops(t *testing.T) {
 	}
 }
 
+// TestCancelFile_RemovesZombieWindowsFromInflight verifies that CancelFile
+// eagerly removes cancelled inflight windows from sr.inflight. Without this,
+// fetchWindow returns on context.Canceled without calling cleanupWindow,
+// leaving the window in sr.inflight indefinitely and causing SnapshotFiles
+// to emit empty file_size=0 entries for the file.
+func TestCancelFile_RemovesZombieWindowsFromInflight(t *testing.T) {
+	rc := cache.NewRangeCache(1<<20, nil)
+	cdn := NewCDNClient(4, nil, 0)
+
+	// Slow CDN that blocks until we signal, keeping the inflight window active.
+	proceed := make(chan struct{})
+	server := newMockCDNServer(t, func(w http.ResponseWriter, r *http.Request) {
+		<-proceed
+		rangeHdr := r.Header.Get("Range")
+		var start, end int64
+		fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end)
+		data := make([]byte, end-start+1)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, 24*1024*1024))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(data)
+	})
+	defer server.Close()
+
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
+		return server.URL + "/" + fileKey
+	}, nil)
+
+	// Start a read that will block on the CDN response.
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 100)
+		_, err := sr.ReadAt(context.Background(), "f1", 0, buf, 24*1024*1024)
+		done <- err
+	}()
+
+	// Wait for the inflight window to be created.
+	time.Sleep(200 * time.Millisecond)
+
+	// Verify there is an inflight window for f1 before CancelFile.
+	hasWindowBefore := false
+	sr.inflight.Range(func(key, value any) bool {
+		if key.(inflightKey).fileKey == "f1" {
+			hasWindowBefore = true
+			return false
+		}
+		return true
+	})
+	if !hasWindowBefore {
+		t.Fatal("expected inflight window for f1 before CancelFile")
+	}
+
+	// Cancel the file — should eagerly remove the window from sr.inflight.
+	sr.CancelFile("f1")
+
+	// Allow the CDN response to proceed so the goroutine can finish.
+	close(proceed)
+
+	// Wait for the goroutine to finish.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ReadAt hung after CancelFile")
+	}
+
+	// Verify NO inflight window for f1 remains after CancelFile.
+	hasWindowAfter := false
+	sr.inflight.Range(func(key, value any) bool {
+		if key.(inflightKey).fileKey == "f1" {
+			hasWindowAfter = true
+			return false
+		}
+		return true
+	})
+	if hasWindowAfter {
+		t.Error("CancelFile left zombie inflight window for f1 in sr.inflight — SnapshotFiles would emit empty entries")
+	}
+}
+
+// TestMaybeCleanupSession_PreservesSessionWithReaders verifies that
+// maybeCleanupSession does not delete a file session while FUSE readers
+// are still open. Without this, lastKnownFileSize is lost before CancelFile
+// can read it, causing files to not appear in recentlyClosed.
+func TestMaybeCleanupSession_PreservesSessionWithReaders(t *testing.T) {
+	rc := cache.NewRangeCache(8<<20, nil)
+	cdn := NewCDNClient(4, nil, 0)
+
+	server := newMockCDNServer(t, func(w http.ResponseWriter, r *http.Request) {
+		rangeHdr := r.Header.Get("Range")
+		var start, end int64
+		fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end)
+		data := make([]byte, end-start+1)
+		for i := range data {
+			data[i] = byte((start + int64(i)) % 256)
+		}
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, 10*1024*1024))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(data)
+	})
+	defer server.Close()
+
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
+		return server.URL + "/" + fileKey
+	}, nil)
+
+	// Simulate a FUSE reader opening the file.
+	sr.TrackReader("f1", 1, 0)
+
+	// Read data to populate lastKnownFileSize.
+	buf := make([]byte, 100)
+	_, err := sr.ReadAt(context.Background(), "f1", 0, buf, 10*1024*1024)
+	if err != nil && err != io.EOF {
+		t.Fatalf("ReadAt: %v", err)
+	}
+
+	// Wait for inflight windows to complete naturally.
+	time.Sleep(500 * time.Millisecond)
+
+	// Verify the session exists with lastKnownFileSize set.
+	v, ok := sr.sessions.Load("f1")
+	if !ok {
+		t.Fatal("session should exist after ReadAt")
+	}
+	sess := v.(*fileSession)
+	lkfs := sess.lastKnownFileSize.Load()
+	if lkfs != 10*1024*1024 {
+		t.Fatalf("lastKnownFileSize = %d, want %d", lkfs, 10*1024*1024)
+	}
+
+	// Now simulate: all inflight windows completed → maybeCleanupSession is called.
+	// With our fix, it should NOT delete the session because readers exist.
+	sr.maybeCleanupSession("f1")
+
+	_, ok = sr.sessions.Load("f1")
+	if !ok {
+		t.Fatal("maybeCleanupSession deleted session while readers are still open — lastKnownFileSize lost before CancelFile")
+	}
+
+	// Now close the reader and call CancelFile.
+	sr.UntrackReader("f1", 1)
+	sr.CancelFile("f1")
+
+	// Verify the file appears in recentlyClosed with the correct file size.
+	closedFiles := sr.RecentlyClosedFiles()
+	found := false
+	for _, cf := range closedFiles {
+		if cf.FileKey == "f1" {
+			found = true
+			if cf.FileSize != 10*1024*1024 {
+				t.Errorf("recentlyClosed fileSize = %d, want %d", cf.FileSize, 10*1024*1024)
+			}
+		}
+	}
+	if !found {
+		t.Error("f1 not found in recentlyClosed after CancelFile — session was prematurely deleted")
+	}
+}
+
 // TestStreamInto_StopsOnContextCancellation verifies that streamInto
 // stops reading from the CDN response body when the window's context is
 // cancelled, releasing the HTTP response body and budget slot promptly.
@@ -1668,5 +1825,99 @@ func TestStreamInto_StopsOnContextCancellation(t *testing.T) {
 		t.Logf("server wrote all %d bytes — cancellation may not have interrupted streamInto", totalWritten)
 	} else {
 		t.Logf("server wrote %d bytes before cancellation interrupted streamInto (expected < 4 MiB)", totalWritten)
+	}
+}
+
+// TestCancelFile_RemovesInflightWindows verifies that CancelFile eagerly removes
+// inflight windows from sr.inflight instead of relying on fetchWindow goroutines
+// to clean up. Without this, context.Canceled errors cause fetchWindow to exit
+// without calling cleanupWindow, leaving zombie windows in sr.inflight that
+// make SnapshotFiles emit empty file_size=0 entries.
+func TestCancelFile_RemovesInflightWindows(t *testing.T) {
+	rc := cache.NewRangeCache(1<<20, nil)
+	cdn := NewCDNClient(4, nil, 0)
+
+	// Slow CDN that blocks until we signal, keeping inflight windows active.
+	proceed := make(chan struct{})
+	var cdnRequests atomic.Int32
+	server := newMockCDNServer(t, func(w http.ResponseWriter, r *http.Request) {
+		cdnRequests.Add(1)
+		<-proceed // block until test signals
+		rangeHdr := r.Header.Get("Range")
+		var start, end int64
+		fmt.Sscanf(rangeHdr, "bytes=%d-%d", &start, &end)
+		data := make([]byte, end-start+1)
+		w.Header().Set("Content-Range", fmt.Sprintf("bytes %d-%d/%d", start, end, 24*1024*1024))
+		w.WriteHeader(http.StatusPartialContent)
+		w.Write(data)
+	})
+	defer server.Close()
+
+	sr := NewStreamReader(rc, cdn, 2, 100, 4<<20, func(fileKey string) string {
+		return server.URL + "/" + fileKey
+	}, nil)
+
+	// Start a read that blocks on CDN.
+	done := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 100)
+		_, err := sr.ReadAt(context.Background(), "f1", 0, buf, 24*1024*1024)
+		done <- err
+	}()
+
+	// Wait for CDN to receive the request.
+	deadline := time.After(5 * time.Second)
+	for cdnRequests.Load() == 0 {
+		select {
+		case <-deadline:
+			t.Fatal("timed out waiting for CDN request")
+		default:
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+
+	// Verify inflight window exists before cancel.
+	foundBefore := false
+	sr.inflight.Range(func(key, value any) bool {
+		if key.(inflightKey).fileKey == "f1" {
+			foundBefore = true
+		}
+		return true
+	})
+	if !foundBefore {
+		t.Fatal("expected inflight window for f1 before CancelFile")
+	}
+
+	// Cancel the file.
+	sr.CancelFile("f1")
+
+	// Verify NO inflight windows remain for f1 after CancelFile.
+	foundAfter := false
+	sr.inflight.Range(func(key, value any) bool {
+		if key.(inflightKey).fileKey == "f1" {
+			foundAfter = true
+		}
+		return true
+	})
+	if foundAfter {
+		t.Error("CancelFile left zombie inflight window in sr.inflight — SnapshotFiles will emit empty entries")
+	}
+
+	// Unblock CDN so goroutines can finish.
+	close(proceed)
+
+	// Wait for ReadAt to complete.
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("ReadAt hung after CancelFile")
+	}
+
+	// SnapshotFiles should not contain f1 (no session, no inflight, no cache).
+	snaps := sr.SnapshotFiles()
+	for _, s := range snaps {
+		if s.FileKey == "f1" {
+			t.Errorf("SnapshotFiles still contains f1 after CancelFile: %+v", s)
+		}
 	}
 }

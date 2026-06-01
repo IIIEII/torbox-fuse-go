@@ -1011,6 +1011,7 @@ func (sr *StreamReader) CancelFile(fileKey string) {
 	// then fall back to the session's lastKnownFileSize (which persists after
 	// windows complete), and finally infer from cached blocks.
 	var fileSize int64
+	var removedWindows int
 	sr.inflight.Range(func(key, value any) bool {
 		ik := key.(inflightKey)
 		if ik.fileKey == fileKey {
@@ -1025,9 +1026,21 @@ func (sr *StreamReader) CancelFile(fileKey string) {
 			if win.fileSize > fileSize {
 				fileSize = win.fileSize
 			}
+			// Eagerly remove from sr.inflight so the dashboard doesn't show
+			// zombie entries for cancelled files. Without this, fetchWindow
+			// returns on context.Canceled without calling cleanupWindow,
+			// leaving the window in sr.inflight indefinitely and causing
+			// SnapshotFiles to emit empty file_size=0 entries for the file.
+			// The cleanupWindow/cleanupWindowOnError goroutines will find
+			// the window gone and skip their delete + metrics decrement.
+			sr.inflight.Delete(key)
+			removedWindows++
 		}
 		return true
 	})
+	if removedWindows > 0 && sr.metrics != nil {
+		sr.metrics.InflightWindows.Add(-int64(removedWindows))
+	}
 
 	// Fall back to session's lastKnownFileSize when all windows already completed.
 	if fileSize == 0 {
@@ -1061,7 +1074,10 @@ func (sr *StreamReader) CancelFile(fileKey string) {
 	sr.readers.Delete(fileKey)
 }
 
-// maybeCleanupSession removes the file session if no inflight windows remain.
+// maybeCleanupSession removes the file session if no inflight windows remain
+// AND no FUSE readers are still open for this file. If readers remain, the
+// session (including lastKnownFileSize) must be preserved so that CancelFile
+// can later record the file in recentlyClosed with the correct file size.
 func (sr *StreamReader) maybeCleanupSession(fileKey string) {
 	hasInflight := false
 	sr.inflight.Range(func(key, value any) bool {
@@ -1071,9 +1087,16 @@ func (sr *StreamReader) maybeCleanupSession(fileKey string) {
 		}
 		return true
 	})
-	if !hasInflight {
-		sr.sessions.Delete(fileKey)
+	if hasInflight {
+		return
 	}
+	// Don't remove the session while FUSE file handles are still open —
+	// CancelFile needs the session's lastKnownFileSize to record the file
+	// in recentlyClosed with the correct file size.
+	if sr.HasReaders(fileKey) {
+		return
+	}
+	sr.sessions.Delete(fileKey)
 }
 
 // isRetryable returns true for errors that may succeed on retry:
