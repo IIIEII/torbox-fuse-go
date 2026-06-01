@@ -189,14 +189,18 @@ func (c *Client) apiGet(ctx context.Context, path string, params map[string]stri
 		cacheKey += "?" + k + "=" + params[k]
 	}
 
-	c.cacheMu.RLock()
-	if entry, ok := c.cache[cacheKey]; ok {
-		if time.Since(entry.createdAt) < c.cacheTTL {
-			c.cacheMu.RUnlock()
-			return entry.data, nil
+	// If the caller explicitly asked to bypass cache, skip the local cache
+	// lookup entirely — we want fresh data from the API.
+	if params["bypass_cache"] != "true" {
+		c.cacheMu.RLock()
+		if entry, ok := c.cache[cacheKey]; ok {
+			if time.Since(entry.createdAt) < c.cacheTTL {
+				c.cacheMu.RUnlock()
+				return entry.data, nil
+			}
 		}
+		c.cacheMu.RUnlock()
 	}
-	c.cacheMu.RUnlock()
 
 	c.apiSem <- struct{}{}
 	defer func() { <-c.apiSem }()
