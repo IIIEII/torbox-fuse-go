@@ -153,7 +153,8 @@ func TestMountE2E(t *testing.T) {
 	tbClient := torbox.NewClient(&e2eTorboxConfig{apiKey: "test", baseURL: "http://localhost:0"})
 
 	// ── Create FUSE root ─────────────────────────────────────────────
-	root := NewRootNode(tree, db, streamer, cfg, tbClient)
+	cat := catalog.NewCatalogFromTree(tree)
+	root := NewRootNode(cat, db, streamer, cfg, tbClient)
 
 	// ── Create mount point ────────────────────────────────────────────
 	mountDir := t.TempDir()

@@ -91,7 +91,10 @@ func main() {
 	}
 
 	// Create FUSE root node from the current catalog tree.
-	root := fusefs.NewRootNode(cat.Tree(), stateDB, streamer, cfg, tbClient)
+	// After each catalog refresh, SyncTree incrementally updates the FUSE
+	// inode tree so newly added downloads appear in the mount immediately.
+	root := fusefs.NewRootNode(cat, stateDB, streamer, cfg, tbClient)
+	cat.SetOnRefresh(func() { root.SyncTree(context.Background()) })
 
 	// Set up metrics server with refresh handler.
 	metricsServer := metrics.NewServer(m, cfg.MetricsListenAddr, cat.Refresh)

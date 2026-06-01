@@ -6,6 +6,7 @@ import (
 	"context"
 	"io"
 	"log/slog"
+	"path"
 	"sync/atomic"
 	"syscall"
 
@@ -25,11 +26,12 @@ import (
 
 // RootNode is the FUSE root inode ("/"). It builds the entire virtual tree
 // from a catalog.Tree in OnAdd, creating persistent child inodes so the
-// kernel cannot forget them.
+// kernel cannot forget them. When the catalog is refreshed, SyncTree
+// incrementally adds new entries and removes deleted ones.
 type RootNode struct {
 	fs.Inode
 
-	tree     *catalog.Tree
+	cat      *catalog.Catalog
 	stateDB  *state.DB
 	streamer *stream.StreamReader
 	cfg      *config.Config
@@ -37,9 +39,9 @@ type RootNode struct {
 }
 
 // NewRootNode creates a RootNode with all required dependencies.
-func NewRootNode(tree *catalog.Tree, stateDB *state.DB, streamer *stream.StreamReader, cfg *config.Config, tbClient *torbox.Client) *RootNode {
+func NewRootNode(cat *catalog.Catalog, stateDB *state.DB, streamer *stream.StreamReader, cfg *config.Config, tbClient *torbox.Client) *RootNode {
 	return &RootNode{
-		tree:     tree,
+		cat:      cat,
 		stateDB:  stateDB,
 		streamer: streamer,
 		cfg:      cfg,
@@ -57,7 +59,7 @@ func (r *RootNode) OnAdd(ctx context.Context) {
 // addCategoryDir creates a top-level category directory (movies/series) and
 // recursively populates its children from the catalog tree.
 func (r *RootNode) addCategoryDir(ctx context.Context, name, catalogPath string) {
-	entries := r.tree.ListDir(catalogPath)
+	entries := r.cat.Tree().ListDir(catalogPath)
 	if len(entries) == 0 {
 		return
 	}
@@ -84,7 +86,7 @@ func (r *RootNode) addCategoryDir(ctx context.Context, name, catalogPath string)
 // populateDir walks the catalog tree at the given path and adds child inodes
 // to the given parent FUSE inode.
 func (r *RootNode) populateDir(ctx context.Context, parent *fs.Inode, catalogPath string) {
-	entries := r.tree.ListDir(catalogPath)
+	entries := r.cat.Tree().ListDir(catalogPath)
 	for _, e := range entries {
 		childPath := catalogPath + "/" + e.Name
 
@@ -149,6 +151,73 @@ func (r *RootNode) addFileNode(ctx context.Context, parent *fs.Inode, name, cata
 		Ino:  ino,
 	})
 	parent.AddChild(name, child, false)
+}
+
+// SyncTree incrementally updates the FUSE inode tree to match the latest
+// catalog state. After a catalog refresh, the in-memory tree is swapped
+// atomically but the FUSE inodes (visible to Plex via the mount) are stale.
+// SyncTree walks both trees and adds new entries, removes deleted ones, and
+// recurses into shared subdirectories. It must be called after Catalog.Refresh
+// completes.
+func (r *RootNode) SyncTree(ctx context.Context) {
+	newTree := r.cat.Tree()
+	for _, catPath := range []string{"/movies", "/series"} {
+		name := path.Base(catPath)
+		child := r.GetChild(name)
+		if child == nil {
+			// Category didn't exist before — create it.
+			r.addCategoryDir(ctx, name, catPath)
+			r.NotifyEntry(name)
+			continue
+		}
+		r.syncDir(ctx, child, catPath, newTree)
+	}
+}
+
+// syncDir incrementally merges a FUSE directory inode with the latest
+// catalog tree at the given catalogPath. It adds new entries, removes
+// deleted ones, and recurses into shared subdirectories.
+func (r *RootNode) syncDir(ctx context.Context, fuseDir *fs.Inode, catalogPath string, newTree *catalog.Tree) {
+	newEntries := newTree.ListDir(catalogPath)
+	newNames := make(map[string]catalog.DirEntry, len(newEntries))
+	for _, e := range newEntries {
+		newNames[e.Name] = e
+	}
+
+	// Remove entries that no longer exist in the catalog.
+	for name := range fuseDir.Children() {
+		if _, exists := newNames[name]; !exists {
+			ch := fuseDir.GetChild(name)
+			if ch != nil {
+				ch.RmAllChildren()
+			}
+			fuseDir.RmChild(name)
+			fuseDir.NotifyEntry(name)
+			slog.Debug("fuse tree: removed entry", "path", catalogPath+"/"+name)
+		}
+	}
+
+	// Add new entries and recurse into shared subdirectories.
+	for _, e := range newEntries {
+		childPath := catalogPath + "/" + e.Name
+		existing := fuseDir.GetChild(e.Name)
+
+		if existing == nil {
+			// New entry — add it.
+			if e.File != nil {
+				r.addFileNode(ctx, fuseDir, e.Name, childPath, e.File)
+			} else {
+				r.addSubDirNode(ctx, fuseDir, e.Name, childPath)
+			}
+			fuseDir.NotifyEntry(e.Name)
+			slog.Debug("fuse tree: added entry", "path", childPath)
+		} else if e.File == nil {
+			// Shared subdirectory — recurse to sync its children.
+			r.syncDir(ctx, existing, childPath, newTree)
+		}
+		// Shared file entries are skipped — their inode is stable and
+		// content is fetched on demand from the CDN.
+	}
 }
 
 // Getattr returns root directory attributes.

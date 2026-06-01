@@ -30,6 +30,16 @@ type Catalog struct {
 
 	tree       atomic.Value // stores *Tree
 	refreshing atomic.Bool
+
+	onRefresh func() // called after a successful tree swap (used by FUSE to sync)
+}
+
+// NewCatalogFromTree creates a Catalog pre-loaded with the given tree.
+// This is intended for tests that need a Catalog without a real API client.
+func NewCatalogFromTree(tree *Tree) *Catalog {
+	c := &Catalog{}
+	c.tree.Store(tree)
+	return c
 }
 
 // NewCatalog creates a Catalog with the given dependencies. The initial tree
@@ -48,6 +58,14 @@ func NewCatalog(client Downloader, stateDB *state.DB, m *metrics.Metrics) *Catal
 // Tree returns the current filesystem tree. Safe to call from any goroutine.
 func (c *Catalog) Tree() *Tree {
 	return c.tree.Load().(*Tree)
+}
+
+// SetOnRefresh registers a callback that is called after a successful catalog
+// refresh (tree swap). The FUSE layer uses this to synchronise the kernel's
+// directory tree with the new catalog. The callback is called without arguments;
+// the callee should call Tree() to get the latest tree.
+func (c *Catalog) SetOnRefresh(fn func()) {
+	c.onRefresh = fn
 }
 
 // Refresh fetches all downloads from the TorBox API (torrents, usenet, webdl),
@@ -118,11 +136,27 @@ func (c *Catalog) Refresh(ctx context.Context) error {
 	// Swap tree atomically.
 	c.tree.Store(tree)
 
+	// Notify FUSE layer to sync the in-memory tree with the new catalog.
+	if c.onRefresh != nil {
+		c.onRefresh()
+	}
+
 	// Update metrics.
 	c.metrics.CatalogItems.Store(int64(len(files)))
 	slog.Info("catalog refresh complete", "files", len(files))
 
 	return nil
+}
+
+// SetTree replaces the catalog tree atomically and triggers the onRefresh
+// callback. This is used in tests to simulate a catalog refresh without
+// needing a real API server, and by the webhook refresh handler when the
+// catalog is rebuilt from cached data.
+func (c *Catalog) SetTree(tree *Tree) {
+	c.tree.Store(tree)
+	if c.onRefresh != nil {
+		c.onRefresh()
+	}
 }
 
 // ErrRefreshInProgress is returned when Refresh is called while a refresh

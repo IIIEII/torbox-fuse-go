@@ -180,7 +180,8 @@ func mountFUSEForMKV(t *testing.T, mkvPath string) (string, func()) {
 	}
 
 	tbClient := torbox.NewClient(&e2eTorboxConfig{apiKey: "test", baseURL: "http://localhost:0"})
-	root := NewRootNode(tree, db, streamer, cfg, tbClient)
+	cat := catalog.NewCatalogFromTree(tree)
+	root := NewRootNode(cat, db, streamer, cfg, tbClient)
 
 	mountDir := t.TempDir()
 	cfg.MountPath = mountDir
