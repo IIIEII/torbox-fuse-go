@@ -47,7 +47,7 @@ tidy-check: ## Verify go.mod and go.sum are tidy
 # ---- docker ----
 
 docker-build: ## Build Docker image
-	$(DOCKER) build
+	TORBOX_API_KEY=dummy $(DOCKER) build
 
 docker-up: ## Start via Docker Compose
 	$(DOCKER) up -d
