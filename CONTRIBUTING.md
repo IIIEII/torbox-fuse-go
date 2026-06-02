@@ -113,7 +113,7 @@ internal/
   cache/      Sharded range cache with budget eviction
   catalog/    TorBox API → virtual directory tree
   config/     Environment variable parsing
-  dashboard/   Real-time web dashboard for cache/stream visualization
+  dashboard/  Real-time web dashboard for cache/stream visualization
   fusefs/     FUSE filesystem (DirNode, FileNode, mount, SyncTree)
   integration/ Cross-package integration tests
   metrics/    Prometheus metrics server
