@@ -26,6 +26,8 @@ import (
 // TestSyncTree_AddsNewFile verifies that SyncTree makes a newly added file
 // appear in the FUSE mount after a catalog refresh.
 func TestSyncTree_AddsNewFile(t *testing.T) {
+	requireFUSE(t)
+
 	// ── Mock CDN server ────────────────────────────────────────────────
 	testData := []byte("synctree-test-data-0123456789abcdef")
 	cdnServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -209,13 +211,4 @@ func TestSyncTree_AddsNewFile(t *testing.T) {
 	if !fi.Mode().IsRegular() {
 		t.Errorf("new file mode = %v, expected regular file", fi.Mode())
 	}
-}
-
-// dirEntryNamesFs extracts sorted names from os.DirEntry slices.
-func dirEntryNamesFs(entries []os.DirEntry) []string {
-	names := make([]string, len(entries))
-	for i, e := range entries {
-		names[i] = e.Name()
-	}
-	return names
 }

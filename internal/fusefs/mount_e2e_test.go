@@ -10,7 +10,6 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
-	"syscall"
 	"testing"
 	"time"
 
@@ -29,16 +28,7 @@ import (
 // reads file contents through the FUSE layer, and verifies SHA256 hashes
 // against known test data served by a mock CDN server.
 func TestMountE2E(t *testing.T) {
-	if testing.Short() {
-		t.Skip("skipping FUSE mount e2e test in short mode")
-	}
-	if os.Getuid() != 0 {
-		// On macOS, FUSE mounts may require specific permissions.
-		// Check if macFUSE/FUSE-T is available.
-		if _, err := os.Stat("/Library/Filesystems/macfuse.fs"); err != nil && os.Getenv("FUSE_T") == "" {
-			t.Skip("skipping: no FUSE driver found (macFUSE or FUSE-T required)")
-		}
-	}
+	requireFUSE(t)
 
 	// Overall test timeout.
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -248,64 +238,3 @@ func TestMountE2E(t *testing.T) {
 		t.Logf("SHA256 verified: %x", gotHash)
 	}
 }
-
-// ── Test helpers ────────────────────────────────────────────────────────────
-
-// waitForMount polls until the FUSE mount point is functional (can list
-// directory entries) or the context expires. It does not require specific
-// entries — just that the mount is responsive.
-func waitForMount(t *testing.T, ctx context.Context, mountDir string) error {
-	t.Helper()
-	for {
-		select {
-		case <-ctx.Done():
-			return fmt.Errorf("timed out waiting for mount at %s: %w", mountDir, ctx.Err())
-		default:
-		}
-
-		f, err := os.Open(mountDir)
-		if err != nil {
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-		_, err = f.Readdirnames(0)
-		f.Close()
-		if err != nil {
-			time.Sleep(100 * time.Millisecond)
-			continue
-		}
-
-		return nil
-	}
-}
-
-// dirEntryNames returns the names of catalog DirEntry slices for logging.
-func dirEntryNames(entries []catalog.DirEntry) []string {
-	names := make([]string, len(entries))
-	for i, e := range entries {
-		names[i] = e.Name
-	}
-	return names
-}
-
-// fsEntryNames returns the names of os.DirEntry slices for logging.
-func fsEntryNames(entries []os.DirEntry) []string {
-	names := make([]string, len(entries))
-	for i, e := range entries {
-		names[i] = e.Name()
-	}
-	return names
-}
-
-// e2eTorboxConfig implements torbox.Config for the e2e test.
-type e2eTorboxConfig struct {
-	apiKey  string
-	baseURL string
-}
-
-func (c *e2eTorboxConfig) APIKey() string            { return c.apiKey }
-func (c *e2eTorboxConfig) APIBaseURL() string         { return c.baseURL }
-func (c *e2eTorboxConfig) APITimeout() time.Duration  { return 30 * time.Second }
-
-// Ensure unmount is available on the platform.
-var _ = syscall.Unmount

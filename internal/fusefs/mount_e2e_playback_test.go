@@ -34,11 +34,7 @@ func mountFUSEForTest(t *testing.T, dataSize int, cdnHandler http.HandlerFunc) (
 	if testing.Short() {
 		t.Skip("skipping FUSE mount e2e test in short mode")
 	}
-	if os.Getuid() != 0 {
-		if _, err := os.Stat("/Library/Filesystems/macfuse.fs"); err != nil && os.Getenv("FUSE_T") == "" {
-			t.Skip("skipping: no FUSE driver found (macFUSE or FUSE-T required)")
-		}
-	}
+	requireFUSE(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 

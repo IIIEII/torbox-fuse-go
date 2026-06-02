@@ -24,11 +24,6 @@ func addInflightWindow(sr *StreamReader, fileKey string, start, readyTo, fileSiz
 	sr.inflight.Store(win.key, win)
 }
 
-// removeInflightWindow removes a manually-added inflight window from the map.
-func removeInflightWindow(sr *StreamReader, fileKey string, start int64) {
-	sr.inflight.Delete(inflightKey{fileKey: fileKey, start: start})
-}
-
 // findFileInSnapshot finds a file by key in the snapshot list.
 func findFileInSnapshot(files []FileSnapshot, fileKey string) (FileSnapshot, bool) {
 	for _, f := range files {

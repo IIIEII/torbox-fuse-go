@@ -87,14 +87,7 @@ func generateMKV(t *testing.T, extraArgs ...string) string {
 func mountFUSEForMKV(t *testing.T, mkvPath string) (string, func()) {
 	t.Helper()
 
-	if testing.Short() {
-		t.Skip("skipping FUSE mount e2e test in short mode")
-	}
-	if os.Getuid() != 0 {
-		if _, err := os.Stat("/Library/Filesystems/macfuse.fs"); err != nil && os.Getenv("FUSE_T") == "" {
-			t.Skip("skipping: no FUSE driver found (macFUSE or FUSE-T required)")
-		}
-	}
+	requireFUSE(t)
 
 	mkvData, err := os.ReadFile(mkvPath)
 	if err != nil {
