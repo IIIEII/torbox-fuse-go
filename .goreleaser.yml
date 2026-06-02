@@ -16,9 +16,11 @@ builds:
     ldflags:
       - -s -w -X main.version={{.Version}} -X main.commit={{.Commit}} -X main.date={{.Date}}
     overrides:
-      - goarch: arm64
+      - goos: linux
+        goarch: arm64
         env:
           - CC=aarch64-linux-gnu-gcc
+          - PKG_CONFIG_PATH=/usr/aarch64-linux-gnu/pkgconfig
 
 archives:
   - id: default
