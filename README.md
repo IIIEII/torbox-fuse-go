@@ -100,8 +100,15 @@ For a minimal Docker image, the included `Dockerfile` produces an Alpine-based c
 ## Running tests
 
 ```bash
-go test ./...
+make test-short     # Unit tests only (no FUSE required)
+make test           # All tests including FUSE e2e (requires FUSE driver)
+make test-race       # Unit tests with race detector
+make test-coverage  # Unit tests with coverage report
+make lint           # golangci-lint
+make vet            # go vet
 ```
+
+See [CONTRIBUTING.md](CONTRIBUTING.md) for detailed development workflow.
 
 ## Project structure
 

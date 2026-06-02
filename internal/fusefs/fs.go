@@ -167,7 +167,7 @@ func (r *RootNode) SyncTree(ctx context.Context) {
 		if child == nil {
 			// Category didn't exist before — create it.
 			r.addCategoryDir(ctx, name, catPath)
-			r.NotifyEntry(name)
+			r.NotifyEntry(name) //nolint:errcheck // kernel notification best-effort
 			continue
 		}
 		r.syncDir(ctx, child, catPath, newTree)
@@ -192,7 +192,7 @@ func (r *RootNode) syncDir(ctx context.Context, fuseDir *fs.Inode, catalogPath s
 				ch.RmAllChildren()
 			}
 			fuseDir.RmChild(name)
-			fuseDir.NotifyEntry(name)
+			fuseDir.NotifyEntry(name) //nolint:errcheck // kernel notification best-effort
 			slog.Debug("fuse tree: removed entry", "path", catalogPath+"/"+name)
 		}
 	}
@@ -209,7 +209,7 @@ func (r *RootNode) syncDir(ctx context.Context, fuseDir *fs.Inode, catalogPath s
 			} else {
 				r.addSubDirNode(ctx, fuseDir, e.Name, childPath)
 			}
-			fuseDir.NotifyEntry(e.Name)
+			fuseDir.NotifyEntry(e.Name) //nolint:errcheck // kernel notification best-effort
 			slog.Debug("fuse tree: added entry", "path", childPath)
 		} else if e.File == nil {
 			// Shared subdirectory — recurse to sync its children.
