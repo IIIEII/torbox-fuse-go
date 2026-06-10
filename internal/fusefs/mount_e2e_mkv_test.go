@@ -142,7 +142,7 @@ func mountFUSEForMKV(t *testing.T, mkvPath string) (string, func()) {
 				},
 			},
 		},
-	})
+	}, false)
 
 	stateDir := t.TempDir()
 	db, err := state.Open(filepath.Join(stateDir, "state.db"))
@@ -152,7 +152,7 @@ func mountFUSEForMKV(t *testing.T, mkvPath string) (string, func()) {
 		t.Fatalf("state.Open: %v", err)
 	}
 
-	rc := cache.NewRangeCache(256 * 1024 * 1024, nil)
+	rc := cache.NewRangeCache(256*1024*1024, nil)
 	cdnClient := stream.NewCDNClient(8, nil, 0)
 	permalinkBuilder := func(fileKey string) string {
 		return cdnServer.URL
@@ -166,10 +166,10 @@ func mountFUSEForMKV(t *testing.T, mkvPath string) (string, func()) {
 		PrefetchWindowMB:  16,
 		StreamMaxInflight: 2,
 		StreamConcurrency: 8,
-		AttrTimeoutSec:   1,
-		EntryTimeoutSec:  1,
-		UID:              uint32(os.Getuid()),
-		GID:              uint32(os.Getgid()),
+		AttrTimeoutSec:    1,
+		EntryTimeoutSec:   1,
+		UID:               uint32(os.Getuid()),
+		GID:               uint32(os.Getgid()),
 	}
 
 	tbClient := torbox.NewClient(&e2eTorboxConfig{apiKey: "test", baseURL: "http://localhost:0"})
@@ -328,7 +328,7 @@ func TestE2E_MKVPlaybackQuick(t *testing.T) {
 	mountDir, cleanup := mountFUSEForMKV(t, mkvPath)
 	defer cleanup()
 
-	filePath := filepath.Join(mountDir, "movies", "Test Movie 2024", "Test.Movie.2024.mkv")
+	filePath := filepath.Join(mountDir, "movies", "Test.Movie.2024", "Test.Movie.2024.mkv")
 
 	info, err := os.Stat(filePath)
 	if err != nil {
@@ -405,7 +405,7 @@ func TestE2E_MKVPlaybackLarge(t *testing.T) {
 	mountDir, cleanup := mountFUSEForMKV(t, mkvPath)
 	defer cleanup()
 
-	filePath := filepath.Join(mountDir, "movies", "Test Movie 2024", "Test.Movie.2024.mkv")
+	filePath := filepath.Join(mountDir, "movies", "Test.Movie.2024", "Test.Movie.2024.mkv")
 
 	fi, err := os.Stat(filePath)
 	if err != nil {

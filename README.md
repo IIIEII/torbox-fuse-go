@@ -80,6 +80,7 @@ All settings are environment variables:
 | `METRICS_LISTEN_ADDR` | `127.0.0.1:9080` | Address for the metrics and control server |
 | `DASHBOARD_ENABLED` | `true` | Enable the built-in web dashboard |
 | `STATE_DB_PATH` | `/config/state.db` | Path to the SQLite state database |
+| `FUSE_ALL_DIR_ENABLED` | `false` | Add a `/all` directory combining all movies and series |
 | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, `error` |
 
 ## How it works

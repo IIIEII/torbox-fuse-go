@@ -67,7 +67,7 @@ func TestSyncTree_AddsNewFile(t *testing.T) {
 				},
 			},
 		},
-	})
+	}, false)
 
 	// ── State DB ──────────────────────────────────────────────────────
 	stateDir := t.TempDir()
@@ -170,7 +170,7 @@ func TestSyncTree_AddsNewFile(t *testing.T) {
 				},
 			},
 		},
-	})
+	}, false)
 
 	// Swap the tree and trigger SyncTree (same as what Catalog.Refresh does).
 	cat.SetTree(updatedTree)
@@ -190,7 +190,7 @@ func TestSyncTree_AddsNewFile(t *testing.T) {
 	t.Logf("movies after sync: %v", dirEntryNamesFs(entries))
 
 	// Verify the new movie directory is readable.
-	newMovieDir := filepath.Join(moviesDir, "Second Movie 2025")
+	newMovieDir := filepath.Join(moviesDir, "Second.Movie.2025")
 	fileEntries, err := os.ReadDir(newMovieDir)
 	if err != nil {
 		t.Fatalf("ReadDir(new movie): %v", err)

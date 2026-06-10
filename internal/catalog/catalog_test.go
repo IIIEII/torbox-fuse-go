@@ -74,8 +74,8 @@ func sampleDownloads() map[DownloadKind][]Download {
 					{
 						DownloadKind: KindTorrent, DownloadID: "1", FileID: "10",
 						Name:      "The.Matrix.1999.mkv",
-						Size:     1500000000,
-						MimeType: "video/x-matroska",
+						Size:      1500000000,
+						MimeType:  "video/x-matroska",
 						MediaType: MediaMovie,
 					},
 				},
@@ -88,8 +88,8 @@ func sampleDownloads() map[DownloadKind][]Download {
 					{
 						DownloadKind: KindUsenet, DownloadID: "2", FileID: "20",
 						Name:      "Breaking.Bad.S01E01.mkv",
-						Size:     800000000,
-						MimeType: "video/x-matroska",
+						Size:      800000000,
+						MimeType:  "video/x-matroska",
 						MediaType: MediaSeries,
 					},
 				},
@@ -102,8 +102,8 @@ func sampleDownloads() map[DownloadKind][]Download {
 					{
 						DownloadKind: KindWebDL, DownloadID: "3", FileID: "30",
 						Name:      "Inception.2010.mkv",
-						Size:     2000000000,
-						MimeType: "video/x-matroska",
+						Size:      2000000000,
+						MimeType:  "video/x-matroska",
 						MediaType: MediaMovie,
 					},
 				},
@@ -135,7 +135,7 @@ func TestCatalog_Refresh(t *testing.T) {
 	db := openTestDB(t)
 	m := metrics.New()
 
-	cat := NewCatalog(dl, db, m)
+	cat := NewCatalog(dl, db, m, false)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -154,9 +154,9 @@ func TestCatalog_Refresh(t *testing.T) {
 	tests := []struct {
 		path string
 	}{
-		{"/movies/The Matrix 1999/The.Matrix.1999.mkv"},
-		{"/series/Breaking Bad S01/Season 1/Breaking.Bad.S01E01.mkv"},
-		{"/movies/Inception 2010/Inception.2010.mkv"},
+		{"/movies/The.Matrix.1999/The.Matrix.1999.mkv"},
+		{"/series/Breaking.Bad.S01/Season 1/Breaking.Bad.S01E01.mkv"},
+		{"/movies/Inception.2010/Inception.2010.mkv"},
 	}
 	for _, tt := range tests {
 		f := tree.Lookup(tt.path)
@@ -191,7 +191,7 @@ func TestCatalog_RefreshAlreadyRunning(t *testing.T) {
 	db := openTestDB(t)
 	m := metrics.New()
 
-	cat := NewCatalog(dl, db, m)
+	cat := NewCatalog(dl, db, m, false)
 
 	// Start first refresh in background.
 	done := make(chan error, 1)
@@ -219,7 +219,7 @@ func TestCatalog_TreeBeforeRefresh(t *testing.T) {
 	db := openTestDB(t)
 	m := metrics.New()
 
-	cat := NewCatalog(dl, db, m)
+	cat := NewCatalog(dl, db, m, false)
 
 	// Tree() should return a non-nil empty tree before first refresh.
 	tree := cat.Tree()
@@ -240,7 +240,7 @@ func TestCatalog_RefreshCancelledContext(t *testing.T) {
 	db := openTestDB(t)
 	m := metrics.New()
 
-	cat := NewCatalog(dl, db, m)
+	cat := NewCatalog(dl, db, m, false)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
 	defer cancel()
@@ -260,8 +260,8 @@ func TestCatalog_RefreshIdempotentInodes(t *testing.T) {
 				{
 					DownloadKind: KindTorrent, DownloadID: "1", FileID: "10",
 					Name:      "movie.mkv",
-					Size:     1000,
-					MimeType: "video/x-matroska",
+					Size:      1000,
+					MimeType:  "video/x-matroska",
 					MediaType: MediaMovie,
 				},
 			},
@@ -271,7 +271,7 @@ func TestCatalog_RefreshIdempotentInodes(t *testing.T) {
 	db := openTestDB(t)
 	m := metrics.New()
 
-	cat := NewCatalog(dl, db, m)
+	cat := NewCatalog(dl, db, m, false)
 
 	// First refresh.
 	if err := cat.Refresh(context.Background()); err != nil {
@@ -305,7 +305,7 @@ func TestCatalog_RefreshAPICallCount(t *testing.T) {
 	db := openTestDB(t)
 	m := metrics.New()
 
-	cat := NewCatalog(dl, db, m)
+	cat := NewCatalog(dl, db, m, false)
 
 	if err := cat.Refresh(context.Background()); err != nil {
 		t.Fatalf("Refresh failed: %v", err)
@@ -328,7 +328,7 @@ func TestCatalog_RefreshAPIError(t *testing.T) {
 	db := openTestDB(t)
 	m := metrics.New()
 
-	cat := NewCatalog(dl, db, m)
+	cat := NewCatalog(dl, db, m, false)
 
 	err := cat.Refresh(context.Background())
 	if err == nil {

@@ -63,7 +63,7 @@ func main() {
 	tbClient := torbox.NewClient(cfg.TorboxConfig())
 
 	// Create catalog.
-	cat := catalog.NewCatalog(tbClient, stateDB, m)
+	cat := catalog.NewCatalog(tbClient, stateDB, m, cfg.AllDirEnabled)
 
 	// Create range cache with configured budget.
 	budgetBytes := int64(cfg.CacheBudgetMB) * 1024 * 1024
