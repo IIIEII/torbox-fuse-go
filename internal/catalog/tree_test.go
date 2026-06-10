@@ -26,7 +26,7 @@ func TestBuildTree_MovieFiles(t *testing.T) {
 		},
 	}
 
-	tree := BuildTree(downloads)
+	tree := BuildTree(downloads, false)
 
 	// /movies/ should list "The Matrix"
 	entries := tree.ListDir("/movies")
@@ -79,7 +79,7 @@ func TestBuildTree_SeriesFiles(t *testing.T) {
 		},
 	}
 
-	tree := BuildTree(downloads)
+	tree := BuildTree(downloads, false)
 
 	// /series/ should list "Breaking Bad"
 	entries := tree.ListDir("/series")
@@ -132,7 +132,7 @@ func TestBuildTree_AnimeGoesToSeries(t *testing.T) {
 		},
 	}
 
-	tree := BuildTree(downloads)
+	tree := BuildTree(downloads, false)
 
 	// Anime should go into /series/, not /anime/
 	entries := tree.ListDir("/series")
@@ -165,7 +165,7 @@ func TestBuildTree_HashNameUsesFirstPathSegment(t *testing.T) {
 		},
 	}
 
-	tree := BuildTree(downloads)
+	tree := BuildTree(downloads, false)
 
 	// When name looks like a hash, use first path segment from filename as title
 	entries := tree.ListDir("/movies")
@@ -215,7 +215,7 @@ func TestBuildTree_FilterNonVideoFiles(t *testing.T) {
 		},
 	}
 
-	tree := BuildTree(downloads)
+	tree := BuildTree(downloads, false)
 
 	// Only video files should appear
 	entries := tree.ListDir("/movies/Some Movie")
@@ -265,7 +265,7 @@ func TestBuildTree_SortedEntries(t *testing.T) {
 		},
 	}
 
-	tree := BuildTree(downloads)
+	tree := BuildTree(downloads, false)
 
 	entries := tree.ListDir("/movies/Collection")
 	if len(entries) != 3 {
@@ -302,7 +302,7 @@ func TestBuildTree_UntaggedDefaultsToMovie(t *testing.T) {
 		},
 	}
 
-	tree := BuildTree(downloads)
+	tree := BuildTree(downloads, false)
 
 	// Untagged files should default to movie
 	entries := tree.ListDir("/movies")
@@ -334,7 +334,7 @@ func TestBuildTree_DefaultSeasonIsOne(t *testing.T) {
 		},
 	}
 
-	tree := BuildTree(downloads)
+	tree := BuildTree(downloads, false)
 
 	// E01 without S01 should default to Season 1
 	entries := tree.ListDir("/series/A Show")
@@ -366,7 +366,7 @@ func TestBuildTree_NestedFilepath(t *testing.T) {
 		},
 	}
 
-	tree := BuildTree(downloads)
+	tree := BuildTree(downloads, false)
 
 	// File should be placed under /series/<title>/Season <N>/
 	// Season is extracted from the S02E03 pattern, not from the directory in the name
@@ -439,7 +439,7 @@ func TestLookup_MovieFile(t *testing.T) {
 		},
 	}
 
-	tree := BuildTree(downloads)
+	tree := BuildTree(downloads, false)
 
 	f := tree.Lookup("/movies/The Matrix/The.Matrix.1999.1080p.mkv")
 	if f == nil {
@@ -470,7 +470,7 @@ func TestLookup_SeriesFile(t *testing.T) {
 		},
 	}
 
-	tree := BuildTree(downloads)
+	tree := BuildTree(downloads, false)
 
 	f := tree.Lookup("/series/Breaking Bad/Season 1/Breaking.Bad.S01E01.720p.mkv")
 	if f == nil {
@@ -482,7 +482,7 @@ func TestLookup_SeriesFile(t *testing.T) {
 }
 
 func TestLookup_NotFound(t *testing.T) {
-	tree := BuildTree(nil)
+	tree := BuildTree(nil, false)
 
 	f := tree.Lookup("/movies/Nonexistent/file.mkv")
 	if f != nil {
@@ -491,7 +491,7 @@ func TestLookup_NotFound(t *testing.T) {
 }
 
 func TestLookup_EmptyPath(t *testing.T) {
-	tree := BuildTree(nil)
+	tree := BuildTree(nil, false)
 
 	f := tree.Lookup("")
 	if f != nil {
@@ -502,7 +502,7 @@ func TestLookup_EmptyPath(t *testing.T) {
 // --- ListDir tests ---
 
 func TestListDir_NonexistentPath(t *testing.T) {
-	tree := BuildTree(nil)
+	tree := BuildTree(nil, false)
 
 	entries := tree.ListDir("/nonexistent")
 	if entries != nil {
@@ -546,7 +546,7 @@ func TestListDir_RootDirectories(t *testing.T) {
 		},
 	}
 
-	tree := BuildTree(downloads)
+	tree := BuildTree(downloads, false)
 
 	rootEntries := tree.ListDir("/")
 	if len(rootEntries) != 2 {
@@ -581,7 +581,7 @@ func TestListDir_OnlyMoviesNoSeries(t *testing.T) {
 		},
 	}
 
-	tree := BuildTree(downloads)
+	tree := BuildTree(downloads, false)
 
 	rootEntries := tree.ListDir("/")
 	if len(rootEntries) != 1 {
@@ -634,7 +634,7 @@ func TestBuildTree_MultipleDownloads(t *testing.T) {
 		},
 	}
 
-	tree := BuildTree(downloads)
+	tree := BuildTree(downloads, false)
 
 	// Both /movies and /series should exist
 	rootEntries := tree.ListDir("/")
@@ -652,6 +652,316 @@ func TestBuildTree_MultipleDownloads(t *testing.T) {
 	seriesEntries := tree.ListDir("/series/Show B/Season 1")
 	if len(seriesEntries) != 1 {
 		t.Fatalf("ListDir(/series/Show B/Season 1): got %d entries, want 1", len(seriesEntries))
+	}
+}
+
+func TestBuildTree_DotsPreservedInFolderNames(t *testing.T) {
+	downloads := []Download{
+		{
+			Kind: KindTorrent,
+			ID:   "100",
+			Name: "101.Dalmatians.BDRip.1080p.tRuAVC.&.Multfilmy",
+			Files: []File{
+				{
+					DownloadKind: KindTorrent,
+					DownloadID:   "100",
+					FileID:       "1",
+					Name:         "101.Dalmatians.BDRip.1080p.tRuAVC.&.Multfilmy/101.Dalmatians.BDRip.1080p.tRuAVC.&.Multfilmy.mkv",
+					Size:         2048,
+					MimeType:     "video/x-matroska",
+					MediaType:    MediaMovie,
+				},
+			},
+		},
+	}
+
+	tree := BuildTree(downloads, false)
+
+	// Folder name should preserve dots exactly as in TorBox
+	entries := tree.ListDir("/movies")
+	if len(entries) != 1 {
+		t.Fatalf("ListDir(/movies): got %d entries, want 1", len(entries))
+	}
+	if entries[0].Name != "101.Dalmatians.BDRip.1080p.tRuAVC.&.Multfilmy" {
+		t.Errorf("Folder name: got %q, want %q", entries[0].Name, "101.Dalmatians.BDRip.1080p.tRuAVC.&.Multfilmy")
+	}
+
+	// Lookup should also work with the dotted name
+	f := tree.Lookup("/movies/101.Dalmatians.BDRip.1080p.tRuAVC.&.Multfilmy/101.Dalmatians.BDRip.1080p.tRuAVC.&.Multfilmy.mkv")
+	if f == nil {
+		t.Fatal("Lookup: expected file, got nil")
+	}
+}
+
+func TestBuildTree_UnderscoresPreservedInFolderNames(t *testing.T) {
+	downloads := []Download{
+		{
+			Kind: KindTorrent,
+			ID:   "200",
+			Name: "Some_Movie_2024",
+			Files: []File{
+				{
+					DownloadKind: KindTorrent,
+					DownloadID:   "200",
+					FileID:       "2",
+					Name:         "Some_Movie_2024.mkv",
+					Size:         1024,
+					MimeType:     "video/x-matroska",
+					MediaType:    MediaMovie,
+				},
+			},
+		},
+	}
+
+	tree := BuildTree(downloads, false)
+
+	entries := tree.ListDir("/movies")
+	if len(entries) != 1 {
+		t.Fatalf("ListDir(/movies): got %d entries, want 1", len(entries))
+	}
+	if entries[0].Name != "Some_Movie_2024" {
+		t.Errorf("Folder name: got %q, want %q", entries[0].Name, "Some_Movie_2024")
+	}
+}
+
+func TestBuildTree_AllDirDisabled(t *testing.T) {
+	downloads := []Download{
+		{
+			Kind: KindTorrent,
+			ID:   "100",
+			Name: "Movie A",
+			Files: []File{
+				{
+					DownloadKind: KindTorrent,
+					DownloadID:   "100",
+					FileID:       "1",
+					Name:         "Movie.A.mkv",
+					Size:         100,
+					MimeType:     "video/x-matroska",
+					MediaType:    MediaMovie,
+				},
+			},
+		},
+	}
+
+	tree := BuildTree(downloads, false) // allDir disabled
+
+	// /all should NOT exist when allDir is false
+	entries := tree.ListDir("/all")
+	if entries != nil {
+		t.Errorf("ListDir(/all): got %v, want nil (allDir disabled)", entries)
+	}
+}
+
+func TestBuildTree_AllDirEnabled(t *testing.T) {
+	downloads := []Download{
+		{
+			Kind: KindTorrent,
+			ID:   "100",
+			Name: "Movie.A.2024",
+			Files: []File{
+				{
+					DownloadKind: KindTorrent,
+					DownloadID:   "100",
+					FileID:       "1",
+					Name:         "Movie.A.2024/Movie.A.2024.mkv",
+					Size:         2048,
+					MimeType:     "video/x-matroska",
+					MediaType:    MediaMovie,
+				},
+			},
+		},
+		{
+			Kind: KindTorrent,
+			ID:   "200",
+			Name: "Show.B",
+			Files: []File{
+				{
+					DownloadKind: KindTorrent,
+					DownloadID:   "200",
+					FileID:       "2",
+					Name:         "Show.B.S01E01.mkv",
+					Size:         1024,
+					MimeType:     "video/x-matroska",
+					MediaType:    MediaSeries,
+				},
+			},
+		},
+	}
+
+	tree := BuildTree(downloads, true) // allDir enabled
+
+	// /all should exist
+	allEntries := tree.ListDir("/all")
+	if len(allEntries) != 2 {
+		t.Fatalf("ListDir(/all): got %d entries, want 2", len(allEntries))
+	}
+
+	// Titles should be sorted
+	if allEntries[0].Name != "Movie.A.2024" {
+		t.Errorf("allEntries[0]: got %q, want %q", allEntries[0].Name, "Movie.A.2024")
+	}
+	if allEntries[1].Name != "Show.B" {
+		t.Errorf("allEntries[1]: got %q, want %q", allEntries[1].Name, "Show.B")
+	}
+
+	// /all/Movie.A.2024/ should list the movie file
+	movieEntries := tree.ListDir("/all/Movie.A.2024")
+	if len(movieEntries) != 1 {
+		t.Fatalf("ListDir(/all/Movie.A.2024): got %d entries, want 1", len(movieEntries))
+	}
+	if movieEntries[0].Name != "Movie.A.2024.mkv" {
+		t.Errorf("Movie filename in /all: got %q, want %q", movieEntries[0].Name, "Movie.A.2024.mkv")
+	}
+	if movieEntries[0].File == nil {
+		t.Fatal("File entry in /all should have non-nil File pointer")
+	}
+
+	// /all/Show.B/ should list the series file (flat, no Season subdirs)
+	seriesEntries := tree.ListDir("/all/Show.B")
+	if len(seriesEntries) != 1 {
+		t.Fatalf("ListDir(/all/Show.B): got %d entries, want 1", len(seriesEntries))
+	}
+	if seriesEntries[0].Name != "Show.B.S01E01.mkv" {
+		t.Errorf("Series filename in /all: got %q, want %q", seriesEntries[0].Name, "Show.B.S01E01.mkv")
+	}
+
+	// Lookup in /all should work
+	f := tree.Lookup("/all/Movie.A.2024/Movie.A.2024.mkv")
+	if f == nil {
+		t.Fatal("Lookup in /all: expected file, got nil")
+	}
+	if f.FileID != "1" {
+		t.Errorf("Lookup FileID in /all: got %q, want %q", f.FileID, "1")
+	}
+}
+
+func TestBuildTree_AllDirDeduplicatesByContentKey(t *testing.T) {
+	// The same file appearing in two downloads with different IDs produces
+	// different content keys, so both appear. This test verifies that files
+	// with the SAME content key (same download, same file) are deduplicated.
+	// This can happen when a single download has both movie and anime files
+	// that map to the same content key.
+	downloads := []Download{
+		{
+			Kind: KindTorrent,
+			ID:   "100",
+			Name: "Movie.A.2024",
+			Files: []File{
+				{
+					DownloadKind: KindTorrent,
+					DownloadID:   "100",
+					FileID:       "1",
+					Name:         "Movie.A.2024.mkv",
+					Size:         2048,
+					MimeType:     "video/x-matroska",
+					MediaType:    MediaMovie,
+				},
+			},
+		},
+		{
+			// Different download with different ID → different content key,
+			// so this file is NOT deduplicated and appears separately.
+			Kind: KindTorrent,
+			ID:   "200",
+			Name: "Movie.A.2024",
+			Files: []File{
+				{
+					DownloadKind: KindTorrent,
+					DownloadID:   "200",
+					FileID:       "1",
+					Name:         "Movie.A.2024.mkv",
+					Size:         2048,
+					MimeType:     "video/x-matroska",
+					MediaType:    MediaMovie,
+				},
+			},
+		},
+	}
+
+	tree := BuildTree(downloads, true)
+
+	// Two different content keys → two entries in /all/Movie.A.2024/
+	entries := tree.ListDir("/all/Movie.A.2024")
+	if len(entries) != 2 {
+		t.Fatalf("ListDir(/all/Movie.A.2024): got %d entries, want 2 (different content keys)", len(entries))
+	}
+}
+
+func TestBuildTree_AllDirFiltersNonVideo(t *testing.T) {
+	downloads := []Download{
+		{
+			Kind: KindTorrent,
+			ID:   "100",
+			Name: "Mixed Content",
+			Files: []File{
+				{
+					DownloadKind: KindTorrent,
+					DownloadID:   "100",
+					FileID:       "1",
+					Name:         "video.mkv",
+					Size:         2048,
+					MimeType:     "video/x-matroska",
+					MediaType:    MediaMovie,
+				},
+				{
+					DownloadKind: KindTorrent,
+					DownloadID:   "100",
+					FileID:       "2",
+					Name:         "subtitle.srt",
+					Size:         50,
+					MimeType:     "application/x-subrip",
+					MediaType:    MediaMovie,
+				},
+			},
+		},
+	}
+
+	tree := BuildTree(downloads, true)
+
+	// /all/Mixed Content/ should only contain the video file
+	entries := tree.ListDir("/all/Mixed Content")
+	if len(entries) != 1 {
+		t.Fatalf("ListDir(/all/Mixed Content): got %d entries, want 1 (non-video filtered)", len(entries))
+	}
+	if entries[0].Name != "video.mkv" {
+		t.Errorf("Entry in /all: got %q, want %q", entries[0].Name, "video.mkv")
+	}
+}
+
+func TestBuildTree_AllDirRootListed(t *testing.T) {
+	downloads := []Download{
+		{
+			Kind: KindTorrent,
+			ID:   "100",
+			Name: "Movie",
+			Files: []File{
+				{
+					DownloadKind: KindTorrent,
+					DownloadID:   "100",
+					FileID:       "1",
+					Name:         "movie.mkv",
+					Size:         100,
+					MimeType:     "video/x-matroska",
+					MediaType:    MediaMovie,
+				},
+			},
+		},
+	}
+
+	tree := BuildTree(downloads, true)
+
+	// Root should list /all alongside /movies
+	rootEntries := tree.ListDir("/")
+	foundAll := false
+	for _, e := range rootEntries {
+		if e.Name == "all" {
+			foundAll = true
+			break
+		}
+	}
+	if !foundAll {
+		t.Error("ListDir(/): 'all' directory not found when allDir is enabled")
 	}
 }
 
@@ -675,7 +985,7 @@ func TestBuildTree_DirEntryHasNoFileForDirectories(t *testing.T) {
 		},
 	}
 
-	tree := BuildTree(downloads)
+	tree := BuildTree(downloads, false)
 
 	// Directory entries should have nil File
 	moviesEntries := tree.ListDir("/movies")

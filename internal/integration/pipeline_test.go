@@ -92,7 +92,7 @@ func TestFullPipeline_CatalogToStreamRead(t *testing.T) {
 	m := metrics.New()
 
 	// Create catalog and refresh.
-	cat := catalog.NewCatalog(tbClient, db, m)
+	cat := catalog.NewCatalog(tbClient, db, m, false)
 	ctx := context.Background()
 	if err := cat.Refresh(ctx); err != nil {
 		t.Fatalf("catalog refresh: %v", err)

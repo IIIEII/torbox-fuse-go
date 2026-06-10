@@ -92,7 +92,7 @@ func TestMountE2E(t *testing.T) {
 				},
 			},
 		},
-	})
+	}, false)
 
 	// Verify the tree looks right before mounting.
 	entries := tree.ListDir("/movies")
@@ -101,9 +101,8 @@ func TestMountE2E(t *testing.T) {
 	}
 	t.Logf("catalog tree entries under /movies: %v", dirEntryNames(entries))
 
-	// cleanTitle replaces dots/underscores with spaces, so the directory name
-	// becomes "Test Movie 2024" while the filename keeps its original dots.
-	movieFile := tree.Lookup("/movies/Test Movie 2024/Test.Movie.2024.mkv")
+	// Folder names preserve the original TorBox download name (with dots).
+	movieFile := tree.Lookup("/movies/Test.Movie.2024/Test.Movie.2024.mkv")
 	if movieFile == nil {
 		t.Fatal("movie file not found in catalog tree")
 	}
@@ -117,7 +116,7 @@ func TestMountE2E(t *testing.T) {
 	defer db.Close()
 
 	// ── Stream reader with mock CDN ──────────────────────────────────
-	rc := cache.NewRangeCache(256 * 1024 * 1024, nil)
+	rc := cache.NewRangeCache(256*1024*1024, nil)
 	cdnClient := stream.NewCDNClient(8, nil, 0)
 	permalinkBuilder := func(fileKey string) string {
 		return cdnServer.URL
@@ -133,10 +132,10 @@ func TestMountE2E(t *testing.T) {
 		PrefetchWindowMB:  16,
 		StreamMaxInflight: 2,
 		StreamConcurrency: 8,
-		AttrTimeoutSec:   1,
-		EntryTimeoutSec:  1,
-		UID:              uint32(os.Getuid()),
-		GID:              uint32(os.Getgid()),
+		AttrTimeoutSec:    1,
+		EntryTimeoutSec:   1,
+		UID:               uint32(os.Getuid()),
+		GID:               uint32(os.Getgid()),
 	}
 
 	// ── TorBox client (unused for streaming; permalinkBuilder replaces it) ──
@@ -198,7 +197,7 @@ func TestMountE2E(t *testing.T) {
 	}
 	foundMovieDir := false
 	for _, e := range dirEntries {
-		if e.Name() == "Test Movie 2024" {
+		if e.Name() == "Test.Movie.2024" {
 			foundMovieDir = true
 			break
 		}
@@ -208,9 +207,9 @@ func TestMountE2E(t *testing.T) {
 	}
 
 	// ── Verify file stat ──────────────────────────────────────────────
-	// cleanTitle replaces dots/underscores with spaces, so the directory
-	// name is "Test Movie 2024" while the filename keeps its dots.
-	filePath := filepath.Join(mountDir, "movies", "Test Movie 2024", "Test.Movie.2024.mkv")
+	// Folder names preserve the original TorBox download name (with dots).
+	// The directory name matches the download name "Test.Movie.2024".
+	filePath := filepath.Join(mountDir, "movies", "Test.Movie.2024", "Test.Movie.2024.mkv")
 	fi, err := os.Stat(filePath)
 	if err != nil {
 		t.Fatalf("Stat(%s): %v", filePath, err)

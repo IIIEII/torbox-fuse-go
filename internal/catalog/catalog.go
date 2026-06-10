@@ -28,6 +28,8 @@ type Catalog struct {
 	stateDB *state.DB
 	metrics *metrics.Metrics
 
+	allDirEnabled bool // whether to include the /all flat directory
+
 	tree       atomic.Value // stores *Tree
 	refreshing atomic.Bool
 
@@ -43,12 +45,14 @@ func NewCatalogFromTree(tree *Tree) *Catalog {
 }
 
 // NewCatalog creates a Catalog with the given dependencies. The initial tree
-// is empty; call Refresh to populate it.
-func NewCatalog(client Downloader, stateDB *state.DB, m *metrics.Metrics) *Catalog {
+// is empty; call Refresh to populate it. The allDirEnabled flag controls whether
+// the /all directory is included in the virtual filesystem tree.
+func NewCatalog(client Downloader, stateDB *state.DB, m *metrics.Metrics, allDirEnabled bool) *Catalog {
 	c := &Catalog{
-		client:  client,
-		stateDB: stateDB,
-		metrics: m,
+		client:        client,
+		stateDB:       stateDB,
+		metrics:       m,
+		allDirEnabled: allDirEnabled,
 	}
 	// Initialise with an empty tree so Tree() never returns nil.
 	c.tree.Store(&Tree{dirs: make(map[string][]DirEntry)})
@@ -98,7 +102,7 @@ func (c *Catalog) Refresh(ctx context.Context) error {
 	slog.Info("total downloads fetched", "count", len(allDownloads))
 
 	// Build the virtual filesystem tree.
-	tree := BuildTree(allDownloads)
+	tree := BuildTree(allDownloads, c.allDirEnabled)
 
 	// Walk all files in the tree and assign inodes + upsert file records.
 	var files []state.FileRecord

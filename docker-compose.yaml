@@ -22,6 +22,7 @@ services:
       CATALOG_REFRESH_INTERVAL: 3h
       METRICS_LISTEN_ADDR: "0.0.0.0:9080"
       STATE_DB_PATH: /config/state.db
+      # FUSE_ALL_DIR_ENABLED: "false"
       LOG_LEVEL: info
     volumes:
       - torbox-config:/config

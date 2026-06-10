@@ -54,6 +54,9 @@ func NewRootNode(cat *catalog.Catalog, stateDB *state.DB, streamer *stream.Strea
 func (r *RootNode) OnAdd(ctx context.Context) {
 	r.addCategoryDir(ctx, "movies", "/movies")
 	r.addCategoryDir(ctx, "series", "/series")
+	if r.cfg.AllDirEnabled {
+		r.addCategoryDir(ctx, "all", "/all")
+	}
 }
 
 // addCategoryDir creates a top-level category directory (movies/series) and
@@ -161,7 +164,11 @@ func (r *RootNode) addFileNode(ctx context.Context, parent *fs.Inode, name, cata
 // completes.
 func (r *RootNode) SyncTree(ctx context.Context) {
 	newTree := r.cat.Tree()
-	for _, catPath := range []string{"/movies", "/series"} {
+	catPaths := []string{"/movies", "/series"}
+	if r.cfg.AllDirEnabled {
+		catPaths = append(catPaths, "/all")
+	}
+	for _, catPath := range catPaths {
 		name := path.Base(catPath)
 		child := r.GetChild(name)
 		if child == nil {

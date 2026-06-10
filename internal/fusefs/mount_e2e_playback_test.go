@@ -63,7 +63,7 @@ func mountFUSEForTest(t *testing.T, dataSize int, cdnHandler http.HandlerFunc) (
 				},
 			},
 		},
-	})
+	}, false)
 
 	stateDir := t.TempDir()
 	db, err := state.Open(filepath.Join(stateDir, "state.db"))
@@ -71,7 +71,7 @@ func mountFUSEForTest(t *testing.T, dataSize int, cdnHandler http.HandlerFunc) (
 		t.Fatalf("state.Open: %v", err)
 	}
 
-	rc := cache.NewRangeCache(256 * 1024 * 1024, nil)
+	rc := cache.NewRangeCache(256*1024*1024, nil)
 	cdnClient := stream.NewCDNClient(8, nil, 0)
 	permalinkBuilder := func(fileKey string) string {
 		return cdnServer.URL
@@ -85,10 +85,10 @@ func mountFUSEForTest(t *testing.T, dataSize int, cdnHandler http.HandlerFunc) (
 		PrefetchWindowMB:  16,
 		StreamMaxInflight: 2,
 		StreamConcurrency: 8,
-		AttrTimeoutSec:   1,
-		EntryTimeoutSec:  1,
-		UID:              uint32(os.Getuid()),
-		GID:              uint32(os.Getgid()),
+		AttrTimeoutSec:    1,
+		EntryTimeoutSec:   1,
+		UID:               uint32(os.Getuid()),
+		GID:               uint32(os.Getgid()),
 	}
 
 	tbClient := torbox.NewClient(&e2eTorboxConfig{apiKey: "test", baseURL: "http://localhost:0"})
@@ -148,7 +148,7 @@ func mountFUSEForTest(t *testing.T, dataSize int, cdnHandler http.HandlerFunc) (
 
 // movieFilePath returns the path to the test movie file within the mount.
 func movieFilePath(mountDir string) string {
-	return filepath.Join(mountDir, "movies", "Test Movie 2024", "Test.Movie.2024.mkv")
+	return filepath.Join(mountDir, "movies", "Test.Movie.2024", "Test.Movie.2024.mkv")
 }
 
 // 8.1 Playback start from middle: seek to 50% offset via FUSE, read data,

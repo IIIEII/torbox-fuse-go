@@ -34,10 +34,16 @@ type Tree struct {
 //   - Season number is parsed from the filename; default is Season 1.
 //   - Untagged files default to movie.
 //   - Directory entries are sorted alphabetically.
-func BuildTree(downloads []Download) *Tree {
+//   - If allDir is true, a /all directory is added containing every video file
+//     under /all/<title>/<filename>, deduplicating files that appear in both
+//     /movies and /series.
+func BuildTree(downloads []Download, allDir bool) *Tree {
 	t := &Tree{dirs: make(map[string][]DirEntry)}
 	for i := range downloads {
 		t.addDownload(&downloads[i])
+	}
+	if allDir {
+		t.addAllDir(downloads)
 	}
 	t.buildParentDirs()
 	// Sort every directory's entries alphabetically by name.
@@ -168,17 +174,48 @@ func (t *Tree) buildParentDirs() {
 	}
 }
 
+// addAllDir creates the /all directory containing every video file under
+// /all/<title>/<filename>, where title is the same download title used in
+// /movies and /series. Files that appear in both categories (same ContentKey)
+// are included only once.
+func (t *Tree) addAllDir(downloads []Download) {
+	seen := make(map[string]bool) // deduplicate by content key
+	for i := range downloads {
+		d := &downloads[i]
+		title := downloadTitle(d)
+		for j := range d.Files {
+			f := &d.Files[j]
+			if !strings.HasPrefix(f.MimeType, "video/") {
+				continue
+			}
+			key := f.ContentKey()
+			if seen[key] {
+				continue
+			}
+			seen[key] = true
+
+			dirPath := path.Join("/all", title)
+			filename := path.Base(f.Name)
+			t.dirs[dirPath] = append(t.dirs[dirPath], DirEntry{
+				Name: filename,
+				File: f,
+			})
+		}
+	}
+}
+
 // downloadTitle determines the display title for a download.
 // If the download name looks like a hex hash (16+ hex characters), the first
-// path segment from the first file's Name is used instead (preserving dots).
-// Otherwise dots and underscores in the name are replaced with spaces.
+// path segment from the first file's Name is used instead.
+// Otherwise the download name is used as-is, preserving dots and underscores
+// so that folder names match the original TorBox names exactly.
 func downloadTitle(d *Download) string {
 	if hashRe.MatchString(d.Name) && len(d.Files) > 0 {
 		if seg := firstPathSegment(d.Files[0].Name); seg != "" {
 			return seg
 		}
 	}
-	return cleanTitle(d.Name)
+	return d.Name
 }
 
 // firstPathSegment returns the first non-empty segment of a path, unmodified.
@@ -190,13 +227,6 @@ func firstPathSegment(p string) string {
 		}
 	}
 	return ""
-}
-
-// cleanTitle replaces dots and underscores with spaces and trims whitespace.
-func cleanTitle(s string) string {
-	s = strings.ReplaceAll(s, ".", " ")
-	s = strings.ReplaceAll(s, "_", " ")
-	return strings.TrimSpace(s)
 }
 
 // extractSeason parses a season number from a filename.
