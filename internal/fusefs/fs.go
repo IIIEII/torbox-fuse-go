@@ -369,7 +369,7 @@ func (f *FileNode) Getattr(ctx context.Context, fh fs.FileHandle, out *fuse.Attr
 	out.Gid = f.cfg.GID
 	out.Nlink = 1
 	out.Blksize = 4096
-	out.Blocks = (f.size + 4095) / 4096
+	out.Blocks = (f.size + 511) / 512
 	return 0
 }
 
