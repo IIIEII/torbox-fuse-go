@@ -252,6 +252,64 @@ h1 { font-size: 1.5rem; font-weight: 700; margin-bottom: 4px; color: #f1f5f9; }
   border-radius: 50%;
 }
 
+/* Hidden downloads section */
+.hidden-entry {
+  background: #1e293b;
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin-bottom: 6px;
+  border: 1px solid #334155;
+  transition: border-color 0.2s;
+}
+.hidden-entry:hover { border-color: #475569; }
+.hidden-entry.fully-hidden { border-left: 3px solid #ef4444; }
+.hidden-entry.partially-hidden { border-left: 3px solid #eab308; }
+
+.hidden-name {
+  font-size: 0.8rem;
+  font-weight: 600;
+  color: #f1f5f9;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  margin-bottom: 4px;
+}
+.hidden-meta {
+  font-size: 0.7rem;
+  color: #64748b;
+  margin-bottom: 6px;
+}
+.hidden-actions {
+  display: flex;
+  gap: 6px;
+}
+.btn {
+  padding: 4px 10px;
+  border-radius: 4px;
+  border: none;
+  font-size: 0.7rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: opacity 0.2s;
+}
+.btn:hover { opacity: 0.8; }
+.btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.btn-unhide { background: #3b82f6; color: #fff; }
+.btn-delete { background: #ef4444; color: #fff; }
+
+.kind-badge {
+  display: inline-block;
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 0.6rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  margin-right: 4px;
+}
+.kind-torrent { background: #1e3a5f; color: #93c5fd; }
+.kind-usenet { background: #3f1e3f; color: #e879f9; }
+.kind-webdl { background: #1e3f2e; color: #6ee7b7; }
+
 /* Responsive */
 @media (max-width: 600px) {
   body { padding: 8px; }

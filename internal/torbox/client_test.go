@@ -204,3 +204,62 @@ func TestSkipsUncached(t *testing.T) {
 		t.Errorf("expected 0 downloads (uncached), got %d", len(downloads))
 	}
 }
+
+func TestDeleteDownload(t *testing.T) {
+	tests := []struct {
+		kind     catalog.DownloadKind
+		wantPath string
+	}{
+		{catalog.KindTorrent, "/torrents/deletetorrent"},
+		{catalog.KindUsenet, "/usenet/deleteusenet"},
+		{catalog.KindWebDL, "/webdl/deletewebdownload"},
+	}
+	for _, tt := range tests {
+		t.Run(string(tt.kind), func(t *testing.T) {
+			var gotPath string
+			var gotID string
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				gotID = r.URL.Query().Get("id")
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(map[string]interface{}{
+					"success": true,
+				})
+			}))
+			defer ts.Close()
+
+			cfg := &testConfig{baseURL: ts.URL}
+			client := NewClient(cfg)
+
+			err := client.DeleteDownload(context.Background(), tt.kind, "12345")
+			if err != nil {
+				t.Fatalf("DeleteDownload returned error: %v", err)
+			}
+			if gotPath != tt.wantPath {
+				t.Errorf("path = %q, want %q", gotPath, tt.wantPath)
+			}
+			if gotID != "12345" {
+				t.Errorf("id = %q, want %q", gotID, "12345")
+			}
+		})
+	}
+}
+
+func TestDeleteDownload_NotFound(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+		json.NewEncoder(w).Encode(map[string]interface{}{
+			"success": false,
+			"detail":  "torrent not found",
+		})
+	}))
+	defer ts.Close()
+
+	cfg := &testConfig{baseURL: ts.URL}
+	client := NewClient(cfg)
+
+	err := client.DeleteDownload(context.Background(), catalog.KindTorrent, "99999")
+	if err == nil {
+		t.Fatal("expected error for 404 response")
+	}
+}

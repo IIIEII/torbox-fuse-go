@@ -4,12 +4,15 @@
 package dashboard
 
 import (
+	"context"
+	"fmt"
 	"log/slog"
 	"sort"
 	"sync"
 	"time"
 
 	"github.com/iiieii/torbox-fuse-go/internal/cache"
+	"github.com/iiieii/torbox-fuse-go/internal/catalog"
 	"github.com/iiieii/torbox-fuse-go/internal/metrics"
 	"github.com/iiieii/torbox-fuse-go/internal/state"
 	"github.com/iiieii/torbox-fuse-go/internal/stream"
@@ -17,10 +20,11 @@ import (
 
 // DashboardSnapshot is the JSON-serializable state snapshot sent to the frontend.
 type DashboardSnapshot struct {
-	Timestamp      string               `json:"timestamp"`
-	Summary        SummaryInfo          `json:"summary"`
-	Active         []FileSnapshotJSON   `json:"active"`
-	RecentlyClosed []ClosedFileInfoJSON `json:"recently_closed"`
+	Timestamp       string               `json:"timestamp"`
+	Summary         SummaryInfo          `json:"summary"`
+	Active          []FileSnapshotJSON   `json:"active"`
+	RecentlyClosed  []ClosedFileInfoJSON `json:"recently_closed"`
+	HiddenDownloads []HiddenDownloadJSON `json:"hidden_downloads"`
 }
 
 // SummaryInfo holds global resource usage stats.
@@ -54,23 +58,50 @@ type ClosedFileInfoJSON struct {
 	ClosedAt string `json:"closed_at"`
 }
 
+// HiddenDownloadJSON is the JSON representation of a download with hidden files.
+type HiddenDownloadJSON struct {
+	DownloadKind string `json:"download_kind"`
+	DownloadID   string `json:"download_id"`
+	DownloadName string `json:"download_name"`
+	HiddenCount  int    `json:"hidden_count"`
+	TotalCount   int    `json:"total_count"`
+	TotalSize    int64  `json:"total_size"`
+	FullyHidden  bool   `json:"fully_hidden"`
+}
+
+// Deleter is the interface used by the Dashboard to delete downloads from TorBox.
+type Deleter interface {
+	DeleteDownload(ctx context.Context, kind catalog.DownloadKind, downloadID string) error
+}
+
+// Refresher is the interface used by the Dashboard to trigger a catalog refresh
+// after unhiding or deleting files.
+type Refresher interface {
+	Refresh(ctx context.Context) error
+}
+
 // Dashboard collects snapshots from the streaming subsystem and resolves
-// file keys to human-readable paths.
+// file keys to human-readable paths. It also provides methods to unhide
+// files and delete downloads from TorBox.
 type Dashboard struct {
 	streamer  *stream.StreamReader
 	cache     *cache.RangeCache
 	stateDB   *state.DB
 	metrics   *metrics.Metrics
+	deleter   Deleter
+	refresher Refresher
 	pathCache sync.Map // fileKey -> resolved path (avoids repeated DB lookups)
 }
 
 // New creates a Dashboard with the given dependencies.
-func New(streamer *stream.StreamReader, cache *cache.RangeCache, stateDB *state.DB, m *metrics.Metrics) *Dashboard {
+func New(streamer *stream.StreamReader, cache *cache.RangeCache, stateDB *state.DB, m *metrics.Metrics, deleter Deleter, refresher Refresher) *Dashboard {
 	return &Dashboard{
-		streamer: streamer,
-		cache:    cache,
-		stateDB:  stateDB,
-		metrics:  m,
+		streamer:  streamer,
+		cache:     cache,
+		stateDB:   stateDB,
+		metrics:   m,
+		deleter:   deleter,
+		refresher: refresher,
 	}
 }
 
@@ -141,12 +172,73 @@ func (d *Dashboard) Snapshot() *DashboardSnapshot {
 		summary.CacheEntries = d.metrics.CacheEntries.Load()
 	}
 
-	return &DashboardSnapshot{
-		Timestamp:      time.Now().UTC().Format(time.RFC3339),
-		Summary:        summary,
-		Active:         activeJSON,
-		RecentlyClosed: closedJSON,
+	// Build hidden downloads section.
+	var hiddenJSON []HiddenDownloadJSON
+	if d.stateDB != nil {
+		hiddens, err := d.stateDB.ListHiddenDownloads()
+		if err != nil {
+			slog.Debug("dashboard: list hidden downloads", "err", err)
+		} else {
+			for _, h := range hiddens {
+				hiddenJSON = append(hiddenJSON, HiddenDownloadJSON{
+					DownloadKind: h.DownloadKind,
+					DownloadID:   h.DownloadID,
+					DownloadName: h.DownloadName,
+					HiddenCount:  h.HiddenCount,
+					TotalCount:   h.TotalCount,
+					TotalSize:    h.TotalSize,
+					FullyHidden:  h.HiddenCount >= h.TotalCount,
+				})
+			}
+		}
 	}
+
+	return &DashboardSnapshot{
+		Timestamp:       time.Now().UTC().Format(time.RFC3339),
+		Summary:         summary,
+		Active:          activeJSON,
+		RecentlyClosed:  closedJSON,
+		HiddenDownloads: hiddenJSON,
+	}
+}
+
+// UnhideDownload restores all hidden files for a download and refreshes the catalog.
+func (d *Dashboard) UnhideDownload(ctx context.Context, kind, downloadID string) error {
+	if d.stateDB == nil {
+		return fmt.Errorf("state database not available")
+	}
+	if err := d.stateDB.UnhideDownload(kind, downloadID); err != nil {
+		return fmt.Errorf("unhide download: %w", err)
+	}
+	if d.refresher != nil {
+		if err := d.refresher.Refresh(ctx); err != nil {
+			slog.Warn("dashboard: refresh after unhide", "err", err)
+		}
+	}
+	return nil
+}
+
+// DeleteDownload removes a download from TorBox after all its files are hidden.
+func (d *Dashboard) DeleteDownload(ctx context.Context, kind, downloadID string) error {
+	if d.deleter == nil {
+		return fmt.Errorf("delete not available")
+	}
+	downloadKind := catalog.DownloadKind(kind)
+	if err := d.deleter.DeleteDownload(ctx, downloadKind, downloadID); err != nil {
+		return fmt.Errorf("delete download from torbox: %w", err)
+	}
+	// After successful deletion, remove hidden file records for this download.
+	if d.stateDB != nil {
+		if err := d.stateDB.UnhideDownload(kind, downloadID); err != nil {
+			slog.Warn("dashboard: cleanup hidden records after delete", "err", err)
+		}
+	}
+	if d.refresher != nil {
+		if err := d.refresher.Refresh(ctx); err != nil {
+			slog.Warn("dashboard: refresh after delete", "err", err)
+		}
+	}
+	return nil
 }
 
 // fileSnapshotToJSON converts a stream.FileSnapshot to a JSON-friendly struct.

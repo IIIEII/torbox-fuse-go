@@ -137,6 +137,14 @@ func (c *Catalog) Refresh(ctx context.Context) error {
 		return fmt.Errorf("upsert file records: %w", err)
 	}
 
+	// Remove hidden files from the tree before exposing it to FUSE.
+	hiddenSet, err := c.stateDB.HiddenSet()
+	if err != nil {
+		slog.Warn("load hidden set", "err", err)
+	} else if len(hiddenSet) > 0 {
+		tree = ApplyHides(tree, hiddenSet)
+	}
+
 	// Swap tree atomically.
 	c.tree.Store(tree)
 
@@ -167,6 +175,16 @@ func (c *Catalog) LoadFromDB(ctx context.Context) error {
 	}
 
 	tree := BuildTreeFromDB(records, c.allDirEnabled)
+
+	// Remove hidden files from the tree before exposing it to FUSE.
+	hiddenSet, err := c.stateDB.HiddenSet()
+	if err != nil {
+		slog.Warn("load hidden set", "err", err)
+	}
+	if len(hiddenSet) > 0 {
+		tree = ApplyHides(tree, hiddenSet)
+	}
+
 	c.tree.Store(tree)
 
 	if c.onRefresh != nil {

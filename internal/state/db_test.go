@@ -280,6 +280,237 @@ func TestLookupInode_NotFound(t *testing.T) {
 	}
 }
 
+func TestHideFile(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	// Insert a file record first.
+	records := []FileRecord{
+		{ContentKey: "torrent:1:10", DownloadKind: "torrent", DownloadID: "1", FileID: "10", Path: "/movies/Test/Test.mkv", Size: 1024},
+	}
+	if err := db.UpsertFiles(records); err != nil {
+		t.Fatalf("UpsertFiles: %v", err)
+	}
+
+	// File is not hidden initially.
+	hidden, err := db.IsHidden("torrent:1:10")
+	if err != nil {
+		t.Fatalf("IsHidden: %v", err)
+	}
+	if hidden {
+		t.Error("file should not be hidden initially")
+	}
+
+	// Hide the file.
+	if err := db.HideFile("torrent:1:10"); err != nil {
+		t.Fatalf("HideFile: %v", err)
+	}
+
+	hidden, err = db.IsHidden("torrent:1:10")
+	if err != nil {
+		t.Fatalf("IsHidden after hide: %v", err)
+	}
+	if !hidden {
+		t.Error("file should be hidden after HideFile")
+	}
+
+	// HideFile is idempotent.
+	if err := db.HideFile("torrent:1:10"); err != nil {
+		t.Fatalf("HideFile idempotent: %v", err)
+	}
+}
+
+func TestUnhideFile(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	if err := db.HideFile("torrent:1:10"); err != nil {
+		t.Fatalf("HideFile: %v", err)
+	}
+
+	if err := db.UnhideFile("torrent:1:10"); err != nil {
+		t.Fatalf("UnhideFile: %v", err)
+	}
+
+	hidden, err := db.IsHidden("torrent:1:10")
+	if err != nil {
+		t.Fatalf("IsHidden after unhide: %v", err)
+	}
+	if hidden {
+		t.Error("file should not be hidden after UnhideFile")
+	}
+
+	// Unhide non-existent key is a no-op.
+	if err := db.UnhideFile("nonexistent"); err != nil {
+		t.Fatalf("UnhideFile nonexistent: %v", err)
+	}
+}
+
+func TestUnhideDownload(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	// Hide files from the same download.
+	if err := db.HideFile("torrent:1:10"); err != nil {
+		t.Fatalf("HideFile: %v", err)
+	}
+	if err := db.HideFile("torrent:1:20"); err != nil {
+		t.Fatalf("HideFile: %v", err)
+	}
+	// Also hide a file from a different download.
+	if err := db.HideFile("usenet:2:30"); err != nil {
+		t.Fatalf("HideFile: %v", err)
+	}
+
+	// Unhide all files for download torrent:1.
+	if err := db.UnhideDownload("torrent", "1"); err != nil {
+		t.Fatalf("UnhideDownload: %v", err)
+	}
+
+	// torrent:1 files should be unhidden.
+	if hidden, _ := db.IsHidden("torrent:1:10"); hidden {
+		t.Error("torrent:1:10 should be unhidden")
+	}
+	if hidden, _ := db.IsHidden("torrent:1:20"); hidden {
+		t.Error("torrent:1:20 should be unhidden")
+	}
+	// usenet:2:30 should still be hidden.
+	if hidden, _ := db.IsHidden("usenet:2:30"); !hidden {
+		t.Error("usenet:2:30 should still be hidden")
+	}
+}
+
+func TestIsDownloadFullyHidden(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	// Insert file records for a download with 2 files.
+	records := []FileRecord{
+		{ContentKey: "torrent:1:10", DownloadKind: "torrent", DownloadID: "1", FileID: "10", Path: "/movies/T/T1.mkv", Size: 1000},
+		{ContentKey: "torrent:1:20", DownloadKind: "torrent", DownloadID: "1", FileID: "20", Path: "/movies/T/T2.mkv", Size: 2000},
+	}
+	if err := db.UpsertFiles(records); err != nil {
+		t.Fatalf("UpsertFiles: %v", err)
+	}
+
+	// Not hidden at all.
+	fully, err := db.IsDownloadFullyHidden("torrent", "1")
+	if err != nil {
+		t.Fatalf("IsDownloadFullyHidden: %v", err)
+	}
+	if fully {
+		t.Error("download should not be fully hidden when no files are hidden")
+	}
+
+	// Hide one file — not fully hidden.
+	if err := db.HideFile("torrent:1:10"); err != nil {
+		t.Fatalf("HideFile: %v", err)
+	}
+	fully, err = db.IsDownloadFullyHidden("torrent", "1")
+	if err != nil {
+		t.Fatalf("IsDownloadFullyHidden partial: %v", err)
+	}
+	if fully {
+		t.Error("download should not be fully hidden when only 1 of 2 files is hidden")
+	}
+
+	// Hide second file — now fully hidden.
+	if err := db.HideFile("torrent:1:20"); err != nil {
+		t.Fatalf("HideFile: %v", err)
+	}
+	fully, err = db.IsDownloadFullyHidden("torrent", "1")
+	if err != nil {
+		t.Fatalf("IsDownloadFullyHidden full: %v", err)
+	}
+	if !fully {
+		t.Error("download should be fully hidden when all files are hidden")
+	}
+
+	// Non-existent download is not fully hidden.
+	fully, err = db.IsDownloadFullyHidden("torrent", "999")
+	if err != nil {
+		t.Fatalf("IsDownloadFullyHidden nonexistent: %v", err)
+	}
+	if fully {
+		t.Error("non-existent download should not be fully hidden")
+	}
+}
+
+func TestListHiddenFiles(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	// Empty — no hidden files.
+	files, err := db.ListHiddenFiles()
+	if err != nil {
+		t.Fatalf("ListHiddenFiles empty: %v", err)
+	}
+	if len(files) != 0 {
+		t.Errorf("ListHiddenFiles empty: got %d, want 0", len(files))
+	}
+
+	// Insert and hide files.
+	records := []FileRecord{
+		{ContentKey: "torrent:1:10", DownloadKind: "torrent", DownloadID: "1", FileID: "10", Path: "/movies/A/A.mkv", Size: 1000},
+		{ContentKey: "torrent:1:20", DownloadKind: "torrent", DownloadID: "1", FileID: "20", Path: "/movies/A/B.mkv", Size: 2000},
+	}
+	if err := db.UpsertFiles(records); err != nil {
+		t.Fatalf("UpsertFiles: %v", err)
+	}
+	if err := db.HideFile("torrent:1:10"); err != nil {
+		t.Fatalf("HideFile: %v", err)
+	}
+
+	files, err = db.ListHiddenFiles()
+	if err != nil {
+		t.Fatalf("ListHiddenFiles: %v", err)
+	}
+	if len(files) != 1 {
+		t.Fatalf("ListHiddenFiles: got %d, want 1", len(files))
+	}
+	if files[0].ContentKey != "torrent:1:10" {
+		t.Errorf("ContentKey: got %q, want %q", files[0].ContentKey, "torrent:1:10")
+	}
+}
+
+func TestListHiddenDownloads(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	// Insert two downloads, hide some files.
+	records := []FileRecord{
+		{ContentKey: "torrent:1:10", DownloadKind: "torrent", DownloadID: "1", FileID: "10", Path: "/movies/Film/Film.mkv", Size: 1000},
+		{ContentKey: "torrent:1:20", DownloadKind: "torrent", DownloadID: "1", FileID: "20", Path: "/movies/Film/Extra.mkv", Size: 500},
+		{ContentKey: "usenet:2:30", DownloadKind: "usenet", DownloadID: "2", FileID: "30", Path: "/series/Show/Show.mkv", Size: 3000},
+	}
+	if err := db.UpsertFiles(records); err != nil {
+		t.Fatalf("UpsertFiles: %v", err)
+	}
+
+	// Hide one file from download 1, making it partially hidden.
+	if err := db.HideFile("torrent:1:20"); err != nil {
+		t.Fatalf("HideFile: %v", err)
+	}
+
+	downloads, err := db.ListHiddenDownloads()
+	if err != nil {
+		t.Fatalf("ListHiddenDownloads: %v", err)
+	}
+	if len(downloads) != 1 {
+		t.Fatalf("ListHiddenDownloads: got %d downloads, want 1", len(downloads))
+	}
+	d := downloads[0]
+	if d.DownloadKind != "torrent" || d.DownloadID != "1" {
+		t.Errorf("got %s:%s, want torrent:1", d.DownloadKind, d.DownloadID)
+	}
+	if d.HiddenCount != 1 {
+		t.Errorf("HiddenCount: got %d, want 1", d.HiddenCount)
+	}
+	if d.TotalCount != 2 {
+		t.Errorf("TotalCount: got %d, want 2", d.TotalCount)
+	}
+}
+
 // openTestDB creates a DB in a temp directory and registers cleanup.
 func openTestDB(t *testing.T) *DB {
 	t.Helper()

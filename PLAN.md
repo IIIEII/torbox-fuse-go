@@ -1,149 +1,251 @@
-# Plan: Fast Startup from DB Cache
+# Plan: Writable FUSE with Hide/Delete & Dashboard Undo
 
 ## Problem
 
-On restart, the app blocks on `cat.Refresh(ctx)` — a full API round-trip — before
-the FUSE mount shows any files. If the TorBox API is slow or down, the app exits
-with `os.Exit(1)` and the mount is completely empty.
+Users want to delete files from the FUSE mount and manage downloads. The design
+simplifies to: **Unlink always hides (soft-delete)**. The dashboard shows which
+downloads have hidden files and lets the user either **restore** (unhide) or
+**permanently delete from TorBox**.
 
-## What we have
+## Key simplification
 
-The SQLite `files` table already stores everything needed to build the tree:
-- `content_key` (kind:downloadID:fileID)
-- `download_kind`, `download_id`, `file_id`
-- `path` (full virtual path like `/movies/The Matrix/film.mkv`)
-- `size`
+There are **two distinct actions** and the user decides which one:
 
-The `inodes` table already stores stable inode assignments.
+1. **Hide** (`rm` in FUSE) — removes the file from the virtual tree but does NOT
+   touch TorBox. Reversible instantly via dashboard "Unhide" button.
+2. **Delete from TorBox** (dashboard button) — permanently removes the download
+   from TorBox via API. This is an explicit, separate action with confirmation.
 
-## Approach
+This means:
+- No auto-delete when "all files hidden"
+- No need to store magnet/hash for re-download
+- No complex "partially hidden" → "fully deleted" transitions
+- Dashboard clearly distinguishes "hidden" from "deleted from TorBox"
 
-**Load tree from DB first, mount immediately, then refresh from API in background.**
+## Architecture
 
-### Step 1 — Add `ListFiles` to `state.DB`
+### 1. Hidden files model
 
-New method that reads all file records from the `files` table:
+A `hidden_files` table in SQLite tracks which content keys are hidden.
+Hidden files are filtered from the FUSE tree on every tree build/refresh.
 
-```go
-func (db *DB) ListFiles() ([]FileRecord, error)
+```sql
+CREATE TABLE IF NOT EXISTS hidden_files (
+    content_key TEXT PRIMARY KEY,
+    hidden_at   TEXT NOT NULL
+);
 ```
 
-Returns all rows. Empty slice (not error) if table is empty (first run).
+### 2. Deletion log
 
-### Step 2 — Add `BuildTreeFromDB` to `catalog`
+A `deletions` table records downloads that were deleted from TorBox via the
+dashboard. This is purely for the dashboard UI — to show "you deleted X on date Y".
+There is no "restore from TorBox" — once deleted, it's gone from TorBox.
 
-New function that converts `[]state.FileRecord` → `catalog.Tree`:
-
-```go
-func BuildTreeFromDB(records []state.FileRecord, allDir bool) *Tree
+```sql
+CREATE TABLE IF NOT EXISTS deletions (
+    download_key  TEXT PRIMARY KEY,  -- "kind:downloadID"
+    download_kind TEXT NOT NULL,
+    download_id   TEXT NOT NULL,
+    download_name TEXT NOT NULL,
+    file_count    INTEGER NOT NULL,
+    total_size    INTEGER NOT NULL,
+    deleted_at    TEXT NOT NULL
+);
 ```
 
-Logic: parse each record's `path` to reconstruct the directory structure.
-Since `path` already contains the full virtual path (e.g. `/movies/The Matrix/film.mkv`),
-we can directly populate `Tree.dirs` without re-classifying media types.
+### 3. Component changes
 
-For each record:
-- `dirPath = path.Dir(record.Path)`
-- `fileName = path.Base(record.Path)`
-- Build `DirEntry{Name: fileName, File: &File{...}}` from DB fields
-- Call `buildParentDirs()` and sort, same as `BuildTree`
+#### `internal/state/db.go`
 
-The `MimeType` field is not stored in DB — it's only used for the `video/`
-filter in `BuildTree`. Since we only ever stored video files (the filter ran
-before upsert), all DB records are already video. We set `MimeType = "video/x-matroska"`
-as a placeholder — it's never read back at FUSE level.
+New methods:
+- `HideFile(contentKey string) error` — insert into `hidden_files`
+- `UnhideFile(contentKey string) error` — remove from `hidden_files`
+- `IsHidden(contentKey string) (bool, error)` — check if hidden
+- `ListHiddenFiles() ([]FileRecord, error)` — all hidden file records
+- `UnhideAllForDownload(downloadKind, downloadID string) error` — clear hides for a download
+- `IsDownloadFullyHidden(downloadKind, downloadID string) (bool, error)` — all video files hidden?
+- `RecordDeletion(kind, id, name string, fileCount int, totalSize int64) error`
+- `ListDeletions(limit int) ([]DeletionRecord, error)` — for dashboard
+- `ClearDeletion(downloadKey string) error` — remove deletion record (forget)
+- `ClearHiddenForDownload(downloadKind, downloadID string) error` — unhide all files of a download
 
-`MediaType` is also not stored — but the path already encodes the classification
-(`/movies/...` vs `/series/...`). We don't need to reconstruct it; the only
-consumer is `BuildTree.addDownload()` which we're bypassing entirely.
-
-### Step 3 — Add `LoadFromDB` method to `Catalog`
-
+New types:
 ```go
-func (c *Catalog) LoadFromDB(ctx context.Context) error
-```
-
-Reads all files from DB, builds tree via `BuildTreeFromDB`, swaps it atomically,
-and triggers `onRefresh` callback. Returns nil if DB is empty (first run).
-
-### Step 4 — Change startup sequence in `main.go`
-
-**Before:**
-```go
-// Block until API responds — mount is empty until this succeeds
-if err := cat.Refresh(ctx); err != nil {
-    slog.Error("initial catalog refresh", "err", err)
-    os.Exit(1)
+type DeletionRecord struct {
+    DownloadKey  string
+    DownloadKind string
+    DownloadID   string
+    DownloadName string
+    FileCount    int
+    TotalSize    int64
+    DeletedAt    string
 }
 ```
 
-**After:**
+#### `internal/catalog/catalog.go`
+
+- Add `ApplyHides(tree *Tree, db *state.DB) *Tree` — filters hidden files from the tree.
+  For each `DirEntry` with a `File`, check `IsHidden(contentKey)`. If hidden, remove entry.
+  Remove empty directories after filtering.
+- Modify `Refresh` and `LoadFromDB` to call `ApplyHides` before tree swap.
+
+#### `internal/catalog/tree.go` or `tree_from_db.go`
+
+- Add `FilterHidden(keys map[string]bool) *Tree` method on `*Tree` — returns a new
+  tree with hidden files removed and empty directories pruned.
+
+#### `internal/torbox/client.go`
+
+- Add `DeleteDownload(ctx context.Context, kind catalog.DownloadKind, downloadID string) error`
+  Maps to:
+  - `POST /torrents/deletetorrent?id={downloadID}` for torrents
+  - `POST /usenet/deleteusenet?id={downloadID}` for usenet
+  - `POST /webdl/deletewebdownload?id={downloadID}` for webdl
+
+#### `internal/fusefs/fs.go`
+
+When `cfg.Writable` is true:
+- `DirNode.Unlink(ctx, name)` → look up child `FileNode`, get `contentKey`,
+  call `stateDB.HideFile(contentKey)`, remove inode from tree via `parent.RmChild(name)`.
+  Log the action. **Does NOT call TorBox delete API.**
+- `DirNode.Rmdir(ctx, name)` → look up all `FileNode` children in that directory,
+  hide each one. Remove directory inode from tree.
+  Log the action. **Does NOT call TorBox delete API.**
+
+When `cfg.Writable` is false (default): return `syscall.EROFS` as before.
+
+RootNode needs access to `stateDB` for `HideFile` calls. It already has it.
+
+#### `internal/config/config.go`
+
+Add `Writable bool` field, env `FUSE_WRITABLE` (default: `false`).
+
+#### `internal/dashboard/dashboard.go`
+
+Add to `DashboardSnapshot`:
 ```go
-// 1. Load cached tree from DB (instant, no network)
-if err := cat.LoadFromDB(ctx); err != nil {
-    slog.Warn("load from db", "err", err) // non-fatal
-} else {
-    slog.Info("loaded catalog from db cache")
+type HiddenDownloadJSON struct {
+    DownloadKey  string   `json:"download_key"`   // "torrent:12345"
+    DownloadName string  `json:"download_name"`
+    HiddenFiles  []HiddenFileJSON `json:"hidden_files"`
+    TotalFiles   int      `json:"total_files"`    // all video files in download
+    AllHidden    bool     `json:"all_hidden"`      // true if every video file is hidden
 }
 
-// 2. Mount FUSE immediately — files visible right away
-root := fusefs.NewRootNode(cat, stateDB, streamer, cfg, tbClient)
-cat.SetOnRefresh(func() { root.SyncTree(context.Background()) })
+type HiddenFileJSON struct {
+    ContentKey string `json:"content_key"`
+    FilePath   string `json:"file_path"`
+    FileSize   int64  `json:"file_size"`
+    HiddenAt   string `json:"hidden_at"`
+}
 
-// 3. Background: refresh from API (replaces stale DB data)
-go func() {
-    slog.Info("background catalog refresh from API")
-    if err := cat.Refresh(ctx); err != nil {
-        slog.Warn("background catalog refresh", "err", err) // non-fatal
-    }
-}()
+type DeletionRecordJSON struct {
+    DownloadKey  string `json:"download_key"`
+    DownloadName string `json:"download_name"`
+    FileCount    int    `json:"file_count"`
+    TotalSize    int64  `json:"total_size"`
+    DeletedAt    string `json:"deleted_at"`
+}
 ```
 
-Key changes:
-- `LoadFromDB` is called first — instant, no network
-- FUSE mount happens immediately after, even if DB was empty
-- API refresh runs in a goroutine — never blocks startup
-- API failure is a warning, not a fatal error
+Snapshot now includes:
+- `HiddenDownloads []HiddenDownloadJSON` — grouped by download, shows partial/total hides
+- `RecentlyDeleted []DeletionRecordJSON` — downloads removed from TorBox
 
-### Step 5 — Move periodic refresh goroutine startup
+#### `internal/dashboard/server.go`
 
-Currently the periodic refresh ticker starts after the mount. No change needed
-here — the initial background refresh goroutine is separate from the ticker.
+New API endpoints:
+- `GET /api/hidden` — list hidden downloads (grouped by download, with all-hidden flag)
+- `POST /api/unhide` — unhide a file or all files of a download, then refresh catalog
+- `POST /api/delete-download` — delete a download from TorBox (with confirmation),
+  record in deletions table, unhide its files, refresh catalog
+- `GET /api/deletions` — list recent TorBox deletions
+- `POST /api/forget-deletion` — remove deletion record from log (don't restore, just forget)
 
-### Step 6 — Tests
+#### `cmd/torbox-media-center/main.go`
 
-1. `TestBuildTreeFromDB` — verify tree construction from `[]FileRecord`
-2. `TestCatalog_LoadFromDB` — verify `LoadFromDB` populates tree from DB
-3. `TestCatalog_LoadFromDB_Empty` — empty DB returns nil error, tree stays empty
-4. `TestBuildTreeFromDB_AllDir` — verify `/all` directory reconstruction
-5. `TestDB_ListFiles` — verify `ListFiles` returns all records
+- Pass `cfg.Writable` to `RootNode`
+- Pass `tbClient` and `cat` to dashboard for unhide/delete operations
+- No other startup changes needed
 
-## Edge cases
+### 4. FUSE Unlink flow (detailed)
 
-- **First run (empty DB):** `LoadFromDB` returns nil, tree stays empty. The
-  background API refresh populates everything. Same UX as today but without
-  blocking — the mount just appears empty for a few seconds.
+```
+1. User: rm /mnt/torbox/movies/The Matrix/The.Matrix.1999.mkv
+2. FUSE calls DirNode.Unlink("The.Matrix.1999.mkv")
+3. Unlink handler:
+   a. Look up child inode → get FileNode
+   b. Extract contentKey = "torrent:12345:678"
+   c. stateDB.HideFile(contentKey) — mark as hidden in SQLite
+   d. Remove inode from FUSE tree: parent.RmChild("The.Matrix.1999.mkv")
+   e. parent.NotifyEntry("The.Matrix.1999.mkv") — kernel cache invalidation
+   f. Log: "file hidden", "content_key", "path"
+   g. **Do NOT call TorBox delete API.**
+```
 
-- **API down on startup:** Mount shows stale (but valid) data from DB. The
-  warning log makes it clear. Next periodic refresh will try again.
+### 5. Dashboard Delete from TorBox flow
 
-- **Stale data after API comes back:** The background `cat.Refresh` call
-  overwrites the DB-loaded tree via `UpsertFiles` + tree swap + `SyncTree`.
-  Files appear/disappear naturally.
+```
+1. User: clicks "Delete from TorBox" for download "torrent:12345"
+2. Dashboard POST /api/delete-download {"download_key": "torrent:12345"}
+3. Handler:
+   a. Parse download_key → kind="torrent", downloadID="12345"
+   b. Look up download name and file count from catalog tree (before deletion)
+   c. tbClient.DeleteDownload(ctx, "torrent", "12345") — call TorBox API
+   d. stateDB.RecordDeletion("torrent", "12345", "The Matrix", N, totalSize)
+   e. stateDB.ClearHiddenForDownload("torrent", "12345") — clean up hide list
+   f. catalog.Refresh(ctx) — tree rebuild removes the download
+   g. Return success
+```
 
-- **MediaType not in DB:** Not needed — the virtual path (`/movies/...`,
-  `/series/...`) already encodes the classification. We only need `path`,
-  `download_kind`, `download_id`, `file_id`, `size` to reconstruct `File`.
+### 6. Dashboard Unhide / Restore flow
 
-- **MimeType not in DB:** All stored records are already video (filtered
-  before upsert). Set placeholder `"video/x-matroska"` — never read by FUSE.
+```
+1. User: clicks "Unhide" for download "torrent:12345"
+2. Dashboard POST /api/unhide {"download_key": "torrent:12345"}
+3. Handler:
+   a. stateDB.UnhideAllForDownload("torrent", "12345")
+   b. catalog.Refresh(ctx) OR catalog.LoadFromDB(ctx) + ApplyHides — files reappear
+   c. Return success
+```
+
+### 7. Edge cases
+
+- **Empty directory after Unlink**: When all files in a directory are hidden,
+  the directory becomes empty. `ApplyHides` prunes empty directories.
+  If the user unhides, the next refresh restores the directory.
+
+- **Multi-file download, partial hide**: User deletes 2 of 5 files.
+  Files are hidden from FUSE, 3 remain visible. Dashboard shows
+  "2 of 5 files hidden" with a per-download summary.
+
+- **Rmdir on a title directory**: `rm -rf /mnt/torbox/movies/The Matrix/`
+  hides all files in that directory. Dashboard shows "all files hidden" with
+  a "Delete from TorBox" button and an "Unhide all" button.
+
+- **Read-only mode (default)**: All write operations return EROFS.
+  Hidden/deletion tables remain empty. Dashboard shows empty sections.
+
+- **Delete from TorBox fails**: Return error to dashboard. Download stays in
+  TorBox, files stay hidden. User can retry.
+
+- **Dashboard "Forget" button**: Removes deletion record from the log.
+  Doesn't restore anything — just cleans up the UI. Useful for old deletions.
 
 ## Files changed
 
 | File | Change |
 |------|--------|
-| `internal/state/db.go` | Add `ListFiles() ([]FileRecord, error)` |
-| `internal/catalog/catalog.go` | Add `LoadFromDB`, `BuildTreeFromDB` |
-| `cmd/torbox-media-center/main.go` | New startup sequence |
-| `internal/state/db_test.go` | Test `ListFiles` |
-| `internal/catalog/catalog_test.go` | Tests for `LoadFromDB`, `BuildTreeFromDB` |
+| `internal/state/db.go` | Add hidden_files/deletions tables, Hide/Unhide/IsHidden/RecordDeletion/ListDeletions/ClearDeletion methods |
+| `internal/state/db_test.go` | Tests for new methods |
+| `internal/torbox/client.go` | Add `DeleteDownload` method |
+| `internal/torbox/client_test.go` | Test for `DeleteDownload` |
+| `internal/catalog/catalog.go` | Add `ApplyHides`, modify Refresh/LoadFromDB |
+| `internal/catalog/tree.go` | Add `FilterHidden` method on Tree |
+| `internal/fusefs/fs.go` | Implement writable Unlink/Rmdir with hide logic |
+| `internal/fusefs/mount.go` | No changes needed (writable is per-inode, not mount option) |
+| `internal/config/config.go` | Add `Writable` field, `FUSE_WRITABLE` env |
+| `internal/dashboard/dashboard.go` | Add HiddenDownloads, RecentlyDeleted to snapshot |
+| `internal/dashboard/server.go` | Add /api/hidden, /api/unhide, /api/delete-download, /api/deletions, /api/forget-deletion |
+| `cmd/torbox-media-center/main.go` | Pass `cfg.Writable` to RootNode |

@@ -41,15 +41,21 @@ func NewServer(d *Dashboard) *Server {
 
 // RegisterRoutes registers dashboard routes on the given ServeMux.
 // This adds:
-//   - GET /           → HTML dashboard page
-//   - GET /api/state  → SSE stream of JSON snapshots (updates every 500ms)
-//   - GET /api/snapshot → single JSON snapshot (for debugging)
+//   - GET /              → HTML dashboard page
+//   - GET /api/state     → SSE stream of JSON snapshots (updates every 500ms)
+//   - GET /api/snapshot  → single JSON snapshot (for debugging)
+//   - GET /api/hidden    → list downloads with hidden files
+//   - POST /api/unhide   → unhide a download's files {download_kind, download_id}
+//   - POST /api/delete   → force-delete a download from TorBox {download_kind, download_id}
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/", s.handleIndex)
 	mux.HandleFunc("/style.css", s.handleCSS)
 	mux.HandleFunc("/app.js", s.handleJS)
 	mux.HandleFunc("/api/state", s.handleSSE)
 	mux.HandleFunc("/api/snapshot", s.handleSnapshot)
+	mux.HandleFunc("/api/hidden", s.handleHidden)
+	mux.HandleFunc("/api/unhide", s.handleUnhide)
+	mux.HandleFunc("/api/delete", s.handleDelete)
 }
 
 // handleIndex serves the embedded dashboard HTML page.
@@ -136,4 +142,76 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 			flusher.Flush()
 		}
 	}
+}
+
+// handleHidden returns a list of downloads that have hidden files.
+func (s *Server) handleHidden(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	snap := s.dashboard.Snapshot()
+	w.Header().Set("Content-Type", "application/json")
+	data, err := json.Marshal(snap.HiddenDownloads)
+	if err != nil {
+		http.Error(w, "marshal error", http.StatusInternalServerError)
+		return
+	}
+	w.Write(data)
+}
+
+// handleUnhide restores hidden files for a download.
+// Expects JSON: {"download_kind": "torrent", "download_id": "12345"}
+func (s *Server) handleUnhide(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		DownloadKind string `json:"download_kind"`
+		DownloadID   string `json:"download_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if req.DownloadKind == "" || req.DownloadID == "" {
+		http.Error(w, "download_kind and download_id are required", http.StatusBadRequest)
+		return
+	}
+	if err := s.dashboard.UnhideDownload(r.Context(), req.DownloadKind, req.DownloadID); err != nil {
+		slog.Error("dashboard: unhide download", "kind", req.DownloadKind, "id", req.DownloadID, "err", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+}
+
+// handleDelete force-deletes a download from TorBox.
+// Expects JSON: {"download_kind": "torrent", "download_id": "12345"}
+func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req struct {
+		DownloadKind string `json:"download_kind"`
+		DownloadID   string `json:"download_id"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "invalid JSON", http.StatusBadRequest)
+		return
+	}
+	if req.DownloadKind == "" || req.DownloadID == "" {
+		http.Error(w, "download_kind and download_id are required", http.StatusBadRequest)
+		return
+	}
+	if err := s.dashboard.DeleteDownload(r.Context(), req.DownloadKind, req.DownloadID); err != nil {
+		slog.Error("dashboard: delete download", "kind", req.DownloadKind, "id", req.DownloadID, "err", err)
+		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
 }

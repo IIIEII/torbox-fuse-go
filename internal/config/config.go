@@ -25,6 +25,7 @@ type Config struct {
 	LogLevel               string
 	DashboardEnabled       bool
 	AllDirEnabled          bool
+	Writable               bool // enable delete operations (hide files + delete from TorBox)
 	UID                    uint32
 	GID                    uint32
 }
@@ -105,6 +106,7 @@ func Load() (*Config, error) {
 		LogLevel:               env("LOG_LEVEL", "info"),
 		DashboardEnabled:       envBool("DASHBOARD_ENABLED", true),
 		AllDirEnabled:          envBool("FUSE_ALL_DIR_ENABLED", false),
+		Writable:               envBool("FUSE_WRITABLE", false),
 		UID:                    uint32(os.Getuid()),
 		GID:                    uint32(os.Getgid()),
 	}, nil

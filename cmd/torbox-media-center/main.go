@@ -110,7 +110,7 @@ func main() {
 
 	// Create and register dashboard for live cache visualization.
 	if cfg.DashboardEnabled {
-		dash := dashboard.New(streamer, rc, stateDB, m)
+		dash := dashboard.New(streamer, rc, stateDB, m, tbClient, cat)
 		dashServer := dashboard.NewServer(dash)
 		dashServer.RegisterRoutes(metricsServer.Mux())
 		slog.Info("dashboard registered", "addr", cfg.MetricsListenAddr)

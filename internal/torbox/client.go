@@ -287,6 +287,67 @@ func (c *Client) apiGet(ctx context.Context, path string, params map[string]stri
 	return nil, fmt.Errorf("unreachable")
 }
 
+// DeleteDownload removes a download from TorBox by its kind and ID.
+// It calls the appropriate TorBox API endpoint based on the download kind:
+//   - torrent:  POST /torrents/deletetorrent?id={downloadID}
+//   - usenet:   POST /usenet/deleteusenet?id={downloadID}
+//   - webdl:    POST /webdl/deletewebdownload?id={downloadID}
+func (c *Client) DeleteDownload(ctx context.Context, kind catalog.DownloadKind, downloadID string) error {
+	var apiPath string
+	switch kind {
+	case catalog.KindTorrent:
+		apiPath = "/torrents/deletetorrent"
+	case catalog.KindUsenet:
+		apiPath = "/usenet/deleteusenet"
+	case catalog.KindWebDL:
+		apiPath = "/webdl/deletewebdownload"
+	default:
+		return fmt.Errorf("unknown download kind: %s", kind)
+	}
+
+	_, err := c.apiPost(ctx, apiPath, map[string]string{"id": downloadID})
+	if err != nil {
+		return fmt.Errorf("delete %s %s: %w", kind, downloadID, err)
+	}
+
+	slog.Info("deleted download from torbox", "kind", kind, "download_id", downloadID)
+	return nil
+}
+
+// apiPost sends a POST request with the given parameters and returns the response body.
+func (c *Client) apiPost(ctx context.Context, path string, params map[string]string) ([]byte, error) {
+	c.apiSem <- struct{}{}
+	defer func() { <-c.apiSem }()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	q := req.URL.Query()
+	for k, v := range params {
+		q.Set(k, v)
+	}
+	req.URL.RawQuery = q.Encode()
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("client error: %s (%s)", resp.Status, string(body))
+	}
+
+	return body, nil
+}
+
 func (c *Client) backoff(ctx context.Context, attempt int) {
 	delay := time.Duration(100*1<<uint(attempt))*time.Millisecond + time.Duration(rand.Intn(100))*time.Millisecond
 	slog.Debug("backoff", "attempt", attempt, "delay", delay)

@@ -21,7 +21,7 @@ func newTestDashboardWithCache(t *testing.T) (*Dashboard, *cache.RangeCache) {
 	sr := stream.NewStreamReader(rc, cdn, 2, 16, 1024*1024, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	}, nil)
-	d := New(sr, rc, nil, m)
+	d := New(sr, rc, nil, m, nil, nil)
 	return d, rc
 }
 
@@ -35,7 +35,7 @@ func newTestDashboardStreamReader(t *testing.T) (*Dashboard, *stream.StreamReade
 	sr := stream.NewStreamReader(rc, cdn, 2, 16, 1024*1024, func(fileKey string) string {
 		return "http://cdn.example.com/" + fileKey
 	}, nil)
-	d := New(sr, rc, nil, m)
+	d := New(sr, rc, nil, m, nil, nil)
 	return d, sr, rc
 }
 
