@@ -80,14 +80,14 @@ func main() {
 	prefetchBytes := int64(cfg.PrefetchWindowMB) * 1024 * 1024
 	streamer := stream.NewStreamReader(rc, cdn, cfg.StreamMaxInflight, cfg.StreamMaxGlobalWindows, prefetchBytes, permalinkBuilder, m)
 
-	// Initial catalog refresh.
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	slog.Info("running initial catalog refresh")
-	if err := cat.Refresh(ctx); err != nil {
-		slog.Error("initial catalog refresh", "err", err)
-		os.Exit(1)
+	// Load cached tree from DB first — instant, no network.
+	// This makes files visible immediately on startup even if the
+	// TorBox API is slow or unreachable.
+	if err := cat.LoadFromDB(ctx); err != nil {
+		slog.Warn("load from db cache", "err", err)
 	}
 
 	// Create FUSE root node from the current catalog tree.
@@ -95,6 +95,15 @@ func main() {
 	// inode tree so newly added downloads appear in the mount immediately.
 	root := fusefs.NewRootNode(cat, stateDB, streamer, cfg, tbClient)
 	cat.SetOnRefresh(func() { root.SyncTree(context.Background()) })
+
+	// Background: refresh from API to replace stale DB data with live state.
+	// Runs in a goroutine so the FUSE mount is available immediately.
+	go func() {
+		slog.Info("running background catalog refresh from API")
+		if err := cat.Refresh(ctx); err != nil {
+			slog.Warn("background catalog refresh", "err", err)
+		}
+	}()
 
 	// Set up metrics server with refresh handler.
 	metricsServer := metrics.NewServer(m, cfg.MetricsListenAddr, cat.Refresh)

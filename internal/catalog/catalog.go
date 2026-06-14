@@ -152,6 +152,32 @@ func (c *Catalog) Refresh(ctx context.Context) error {
 	return nil
 }
 
+// LoadFromDB loads the catalog tree from the state database, bypassing the
+// TorBox API entirely. This enables fast startup: the FUSE mount can show files
+// immediately from cached data while the API refresh runs in the background.
+// Returns nil if the database contains no file records (first run).
+func (c *Catalog) LoadFromDB(ctx context.Context) error {
+	records, err := c.stateDB.ListFiles()
+	if err != nil {
+		return fmt.Errorf("load from db: %w", err)
+	}
+	if len(records) == 0 {
+		slog.Info("no cached files in db, skipping db load")
+		return nil
+	}
+
+	tree := BuildTreeFromDB(records, c.allDirEnabled)
+	c.tree.Store(tree)
+
+	if c.onRefresh != nil {
+		c.onRefresh()
+	}
+
+	c.metrics.CatalogItems.Store(int64(len(records)))
+	slog.Info("loaded catalog from db cache", "files", len(records))
+	return nil
+}
+
 // SetTree replaces the catalog tree atomically and triggers the onRefresh
 // callback. This is used in tests to simulate a catalog refresh without
 // needing a real API server, and by the webhook refresh handler when the

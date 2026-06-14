@@ -194,6 +194,32 @@ func (db *DB) LookupFile(contentKey string) (*FileRecord, error) {
 	return &f, nil
 }
 
+// ListFiles returns all file records from the database.
+// Returns an empty slice (not error) if no records exist.
+func (db *DB) ListFiles() ([]FileRecord, error) {
+	rows, err := db.conn.Query(
+		`SELECT content_key, download_kind, download_id, file_id, path, size FROM files`,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("state: list files: %w", err)
+	}
+	defer rows.Close()
+
+	var files []FileRecord
+	for rows.Next() {
+		var f FileRecord
+		if err := rows.Scan(&f.ContentKey, &f.DownloadKind, &f.DownloadID,
+			&f.FileID, &f.Path, &f.Size); err != nil {
+			return nil, fmt.Errorf("state: scan file: %w", err)
+		}
+		files = append(files, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: list files rows: %w", err)
+	}
+	return files, nil
+}
+
 // Close closes the underlying database connection.
 func (db *DB) Close() error {
 	return db.conn.Close()
