@@ -105,6 +105,44 @@ func buildAllDirFromDB(t *Tree, records []state.FileRecord, seen map[string]bool
 	}
 }
 
+// ApplyHides removes entries from the tree whose content keys appear in the
+// hidden set. Directories that become empty after hiding are also removed.
+// This is called after BuildTree or BuildTreeFromDB, before the tree is
+// swapped into the catalog.
+func ApplyHides(tree *Tree, hidden map[string]bool) *Tree {
+	if len(hidden) == 0 {
+		return tree
+	}
+
+	// Build a new tree excluding hidden files.
+	filtered := &Tree{dirs: make(map[string][]DirEntry)}
+
+	for dirPath, entries := range tree.dirs {
+		var kept []DirEntry
+		for _, e := range entries {
+			if e.File != nil && hidden[e.File.ContentKey()] {
+				continue // skip hidden file
+			}
+			kept = append(kept, e)
+		}
+		if len(kept) > 0 {
+			filtered.dirs[dirPath] = kept
+		}
+	}
+
+	// Rebuild parent dirs since removing files may have emptied directories.
+	filtered.buildParentDirs()
+
+	// Sort entries.
+	for p := range filtered.dirs {
+		sort.Slice(filtered.dirs[p], func(i, j int) bool {
+			return filtered.dirs[p][i].Name < filtered.dirs[p][j].Name
+		})
+	}
+
+	return filtered
+}
+
 // splitPath splits a clean path into its non-empty segments.
 // e.g. "/movies/The Matrix" → ["movies", "The Matrix"]
 func splitPath(p string) []string {

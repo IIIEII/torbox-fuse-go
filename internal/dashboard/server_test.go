@@ -2,6 +2,8 @@ package dashboard
 
 import (
 	"bufio"
+	"bytes"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -21,7 +23,7 @@ func newTestDashboard(t *testing.T) *Dashboard {
 		return "http://cdn.example.com/" + fileKey
 	}, nil)
 	m := metrics.New()
-	return New(sr, rc, nil, m)
+	return New(sr, rc, nil, m, nil, nil)
 }
 
 func TestServerIndex(t *testing.T) {
@@ -198,5 +200,140 @@ func TestServerIndexNotFound(t *testing.T) {
 
 	if w.Code != 404 {
 		t.Fatalf("GET /nonexistent: status %d, want 404", w.Code)
+	}
+}
+
+func TestServerHiddenEndpoint(t *testing.T) {
+	d := newTestDashboard(t)
+	srv := NewServer(d)
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	// GET /api/hidden returns 200 with JSON array (empty when no stateDB).
+	req := httptest.NewRequest(http.MethodGet, "/api/hidden", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("GET /api/hidden: status %d, want 200", w.Code)
+	}
+	ct := w.Header().Get("Content-Type")
+	if !strings.Contains(ct, "application/json") {
+		t.Fatalf("Content-Type = %q, want application/json", ct)
+	}
+	// Without stateDB, hidden downloads should be null (not crash).
+	body := w.Body.String()
+	if !strings.Contains(body, "null") && !strings.Contains(body, "[]") {
+		t.Fatalf("expected null or empty array, got: %s", body)
+	}
+}
+
+func TestServerUnhideBadMethod(t *testing.T) {
+	d := newTestDashboard(t)
+	srv := NewServer(d)
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/unhide", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != 405 {
+		t.Fatalf("GET /api/unhide: status %d, want 405", w.Code)
+	}
+}
+
+func TestServerDeleteBadMethod(t *testing.T) {
+	d := newTestDashboard(t)
+	srv := NewServer(d)
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/delete", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != 405 {
+		t.Fatalf("GET /api/delete: status %d, want 405", w.Code)
+	}
+}
+
+func TestServerUnhideMissingFields(t *testing.T) {
+	d := newTestDashboard(t)
+	srv := NewServer(d)
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	// POST with empty JSON body.
+	body := bytes.NewBufferString("{}")
+	req := httptest.NewRequest(http.MethodPost, "/api/unhide", body)
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != 400 {
+		t.Fatalf("POST /api/unhide with empty body: status %d, want 400", w.Code)
+	}
+}
+
+func TestServerDeleteMissingFields(t *testing.T) {
+	d := newTestDashboard(t)
+	srv := NewServer(d)
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	// POST with only download_kind, missing download_id.
+	payload := `{"download_kind": "torrent"}`
+	req := httptest.NewRequest(http.MethodPost, "/api/delete", strings.NewReader(payload))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != 400 {
+		t.Fatalf("POST /api/delete missing download_id: status %d, want 400", w.Code)
+	}
+}
+
+func TestServerUnhideInvalidJSON(t *testing.T) {
+	d := newTestDashboard(t)
+	srv := NewServer(d)
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodPost, "/api/unhide", strings.NewReader("not-json"))
+	req.Header.Set("Content-Type", "application/json")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != 400 {
+		t.Fatalf("POST /api/unhide with invalid JSON: status %d, want 400", w.Code)
+	}
+}
+
+func TestServerSnapshotIncludesHiddenDownloads(t *testing.T) {
+	d := newTestDashboard(t)
+	srv := NewServer(d)
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/snapshot", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("GET /api/snapshot: status %d, want 200", w.Code)
+	}
+	// The response should include hidden_downloads field (null without stateDB).
+	body := w.Body.String()
+	if !strings.Contains(body, "hidden_downloads") {
+		t.Fatalf("snapshot missing hidden_downloads field: %s", body[:200])
+	}
+	// Parse to verify structure.
+	var snap map[string]json.RawMessage
+	if err := json.Unmarshal([]byte(body), &snap); err != nil {
+		t.Fatalf("failed to parse snapshot JSON: %v", err)
+	}
+	if _, ok := snap["hidden_downloads"]; !ok {
+		t.Fatal("hidden_downloads key missing from snapshot")
 	}
 }

@@ -10,8 +10,10 @@
   const summaryEl = document.getElementById('summary');
   const activeEl = document.getElementById('active-files');
   const closedEl = document.getElementById('closed-files');
+  const hiddenEl = document.getElementById('hidden-downloads');
   const activeCountEl = document.getElementById('active-count');
   const closedCountEl = document.getElementById('closed-count');
+  const hiddenCountEl = document.getElementById('hidden-count');
   const searchInput = document.getElementById('search');
   const statusDot = document.getElementById('status-dot');
   const statusText = document.getElementById('status-text');
@@ -53,6 +55,7 @@
     renderSummary(snap.summary);
     renderFileList(activeEl, activeCountEl, snap.active, 'active');
     renderClosedList(closedEl, closedCountEl, snap.recently_closed);
+    renderHiddenList(hiddenEl, hiddenCountEl, snap.hidden_downloads || []);
   }
 
   // Render summary bar
@@ -287,6 +290,71 @@
     if (!s) return '';
     return s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
   }
+
+  // Render hidden downloads list
+  function renderHiddenList(container, countEl, downloads) {
+    countEl.textContent = downloads ? downloads.length : '0';
+    if (!downloads || downloads.length === 0) {
+      container.innerHTML = '<div class="empty">No hidden downloads</div>';
+      return;
+    }
+
+    var filter = (searchInput.value || '').toLowerCase();
+    var html = '';
+    for (var i = 0; i < downloads.length; i++) {
+      var d = downloads[i];
+      if (filter && d.download_name.toLowerCase().indexOf(filter) < 0 && d.download_kind.toLowerCase().indexOf(filter) < 0) {
+        continue;
+      }
+      var statusBadge = d.fully_hidden
+        ? '<span class="hidden-badge fully-hidden">All files hidden</span>'
+        : '<span class="hidden-badge partial">' + d.hidden_count + '/' + d.total_count + ' hidden</span>';
+      html += '<div class="file-entry hidden-entry">' +
+        '<div class="file-name">' + esc(d.download_name) + ' ' + statusBadge + '</div>' +
+        '<div class="file-meta">' + esc(d.download_kind) + ' · ' + d.download_id + ' · ' + formatBytes(d.total_size) + '</div>' +
+        '<div class="hidden-actions">' +
+        '<button class="btn-unhide" onclick="window._unhide(\'' + esc(d.download_kind) + '\',\'' + esc(d.download_id) + '\')">Unhide</button>' +
+        (d.fully_hidden ? '<button class="btn-delete" onclick="window._delete(\'' + esc(d.download_kind) + '\',\'' + esc(d.download_id) + '\')">Delete from TorBox</button>' : '') +
+        '</div></div>';
+    }
+    if (!html) {
+      html = '<div class="empty">No matching downloads</div>';
+    }
+    container.innerHTML = html;
+  }
+
+  // Unhide a download's files
+  window._unhide = function (kind, id) {
+    fetch('/api/unhide', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ download_kind: kind, download_id: id })
+    }).then(function (r) {
+      if (!r.ok) return r.text().then(function (t) { throw new Error(t); });
+      return r.json();
+    }).then(function () {
+      // Snapshot will auto-refresh via SSE
+    }).catch(function (e) {
+      alert('Failed to unhide: ' + e.message);
+    });
+  };
+
+  // Force-delete a download from TorBox
+  window._delete = function (kind, id) {
+    if (!confirm('Delete this download from TorBox? This cannot be undone.')) return;
+    fetch('/api/delete', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ download_kind: kind, download_id: id })
+    }).then(function (r) {
+      if (!r.ok) return r.text().then(function (t) { throw new Error(t); });
+      return r.json();
+    }).then(function () {
+      // Snapshot will auto-refresh via SSE
+    }).catch(function (e) {
+      alert('Failed to delete: ' + e.message);
+    });
+  };
 
   // Search filter handler
   searchInput.addEventListener('input', function () {

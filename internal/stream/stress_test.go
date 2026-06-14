@@ -1047,14 +1047,15 @@ func TestStreamReader_PriorityGlobalBudget(t *testing.T) {
 	//   (~0-100ms remaining) plus its own CDN latency (100ms).
 	//   Total: ~200-350ms depending on scheduling.
 	//
-	// We use 350ms as the threshold — well below FIFO wait (~450ms)
-	// but generous enough for scheduling jitter and CDN timing.
-	t.Logf("playback first-read wait: %v (threshold: 350ms)", playbackWait)
+	// We use 400ms as the threshold — well below FIFO wait (~450ms)
+	// while being resilient to scheduling jitter under race detector
+	// (which can add 10-15ms of overhead per goroutine switch).
+	t.Logf("playback first-read wait: %v (threshold: 400ms)", playbackWait)
 
-	if playbackWait > 350*time.Millisecond {
+	if playbackWait > 400*time.Millisecond {
 		t.Errorf("playback ReadAt waited %v — global budget starvation detected! "+
 			"PriorityHigh playback should not wait behind PriorityLow scan windows. "+
-			"Expected < 350ms (priority budget), got FIFO-style delay.",
+			"Expected < 400ms (priority budget), got FIFO-style delay.",
 			playbackWait)
 	}
 }

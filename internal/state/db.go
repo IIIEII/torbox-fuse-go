@@ -6,6 +6,7 @@ package state
 import (
 	"database/sql"
 	"fmt"
+	"strings"
 	"sync"
 
 	_ "github.com/mattn/go-sqlite3"
@@ -63,6 +64,10 @@ func Open(path string) (*DB, error) {
 			path          TEXT NOT NULL,
 			size          INTEGER NOT NULL,
 			updated_at    TEXT NOT NULL
+		)`,
+		`CREATE TABLE IF NOT EXISTS hidden_files (
+			content_key TEXT PRIMARY KEY,
+			hidden_at  TEXT NOT NULL
 		)`,
 	}
 	for _, stmt := range ddl {
@@ -218,6 +223,176 @@ func (db *DB) ListFiles() ([]FileRecord, error) {
 		return nil, fmt.Errorf("state: list files rows: %w", err)
 	}
 	return files, nil
+}
+
+// HideFile marks a file as hidden so it will be excluded from the FUSE tree.
+func (db *DB) HideFile(contentKey string) error {
+	_, err := db.conn.Exec(
+		`INSERT OR IGNORE INTO hidden_files (content_key, hidden_at) VALUES (?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))`,
+		contentKey,
+	)
+	if err != nil {
+		return fmt.Errorf("state: hide file %q: %w", contentKey, err)
+	}
+	return nil
+}
+
+// UnhideFile removes a file from the hidden list so it reappears in the FUSE tree.
+func (db *DB) UnhideFile(contentKey string) error {
+	_, err := db.conn.Exec(`DELETE FROM hidden_files WHERE content_key = ?`, contentKey)
+	if err != nil {
+		return fmt.Errorf("state: unhide file %q: %w", contentKey, err)
+	}
+	return nil
+}
+
+// UnhideDownload removes all hidden-file entries for a given download.
+func (db *DB) UnhideDownload(downloadKind, downloadID string) error {
+	prefix := downloadKind + ":" + downloadID + ":"
+	_, err := db.conn.Exec(`DELETE FROM hidden_files WHERE content_key LIKE ?`, prefix+"%")
+	if err != nil {
+		return fmt.Errorf("state: unhide download %s:%s: %w", downloadKind, downloadID, err)
+	}
+	return nil
+}
+
+// IsHidden checks whether a file is in the hidden list.
+func (db *DB) IsHidden(contentKey string) (bool, error) {
+	var count int
+	err := db.conn.QueryRow(`SELECT COUNT(*) FROM hidden_files WHERE content_key = ?`, contentKey).Scan(&count)
+	if err != nil {
+		return false, fmt.Errorf("state: is hidden %q: %w", contentKey, err)
+	}
+	return count > 0, nil
+}
+
+// IsDownloadFullyHidden checks whether all video files of a download are hidden.
+// It compares the count of hidden files for a download against the total file count
+// in the files table.
+func (db *DB) IsDownloadFullyHidden(downloadKind, downloadID string) (bool, error) {
+	prefix := downloadKind + ":" + downloadID + ":"
+	var hiddenCount int
+	err := db.conn.QueryRow(
+		`SELECT COUNT(*) FROM hidden_files WHERE content_key LIKE ?`, prefix+"%",
+	).Scan(&hiddenCount)
+	if err != nil {
+		return false, fmt.Errorf("state: count hidden for %s:%s: %w", downloadKind, downloadID, err)
+	}
+	var totalCount int
+	err = db.conn.QueryRow(
+		`SELECT COUNT(*) FROM files WHERE download_kind = ? AND download_id = ?`,
+		downloadKind, downloadID,
+	).Scan(&totalCount)
+	if err != nil {
+		return false, fmt.Errorf("state: count total for %s:%s: %w", downloadKind, downloadID, err)
+	}
+	return totalCount > 0 && hiddenCount >= totalCount, nil
+}
+
+// ListHiddenFiles returns all file records that are currently hidden.
+func (db *DB) ListHiddenFiles() ([]FileRecord, error) {
+	rows, err := db.conn.Query(`
+		SELECT f.content_key, f.download_kind, f.download_id, f.file_id, f.path, f.size
+		FROM files f
+		JOIN hidden_files h ON f.content_key = h.content_key
+		ORDER BY h.hidden_at DESC
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("state: list hidden files: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var files []FileRecord
+	for rows.Next() {
+		var f FileRecord
+		if err := rows.Scan(&f.ContentKey, &f.DownloadKind, &f.DownloadID,
+			&f.FileID, &f.Path, &f.Size); err != nil {
+			return nil, fmt.Errorf("state: scan hidden file: %w", err)
+		}
+		files = append(files, f)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: list hidden files rows: %w", err)
+	}
+	return files, nil
+}
+
+// HiddenDownload represents a download that has some or all of its files hidden.
+type HiddenDownload struct {
+	DownloadKind string
+	DownloadID   string
+	DownloadName string // derived from first file's path
+	HiddenCount  int
+	TotalCount   int
+	TotalSize    int64
+}
+
+// ListHiddenDownloads returns downloads that have at least one hidden file,
+// grouped by download. This is used by the dashboard to show which downloads
+// are partially or fully hidden.
+func (db *DB) ListHiddenDownloads() ([]HiddenDownload, error) {
+	rows, err := db.conn.Query(`
+		SELECT
+			f.download_kind,
+			f.download_id,
+			COUNT(CASE WHEN h.content_key IS NOT NULL THEN 1 END) AS hidden_count,
+			COUNT(*) AS total_count,
+			SUM(f.size) AS total_size,
+			MIN(f.path) AS first_path
+		FROM files f
+		LEFT JOIN hidden_files h ON f.content_key = h.content_key
+		GROUP BY f.download_kind, f.download_id
+		HAVING hidden_count > 0
+		ORDER BY f.download_kind, f.download_id
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("state: list hidden downloads: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	var downloads []HiddenDownload
+	for rows.Next() {
+		var d HiddenDownload
+		var firstPath string
+		if err := rows.Scan(&d.DownloadKind, &d.DownloadID, &d.HiddenCount, &d.TotalCount, &d.TotalSize, &firstPath); err != nil {
+			return nil, fmt.Errorf("state: scan hidden download: %w", err)
+		}
+		// Derive download name from first file's path: "/movies/The Matrix/film.mkv" → "The Matrix"
+		parts := strings.SplitN(firstPath, "/", 4)
+		if len(parts) >= 3 {
+			d.DownloadName = parts[2]
+		} else {
+			d.DownloadName = firstPath
+		}
+		downloads = append(downloads, d)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: list hidden downloads rows: %w", err)
+	}
+	return downloads, nil
+}
+
+// HiddenSet returns the set of all hidden content keys as a map for fast
+// lookup. Returns an empty map (not nil) if no files are hidden.
+func (db *DB) HiddenSet() (map[string]bool, error) {
+	rows, err := db.conn.Query(`SELECT content_key FROM hidden_files`)
+	if err != nil {
+		return nil, fmt.Errorf("state: hidden set: %w", err)
+	}
+	defer func() { _ = rows.Close() }()
+
+	result := make(map[string]bool)
+	for rows.Next() {
+		var key string
+		if err := rows.Scan(&key); err != nil {
+			return nil, fmt.Errorf("state: scan hidden key: %w", err)
+		}
+		result[key] = true
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("state: hidden set rows: %w", err)
+	}
+	return result, nil
 }
 
 // Close closes the underlying database connection.

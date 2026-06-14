@@ -263,14 +263,17 @@ func (r *RootNode) Statfs(ctx context.Context, out *fuse.StatfsOut) syscall.Errn
 // DirNode
 // ---------------------------------------------------------------------------
 
-// DirNode represents a read-only directory in the FUSE tree.
-// Lookup and Readdir are handled automatically by go-fuse from the persistent
-// children created during OnAdd, but we implement Getattr to return
-// directory attributes and block write operations.
+// DirNode represents a directory in the FUSE tree.
+// In read-only mode (default), all write operations return EROFS.
+// In writable mode (FUSE_WRITABLE=true), Unlink hides the file and may
+// delete the entire download from TorBox when all its files are hidden.
 type DirNode struct {
 	fs.Inode
 
-	cfg *config.Config
+	cfg      *config.Config
+	stateDB  *state.DB
+	cat      *catalog.Catalog
+	tbClient *torbox.Client
 }
 
 // Getattr returns directory attributes.
@@ -287,14 +290,151 @@ func (d *DirNode) Mkdir(ctx context.Context, name string, mode uint32, out *fuse
 	return nil, syscall.EROFS
 }
 
-// Unlink rejects file removal (read-only filesystem).
+// Unlink handles file removal. When writable mode is enabled, it hides the
+// file and checks whether the parent download should be deleted from TorBox.
+// When writable mode is disabled, it returns EROFS.
 func (d *DirNode) Unlink(ctx context.Context, name string) syscall.Errno {
-	return syscall.EROFS
+	if !d.cfg.Writable {
+		return syscall.EROFS
+	}
+
+	child := d.GetChild(name)
+	if child == nil {
+		return syscall.ENOENT
+	}
+
+	fileNode, ok := child.Operations().(*FileNode)
+	if !ok {
+		// Not a regular file — cannot unlink a directory entry this way.
+		return syscall.EISDIR
+	}
+
+	contentKey := fileNode.fileKey
+	slog.Info("fuse unlink: hiding file", "name", name, "key", contentKey)
+
+	// Mark file as hidden in the database.
+	if err := d.stateDB.HideFile(contentKey); err != nil {
+		slog.Error("hide file", "key", contentKey, "err", err)
+		return syscall.EIO
+	}
+
+	// Remove the inode from the FUSE tree.
+	d.RmChild(name)
+	_ = d.NotifyEntry(name)
+
+	// Parse content key to get download kind and ID.
+	kind, downloadID, _ := parseContentKey(contentKey)
+
+	// Check if all files of this download are now hidden.
+	fullyHidden, err := d.stateDB.IsDownloadFullyHidden(string(kind), downloadID)
+	if err != nil {
+		slog.Error("check download fully hidden", "kind", kind, "downloadID", downloadID, "err", err)
+		// Non-fatal: the file is hidden locally, we just can't check TorBox status.
+		return 0
+	}
+
+	if fullyHidden {
+		slog.Info("all files hidden for download, deleting from TorBox", "kind", kind, "downloadID", downloadID)
+		if err := d.tbClient.DeleteDownload(ctx, catalog.DownloadKind(kind), downloadID); err != nil {
+			slog.Error("delete download from TorBox", "kind", kind, "downloadID", downloadID, "err", err)
+			// Non-fatal: file is hidden locally, TorBox deletion will be retried on next refresh.
+			return 0
+		}
+		slog.Info("deleted download from TorBox", "kind", kind, "downloadID", downloadID)
+
+		// Clean up hidden files for this download since the download is gone.
+		if err := d.stateDB.UnhideDownload(string(kind), downloadID); err != nil {
+			slog.Error("unhide download after deletion", "kind", kind, "downloadID", downloadID, "err", err)
+		}
+		// Trigger a catalog refresh to update the tree.
+		if err := d.cat.Refresh(ctx); err != nil && err != catalog.ErrRefreshInProgress {
+			slog.Warn("catalog refresh after delete", "err", err)
+		}
+	}
+
+	return 0
 }
 
-// Rmdir rejects directory removal (read-only filesystem).
+// Rmdir handles directory removal. When writable mode is enabled, it hides
+// all files in the directory. When all files of a download are hidden, the
+// download is deleted from TorBox. When writable mode is disabled, returns EROFS.
 func (d *DirNode) Rmdir(ctx context.Context, name string) syscall.Errno {
-	return syscall.EROFS
+	if !d.cfg.Writable {
+		return syscall.EROFS
+	}
+
+	child := d.GetChild(name)
+	if child == nil {
+		return syscall.ENOENT
+	}
+
+	// Check if the child is a directory (not a file).
+	if child.Operations().(*DirNode) == nil && child.Operations().(*FileNode) != nil {
+		// It's a file node, not a directory. Use Unlink instead.
+		return syscall.ENOTDIR
+	}
+
+	// Collect all file nodes under this directory.
+	var fileNodes []*FileNode
+	child.RmAllChildren() // we'll re-add the remaining ones after hiding
+	// Walk all children of the directory and collect FileNodes.
+	for childName, ch := range child.Children() {
+		if fn, ok := ch.Operations().(*FileNode); ok {
+			fileNodes = append(fileNodes, fn)
+			_ = childName // suppress unused warning
+		}
+	}
+
+	if len(fileNodes) == 0 {
+		// Empty directory — just remove it from the tree.
+		d.RmChild(name)
+		_ = d.NotifyEntry(name)
+		return 0
+	}
+
+	// Hide each file.
+	for _, fn := range fileNodes {
+		if err := d.stateDB.HideFile(fn.fileKey); err != nil {
+			slog.Error("hide file in rmdir", "key", fn.fileKey, "err", err)
+			continue
+		}
+		slog.Info("fuse rmdir: hiding file", "key", fn.fileKey)
+	}
+
+	// Check downloads that may now be fully hidden.
+	// Group hidden files by download.
+	downloadChecked := make(map[string]bool)
+	for _, fn := range fileNodes {
+		kind, downloadID, _ := parseContentKey(fn.fileKey)
+		dlKey := string(kind) + ":" + downloadID
+		if downloadChecked[dlKey] {
+			continue
+		}
+		downloadChecked[dlKey] = true
+
+		fullyHidden, err := d.stateDB.IsDownloadFullyHidden(string(kind), downloadID)
+		if err != nil {
+			slog.Error("check download fully hidden in rmdir", "kind", kind, "downloadID", downloadID, "err", err)
+			continue
+		}
+		if fullyHidden {
+			slog.Info("all files hidden for download (rmdir), deleting from TorBox", "kind", kind, "downloadID", downloadID)
+			if err := d.tbClient.DeleteDownload(ctx, catalog.DownloadKind(kind), downloadID); err != nil {
+				slog.Error("delete download from TorBox (rmdir)", "kind", kind, "downloadID", downloadID, "err", err)
+				continue
+			}
+			if err := d.stateDB.UnhideDownload(string(kind), downloadID); err != nil {
+				slog.Error("unhide download after deletion (rmdir)", "err", err)
+			}
+		}
+	}
+
+	// Trigger a catalog refresh to update the tree.
+	if err := d.cat.Refresh(ctx); err != nil && err != catalog.ErrRefreshInProgress {
+		slog.Warn("catalog refresh after rmdir", "err", err)
+	}
+
+	return 0
 }
 
 // Rename rejects renames (read-only filesystem).
