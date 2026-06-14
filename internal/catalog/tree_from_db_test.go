@@ -9,8 +9,6 @@ import (
 	"github.com/iiieii/torbox-fuse-go/internal/state"
 )
 
-var bgCtx = context.Background()
-
 func TestBuildTreeFromDB(t *testing.T) {
 	records := []state.FileRecord{
 		{

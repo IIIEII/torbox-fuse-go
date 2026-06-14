@@ -203,7 +203,7 @@ func (db *DB) ListFiles() ([]FileRecord, error) {
 	if err != nil {
 		return nil, fmt.Errorf("state: list files: %w", err)
 	}
-	defer rows.Close()
+	defer func() { _ = rows.Close() }()
 
 	var files []FileRecord
 	for rows.Next() {
