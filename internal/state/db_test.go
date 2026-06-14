@@ -196,6 +196,67 @@ func TestUpsertFiles_UpdateExisting(t *testing.T) {
 	}
 }
 
+func TestListFiles(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	// Empty DB returns empty slice, not error.
+	files, err := db.ListFiles()
+	if err != nil {
+		t.Fatalf("ListFiles on empty DB: %v", err)
+	}
+	if len(files) != 0 {
+		t.Errorf("ListFiles on empty DB: got %d records, want 0", len(files))
+	}
+
+	// Insert records.
+	records := []FileRecord{
+		{
+			ContentKey:   "torrent:100:1",
+			DownloadKind: "torrent",
+			DownloadID:   "100",
+			FileID:       "1",
+			Path:         "/movies/The Matrix/The.Matrix.1999.mkv",
+			Size:         2048,
+		},
+		{
+			ContentKey:   "usenet:200:2",
+			DownloadKind: "usenet",
+			DownloadID:   "200",
+			FileID:       "2",
+			Path:         "/series/Breaking Bad/Season 1/Breaking.Bad.S01E01.mkv",
+			Size:         1024,
+		},
+	}
+	if err := db.UpsertFiles(records); err != nil {
+		t.Fatalf("UpsertFiles: %v", err)
+	}
+
+	files, err = db.ListFiles()
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	if len(files) != 2 {
+		t.Fatalf("ListFiles: got %d records, want 2", len(files))
+	}
+
+	// Verify records by content key for deterministic lookup.
+	byKey := make(map[string]FileRecord)
+	for _, f := range files {
+		byKey[f.ContentKey] = f
+	}
+	if rec, ok := byKey["torrent:100:1"]; !ok {
+		t.Error("missing torrent:100:1")
+	} else if rec.Path != "/movies/The Matrix/The.Matrix.1999.mkv" {
+		t.Errorf("Path: got %q, want %q", rec.Path, "/movies/The Matrix/The.Matrix.1999.mkv")
+	}
+	if rec, ok := byKey["usenet:200:2"]; !ok {
+		t.Error("missing usenet:200:2")
+	} else if rec.Size != 1024 {
+		t.Errorf("Size: got %d, want %d", rec.Size, 1024)
+	}
+}
+
 func TestLookupFile_NotFound(t *testing.T) {
 	db := openTestDB(t)
 	defer db.Close()
