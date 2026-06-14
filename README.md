@@ -81,6 +81,7 @@ All settings are environment variables:
 | `DASHBOARD_ENABLED` | `true` | Enable the built-in web dashboard |
 | `STATE_DB_PATH` | `/config/state.db` | Path to the SQLite state database |
 | `FUSE_ALL_DIR_ENABLED` | `false` | Add a `/all` directory combining all movies and series |
+| `FUSE_WRITABLE` | `false` | Enable write support: deleting files hides them locally and can remove downloads from TorBox via dashboard |
 | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, `error` |
 
 ## How it works
@@ -93,7 +94,7 @@ TorBox API → catalog (tree builder) → FUSE mount point
                                           CDN range requests (cached)
 ```
 
-1. On startup, the catalog fetches your downloads from the TorBox API and builds a virtual directory tree
+1. On startup, the catalog immediately loads the file tree from the local SQLite cache, then refreshes from the TorBox API in the background
 2. The FUSE mount presents this tree as a regular filesystem
 3. When a player reads a file, the `StreamReader` fetches only the needed byte ranges from the TorBox CDN
 4. A sharded range cache keeps hot data in memory, avoiding redundant downloads
@@ -129,6 +130,41 @@ When a download completes, TorBox sends a POST request that triggers a catalog r
 
 > **Note:** If the metrics server is bound to `127.0.0.1` (default), you'll need to change `METRICS_LISTEN_ADDR` to `0.0.0.0:9080` so TorBox can reach it, or set up a reverse proxy.
 
+## Read-write mode (file hiding)
+
+By default the FUSE mount is read-only. Enable `FUSE_WRITABLE=true` to allow deleting files from the mount. This is useful for cleaning up downloads you no longer need.
+
+**How it works:**
+
+1. Deleting a file (or all files in a directory) from the mount **hides** it locally — the file disappears from the FUSE tree, but the download remains in TorBox.
+2. Hidden files persist across catalog refreshes and restarts (stored in the SQLite `hidden_files` table).
+3. When **all** files of a download are hidden, the download becomes eligible for force-deletion from TorBox via the dashboard.
+4. The dashboard shows a "Hidden Downloads" section with two actions per download:
+   - **Unhide** — restores all hidden files for that download (`POST /api/unhide`)
+   - **Delete from TorBox** — permanently removes the download from TorBox (`POST /api/delete`)
+
+**Example:**
+
+```bash
+# Hide a file by deleting it from the mount
+rm /mnt/torbox/movies/movie.mkv
+
+# View hidden downloads in the dashboard
+curl http://localhost:9080/api/hidden
+
+# Unhide a download (restore its files)
+curl -X POST http://localhost:9080/api/unhide \
+  -H 'Content-Type: application/json' \
+  -d '{"download_kind":"torrent","download_id":"12345"}'
+
+# Force-delete a download from TorBox
+curl -X POST http://localhost:9080/api/delete \
+  -H 'Content-Type: application/json' \
+  -d '{"download_kind":"torrent","download_id":"12345"}'
+```
+
+> **Warning:** Deleting from TorBox is irreversible. Use the Unhide action first to double-check before force-deleting.
+
 ## Building
 
 ```bash
@@ -160,11 +196,11 @@ internal/
   cache/      Sharded range cache with budget eviction
   catalog/    TorBox API → virtual directory tree
   config/     Environment variable parsing
-  dashboard/   Real-time web dashboard for cache/stream visualization
-  fusefs/     FUSE filesystem (DirNode, FileNode, mount, SyncTree)
+  dashboard/   Web dashboard: cache visualization, hidden file management
+  fusefs/     FUSE filesystem (DirNode, FileNode, mount, SyncTree, Unlink/Rmdir)
   integration/ Cross-package integration tests
   metrics/    Prometheus metrics server
-  state/      SQLite-backed persistent state
+  state/      SQLite-backed persistent state (file cache, hidden files)
   stream/     CDN client + StreamReader with prefetch & priority
   torbox/     TorBox API client with retry and rate limiting
 tests/        End-to-end stress tests
