@@ -132,9 +132,13 @@ func (c *Catalog) Refresh(ctx context.Context) error {
 		}
 	}
 
-	if err := c.stateDB.UpsertFiles(files); err != nil {
-		slog.Error("upsert file records", "err", err)
-		return fmt.Errorf("upsert file records: %w", err)
+	staleCount, err := c.stateDB.ReplaceFiles(files)
+	if err != nil {
+		slog.Error("replace file records", "err", err)
+		return fmt.Errorf("replace file records: %w", err)
+	}
+	if staleCount > 0 {
+		slog.Info("removed stale records", "count", staleCount)
 	}
 
 	// Remove hidden files from the tree before exposing it to FUSE.

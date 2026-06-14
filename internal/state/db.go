@@ -47,108 +47,114 @@ func Open(path string) (*DB, error) {
 		return nil, fmt.Errorf("state: ping db: %w", err)
 	}
 
-	// Create tables.
-	ddl := []string{
-		`CREATE TABLE IF NOT EXISTS inodes (
-			content_key TEXT PRIMARY KEY,
-			inode       INTEGER NOT NULL,
-			path        TEXT NOT NULL,
-			updated_at  TEXT NOT NULL
-		)`,
-		`CREATE UNIQUE INDEX IF NOT EXISTS idx_inode ON inodes(inode)`,
-		`CREATE TABLE IF NOT EXISTS files (
-			content_key   TEXT PRIMARY KEY,
-			download_kind TEXT NOT NULL,
-			download_id   TEXT NOT NULL,
-			file_id       TEXT NOT NULL,
-			path          TEXT NOT NULL,
-			size          INTEGER NOT NULL,
-			updated_at    TEXT NOT NULL
-		)`,
-		`CREATE TABLE IF NOT EXISTS hidden_files (
-			content_key TEXT PRIMARY KEY,
-			hidden_at  TEXT NOT NULL
-		)`,
-	}
-	for _, stmt := range ddl {
-		if _, err := conn.Exec(stmt); err != nil {
-			_ = conn.Close()
-			return nil, fmt.Errorf("state: exec ddl: %w", err)
-		}
-	}
-
-	db := &DB{conn: conn}
-
-	// Initialise nextInode from existing data.
-	var maxInode sql.NullInt64
-	row := conn.QueryRow(`SELECT COALESCE(MAX(inode), 0) FROM inodes`)
-	if err := row.Scan(&maxInode); err != nil {
+	if err := initSchema(conn); err != nil {
 		_ = conn.Close()
-		return nil, fmt.Errorf("state: scan max inode: %w", err)
+		return nil, fmt.Errorf("state: init schema: %w", err)
 	}
-	db.nextInode = uint64(maxInode.Int64) + 1
 
-	return db, nil
+	next, err := initNextInode(conn)
+	if err != nil {
+		_ = conn.Close()
+		return nil, fmt.Errorf("state: init next inode: %w", err)
+	}
+
+	return &DB{conn: conn, nextInode: next}, nil
 }
 
-// AssignInode returns the existing inode for contentKey if one exists,
-// otherwise allocates the next available inode number and persists it.
+func initSchema(conn *sql.DB) error {
+	const schema = `
+	CREATE TABLE IF NOT EXISTS inodes (
+		content_key TEXT PRIMARY KEY,
+		inode       INTEGER NOT NULL,
+		path        TEXT NOT NULL
+	);
+	CREATE TABLE IF NOT EXISTS files (
+		content_key   TEXT PRIMARY KEY,
+		download_kind TEXT NOT NULL,
+		download_id   TEXT NOT NULL,
+		file_id       TEXT NOT NULL,
+		path          TEXT NOT NULL,
+		size          INTEGER NOT NULL,
+		updated_at    TEXT NOT NULL
+	);
+	CREATE TABLE IF NOT EXISTS hidden_files (
+		content_key TEXT PRIMARY KEY,
+		hidden_at   TEXT NOT NULL
+	);
+	CREATE INDEX IF NOT EXISTS idx_files_download ON files(download_kind, download_id);
+	`
+	if _, err := conn.Exec(schema); err != nil {
+		return fmt.Errorf("init schema: %w", err)
+	}
+	return nil
+}
+
+func initNextInode(conn *sql.DB) (uint64, error) {
+	var maxInode sql.NullInt64
+	err := conn.QueryRow(`SELECT MAX(inode) FROM inodes`).Scan(&maxInode)
+	if err != nil {
+		return 0, fmt.Errorf("query max inode: %w", err)
+	}
+	if maxInode.Valid {
+		return uint64(maxInode.Int64) + 1, nil
+	}
+	return 1, nil // empty table
+}
+
+// AssignInode returns a stable inode number for the given content key.
+// If the key already has an inode, it returns the existing one.
+// Otherwise it allocates the next available inode.
 func (db *DB) AssignInode(contentKey, path string) (uint64, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
 
 	// Check for existing inode.
-	var inode uint64
+	var ino uint64
 	err := db.conn.QueryRow(
 		`SELECT inode FROM inodes WHERE content_key = ?`, contentKey,
-	).Scan(&inode)
+	).Scan(&ino)
 	if err == nil {
-		return inode, nil
+		return ino, nil
 	}
 	if err != sql.ErrNoRows {
-		return 0, fmt.Errorf("state: query inode: %w", err)
+		return 0, fmt.Errorf("state: lookup inode for %q: %w", contentKey, err)
 	}
 
 	// Allocate new inode.
-	inode = db.nextInode
+	ino = db.nextInode
 	db.nextInode++
-
-	now := sql.NullString{}
-	// Use current timestamp if available, otherwise empty string.
-	row := db.conn.QueryRow(`SELECT strftime('%Y-%m-%dT%H:%M:%SZ', 'now')`)
-	if err := row.Scan(&now); err != nil {
-		now.String = ""
-	}
-
 	_, err = db.conn.Exec(
-		`INSERT INTO inodes (content_key, inode, path, updated_at) VALUES (?, ?, ?, ?)`,
-		contentKey, inode, path, now,
+		`INSERT INTO inodes (content_key, inode, path) VALUES (?, ?, ?)`,
+		contentKey, ino, path,
 	)
 	if err != nil {
-		return 0, fmt.Errorf("state: insert inode: %w", err)
+		return 0, fmt.Errorf("state: insert inode for %q: %w", contentKey, err)
 	}
-
-	return inode, nil
+	return ino, nil
 }
 
 // LookupInode returns the inode number for the given content key.
-// Returns an error if the content key is not found.
 func (db *DB) LookupInode(contentKey string) (uint64, error) {
-	var inode uint64
+	var ino uint64
 	err := db.conn.QueryRow(
 		`SELECT inode FROM inodes WHERE content_key = ?`, contentKey,
-	).Scan(&inode)
+	).Scan(&ino)
+	if err == sql.ErrNoRows {
+		return 0, fmt.Errorf("state: no inode for %q", contentKey)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("state: lookup inode for %q: %w", contentKey, err)
 	}
-	return inode, nil
+	return ino, nil
 }
 
-// UpsertFiles performs a bulk upsert of file records using INSERT OR REPLACE.
+// UpsertFiles inserts or replaces file records in the database.
 func (db *DB) UpsertFiles(files []FileRecord) error {
 	if len(files) == 0 {
 		return nil
 	}
+	db.mu.Lock()
+	defer db.mu.Unlock()
 
 	tx, err := db.conn.Begin()
 	if err != nil {
@@ -179,6 +185,86 @@ func (db *DB) UpsertFiles(files []FileRecord) error {
 		return fmt.Errorf("state: commit upsert: %w", err)
 	}
 	return nil
+}
+
+// ReplaceFiles atomically replaces the entire file set: it upserts the
+// provided records and deletes any stale records from files and hidden_files
+// tables. Inodes are preserved so that stable inode numbers survive across
+// API refreshes. Returns the number of stale file records removed.
+func (db *DB) ReplaceFiles(files []FileRecord) (int, error) {
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	tx, err := db.conn.Begin()
+	if err != nil {
+		return 0, fmt.Errorf("state: begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	// Create a temp table holding current content keys for efficient NOT IN queries.
+	if _, err := tx.Exec(`CREATE TEMP TABLE _current_keys (content_key TEXT PRIMARY KEY)`); err != nil {
+		return 0, fmt.Errorf("state: create temp table: %w", err)
+	}
+	keyStmt, err := tx.Prepare(`INSERT OR IGNORE INTO _current_keys (content_key) VALUES (?)`)
+	if err != nil {
+		return 0, fmt.Errorf("state: prepare key insert: %w", err)
+	}
+	defer func() { _ = keyStmt.Close() }()
+
+	for _, f := range files {
+		if _, err := keyStmt.Exec(f.ContentKey); err != nil {
+			return 0, fmt.Errorf("state: insert key %q: %w", f.ContentKey, err)
+		}
+	}
+
+	// Upsert current records into files table.
+	stmt, err := tx.Prepare(`
+		INSERT OR REPLACE INTO files
+			(content_key, download_kind, download_id, file_id, path, size, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))
+	`)
+	if err != nil {
+		return 0, fmt.Errorf("state: prepare upsert: %w", err)
+	}
+	defer func() { _ = stmt.Close() }()
+
+	for _, f := range files {
+		if _, err := stmt.Exec(
+			f.ContentKey, f.DownloadKind, f.DownloadID,
+			f.FileID, f.Path, f.Size,
+		); err != nil {
+			return 0, fmt.Errorf("state: upsert file %q: %w", f.ContentKey, err)
+		}
+	}
+
+	// Delete stale hidden_files first (so files JOIN still works if needed).
+	if _, err := tx.Exec(`DELETE FROM hidden_files WHERE content_key NOT IN (SELECT content_key FROM _current_keys)`); err != nil {
+		return 0, fmt.Errorf("state: delete stale hidden: %w", err)
+	}
+
+	// Delete stale file records and capture the count.
+	result, err := tx.Exec(`DELETE FROM files WHERE content_key NOT IN (SELECT content_key FROM _current_keys)`)
+	if err != nil {
+		return 0, fmt.Errorf("state: delete stale files: %w", err)
+	}
+	staleCount, err := result.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("state: rows affected: %w", err)
+	}
+
+	// Keep inodes for removed files — they provide stable inode numbers
+	// across restarts so media scanners don't re-scan unchanged content.
+
+	// Clean up temp table.
+	if _, err := tx.Exec(`DROP TABLE IF EXISTS _current_keys`); err != nil {
+		return 0, fmt.Errorf("state: drop temp table: %w", err)
+	}
+
+	if err := tx.Commit(); err != nil {
+		return 0, fmt.Errorf("state: commit replace: %w", err)
+	}
+
+	return int(staleCount), nil
 }
 
 // LookupFile returns file metadata for the given content key.

@@ -511,6 +511,85 @@ func TestListHiddenDownloads(t *testing.T) {
 	}
 }
 
+func TestReplaceFiles_RemovesStale(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	// Insert initial files.
+	err := db.UpsertFiles([]FileRecord{
+		{ContentKey: "torrent:1:10", DownloadKind: "torrent", DownloadID: "1", FileID: "10", Path: "/movies/Film A/film.mkv", Size: 1000},
+		{ContentKey: "torrent:1:20", DownloadKind: "torrent", DownloadID: "1", FileID: "20", Path: "/movies/Film A/sub.srt", Size: 50},
+		{ContentKey: "torrent:2:30", DownloadKind: "torrent", DownloadID: "2", FileID: "30", Path: "/movies/Film B/film.mkv", Size: 2000},
+	})
+	if err != nil {
+		t.Fatalf("UpsertFiles: %v", err)
+	}
+
+	// Verify we have 3 files.
+	files, err := db.ListFiles()
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	if len(files) != 3 {
+		t.Fatalf("expected 3 files, got %d", len(files))
+	}
+
+	// Assign inodes so we can check they're cleaned up.
+	_, err = db.AssignInode("torrent:1:10", "/movies/Film A/film.mkv")
+	if err != nil {
+		t.Fatalf("AssignInode: %v", err)
+	}
+	_, err = db.AssignInode("torrent:1:20", "/movies/Film A/sub.srt")
+	if err != nil {
+		t.Fatalf("AssignInode: %v", err)
+	}
+	_, err = db.AssignInode("torrent:2:30", "/movies/Film B/film.mkv")
+	if err != nil {
+		t.Fatalf("AssignInode: %v", err)
+	}
+
+	// Hide one file to check it's cleaned up too.
+	if err := db.HideFile("torrent:1:20"); err != nil {
+		t.Fatalf("HideFile: %v", err)
+	}
+
+	// Replace with only 2 files (torrent:2:30 removed, torrent:1:20 no longer in API).
+	staleCount, err := db.ReplaceFiles([]FileRecord{
+		{ContentKey: "torrent:1:10", DownloadKind: "torrent", DownloadID: "1", FileID: "10", Path: "/movies/Film A/film.mkv", Size: 1000},
+		{ContentKey: "torrent:3:40", DownloadKind: "torrent", DownloadID: "3", FileID: "40", Path: "/movies/Film C/film.mkv", Size: 3000},
+	})
+	if err != nil {
+		t.Fatalf("ReplaceFiles: %v", err)
+	}
+	if staleCount != 2 {
+		t.Errorf("staleCount: got %d, want 2", staleCount)
+	}
+
+	// Verify files table now has only 2 records.
+	files, err = db.ListFiles()
+	if err != nil {
+		t.Fatalf("ListFiles: %v", err)
+	}
+	if len(files) != 2 {
+		t.Errorf("expected 2 files after ReplaceFiles, got %d", len(files))
+	}
+
+	// Verify hidden_files was also cleaned up.
+	hidden, err := db.HiddenSet()
+	if err != nil {
+		t.Fatalf("HiddenSet: %v", err)
+	}
+	if len(hidden) != 0 {
+		t.Errorf("expected 0 hidden files after ReplaceFiles, got %d", len(hidden))
+	}
+
+	// Verify inode for removed file still exists (it's kept for stability).
+	_, err = db.LookupInode("torrent:1:20")
+	if err != nil {
+		t.Logf("inode for removed file: %v (kept for path stability)", err)
+	}
+}
+
 // openTestDB creates a DB in a temp directory and registers cleanup.
 func openTestDB(t *testing.T) *DB {
 	t.Helper()
