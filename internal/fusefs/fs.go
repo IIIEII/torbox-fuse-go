@@ -320,7 +320,7 @@ func (d *DirNode) Unlink(ctx context.Context, name string) syscall.Errno {
 
 	// Remove the inode from the FUSE tree.
 	d.RmChild(name)
-	d.NotifyEntry(name)
+	_ = d.NotifyEntry(name)
 
 	// Parse content key to get download kind and ID.
 	kind, downloadID, _ := parseContentKey(contentKey)
@@ -388,7 +388,7 @@ func (d *DirNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 	if len(fileNodes) == 0 {
 		// Empty directory — just remove it from the tree.
 		d.RmChild(name)
-		d.NotifyEntry(name)
+		_ = d.NotifyEntry(name)
 		return 0
 	}
 
