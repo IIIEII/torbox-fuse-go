@@ -7,6 +7,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync/atomic"
 
 	"github.com/iiieii/torbox-fuse-go/internal/metrics"
@@ -109,6 +110,11 @@ func (c *Catalog) Refresh(ctx context.Context) error {
 	for dirPath, entries := range tree.dirs {
 		for _, entry := range entries {
 			if entry.File == nil {
+				continue
+			}
+			// Skip /all directory entries — they are derived from /movies and /series
+			// paths and must not overwrite the real paths in the database.
+			if strings.HasPrefix(dirPath, "/all/") {
 				continue
 			}
 			f := entry.File
