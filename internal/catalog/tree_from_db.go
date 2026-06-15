@@ -3,6 +3,7 @@ package catalog
 import (
 	"path"
 	"sort"
+	"strings"
 
 	"github.com/iiieii/torbox-fuse-go/internal/state"
 )
@@ -27,6 +28,14 @@ func BuildTreeFromDB(records []state.FileRecord, allDir bool) *Tree {
 			continue
 		}
 		seen[rec.ContentKey] = true
+
+		// Filter out stale /all/ paths that may have been stored by a
+		// previous version. The /all directory is derived from /movies
+		// and /series paths, so storing it in the DB would overwrite
+		// the real path with an incorrect /all/<title>/<filename> path.
+		if strings.HasPrefix(rec.Path, "/all/") {
+			continue
+		}
 
 		dirPath := path.Dir(rec.Path)
 		fileName := path.Base(rec.Path)
