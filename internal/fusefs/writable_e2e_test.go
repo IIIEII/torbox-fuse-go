@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 	"time"
 
@@ -52,6 +53,7 @@ func TestUnlink_HidesFile(t *testing.T) {
 	defer tbServer.Close()
 
 	// ── Build catalog: one download with two files ────────────────────
+	// BuildTree places series files under /series/{title}/Season {N}/.
 	tree := catalog.BuildTree([]catalog.Download{
 		{
 			Kind: catalog.KindTorrent,
@@ -148,11 +150,11 @@ func TestUnlink_HidesFile(t *testing.T) {
 		t.Fatalf("mount did not become ready: %v", err)
 	}
 
-	// ── Verify initial state: 2 files in series directory ─────────────
-	seriesDir := filepath.Join(mountDir, "series", "Test.Show.S01")
-	entries, err := os.ReadDir(seriesDir)
+	// ── Verify initial state: 2 files in Season 1 directory ──────────
+	seasonDir := filepath.Join(mountDir, "series", "Test.Show.S01", "Season 1")
+	entries, err := os.ReadDir(seasonDir)
 	if err != nil {
-		t.Fatalf("ReadDir(series): %v", err)
+		t.Fatalf("ReadDir(season dir): %v", err)
 	}
 	if len(entries) != 2 {
 		t.Fatalf("expected 2 files initially, got %d: %v", len(entries), dirEntryNamesFs(entries))
@@ -160,15 +162,15 @@ func TestUnlink_HidesFile(t *testing.T) {
 	t.Logf("initial files: %v", dirEntryNamesFs(entries))
 
 	// ── Delete (unlink) one file ───────────────────────────────────────
-	fileToDelete := filepath.Join(seriesDir, "Test.Show.S01E01.mkv")
+	fileToDelete := filepath.Join(seasonDir, "Test.Show.S01E01.mkv")
 	if err := os.Remove(fileToDelete); err != nil {
 		t.Fatalf("os.Remove(%s): %v", fileToDelete, err)
 	}
 
 	// ── Verify: only one file remains visible ─────────────────────────
-	entries, err = os.ReadDir(seriesDir)
+	entries, err = os.ReadDir(seasonDir)
 	if err != nil {
-		t.Fatalf("ReadDir(series) after unlink: %v", err)
+		t.Fatalf("ReadDir(season dir) after unlink: %v", err)
 	}
 	if len(entries) != 1 {
 		t.Fatalf("expected 1 file after unlink, got %d: %v", len(entries), dirEntryNamesFs(entries))
@@ -201,15 +203,15 @@ func TestUnlink_HidesFile(t *testing.T) {
 	}
 
 	// ── Delete the second file ────────────────────────────────────────
-	fileToDelete2 := filepath.Join(seriesDir, "Test.Show.S01E02.mkv")
+	fileToDelete2 := filepath.Join(seasonDir, "Test.Show.S01E02.mkv")
 	if err := os.Remove(fileToDelete2); err != nil {
 		t.Fatalf("os.Remove(%s): %v", fileToDelete2, err)
 	}
 
 	// ── Verify: directory is now empty ──────────────────────────────────
-	entries, err = os.ReadDir(seriesDir)
+	entries, err = os.ReadDir(seasonDir)
 	if err != nil {
-		t.Fatalf("ReadDir(series) after second unlink: %v", err)
+		t.Fatalf("ReadDir(season dir) after second unlink: %v", err)
 	}
 	if len(entries) != 0 {
 		t.Fatalf("expected 0 files after both unlinked, got %d: %v", len(entries), dirEntryNamesFs(entries))
@@ -240,5 +242,142 @@ func TestUnlink_HidesFile(t *testing.T) {
 		if !found {
 			t.Errorf("expected delete request for torrent:100, got %v", deleteRequests)
 		}
+	}
+}
+
+// TestUnlink_ReadOnly_ReturnsEROFS verifies that deleting a file via FUSE
+// returns EROFS when Writable mode is disabled.
+func TestUnlink_ReadOnly_ReturnsEROFS(t *testing.T) {
+	requireFUSE(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// ── Mock CDN server (not read, but needed by StreamReader) ────────
+	cdnServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not needed", http.StatusNotFound)
+	}))
+	defer cdnServer.Close()
+
+	// ── Build catalog: one movie file ─────────────────────────────────
+	tree := catalog.BuildTree([]catalog.Download{
+		{
+			Kind: catalog.KindTorrent,
+			ID:   "200",
+			Name: "Test.Movie.2024",
+			Hash: "def456",
+			Files: []catalog.File{
+				{
+					DownloadKind: catalog.KindTorrent,
+					DownloadID:   "200",
+					FileID:       "300",
+					Name:         "Test.Movie.2024/Test.Movie.2024.mkv",
+					Size:         4096,
+					MimeType:     "video/x-matroska",
+					MediaType:    catalog.MediaMovie,
+				},
+			},
+		},
+	}, false)
+
+	// ── State DB ─────────────────────────────────────────────────────
+	stateDir := t.TempDir()
+	db, err := state.Open(filepath.Join(stateDir, "state.db"))
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+	defer db.Close()
+
+	// ── Stream reader (unused, but needed by RootNode) ──────────────
+	rc := cache.NewRangeCache(256*1024*1024, nil)
+	cdnClient := stream.NewCDNClient(8, nil, 0)
+	permalinkBuilder := func(fileKey string) string { return cdnServer.URL }
+	streamer := stream.NewStreamReader(rc, cdnClient, 2, 100, int64(16*1024*1024), permalinkBuilder, nil)
+
+	// ── Config with Writable = false (default) ────────────────────────
+	cfg := &config.Config{
+		APIKey:            "test-api-key",
+		APIBaseURL:        "http://localhost:0",
+		CacheBudgetMB:     256,
+		PrefetchWindowMB:  16,
+		StreamMaxInflight: 2,
+		StreamConcurrency: 8,
+		AttrTimeoutSec:    1,
+		EntryTimeoutSec:   1,
+		UID:               uint32(os.Getuid()),
+		GID:               uint32(os.Getgid()),
+		Writable:          false, // read-only
+	}
+
+	tbClient := torbox.NewClient(&e2eTorboxConfig{apiKey: "test", baseURL: "http://localhost:0"})
+
+	// ── Create FUSE root and mount ─────────────────────────────────────
+	cat := catalog.NewCatalogFromTree(tree)
+	root := NewRootNode(cat, db, streamer, cfg, tbClient)
+
+	mountDir := t.TempDir()
+	cfg.MountPath = mountDir
+
+	attrTimeout := time.Duration(cfg.AttrTimeoutSec) * time.Second
+	entryTimeout := time.Duration(cfg.EntryTimeoutSec) * time.Second
+	server, err := fs.Mount(mountDir, root, &fs.Options{
+		AttrTimeout:  &attrTimeout,
+		EntryTimeout: &entryTimeout,
+		MountOptions: fuse.MountOptions{
+			FsName: "torbox-media-center",
+			Debug:  false,
+		},
+	})
+	if err != nil {
+		t.Fatalf("fs.Mount: %v", err)
+	}
+	defer func() {
+		server.Unmount()
+		done := make(chan struct{})
+		go func() { server.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Log("timeout waiting for server.Wait after unmount")
+		}
+	}()
+
+	if err := waitForMount(t, ctx, mountDir); err != nil {
+		t.Fatalf("mount did not become ready: %v", err)
+	}
+
+	// ── Verify: file exists ───────────────────────────────────────────
+	filePath := filepath.Join(mountDir, "movies", "Test.Movie.2024", "Test.Movie.2024.mkv")
+	if _, err := os.Stat(filePath); err != nil {
+		t.Fatalf("Stat(movie file): %v", err)
+	}
+
+	// ── Verify: os.Remove returns EROFS (read-only filesystem) ─────────
+	err = os.Remove(filePath)
+	if err == nil {
+		t.Fatal("expected os.Remove to fail on read-only mount, but it succeeded")
+	}
+	// On macOS, the error is EROFS; on Linux it may be EPERM.
+	// Both map to "read-only file system" or "operation not permitted".
+	pathErr, ok := err.(*os.PathError)
+	if !ok {
+		t.Fatalf("expected *os.PathError, got %T: %v", err, err)
+	}
+	if pathErr.Err != syscall.EROFS && pathErr.Err != syscall.EPERM {
+		t.Errorf("expected EROFS or EPERM, got %v (raw: %v)", pathErr.Err, err)
+	}
+
+	// ── Verify: file is still visible after failed remove ──────────────
+	if _, err := os.Stat(filePath); err != nil {
+		t.Fatalf("file should still exist after failed remove: %v", err)
+	}
+
+	// ── Verify: file is NOT marked as hidden in DB ────────────────────
+	hidden, err := db.IsHidden("torrent:200:300")
+	if err != nil {
+		t.Fatalf("IsHidden: %v", err)
+	}
+	if hidden {
+		t.Error("file should NOT be hidden in DB after failed unlink")
 	}
 }
