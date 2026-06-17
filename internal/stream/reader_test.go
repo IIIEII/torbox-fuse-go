@@ -103,9 +103,19 @@ func TestReadAt_CacheMissFetchesFromCDN(t *testing.T) {
 		t.Fatalf("expected \"ABCDE\", got %q", buf[:n])
 	}
 
-	// Verify the data was cached
-	cached := make([]byte, 5)
-	cn, hit := rc.CopyTo("f1", 0, cached)
+	// Verify the data was cached. The fetchWindow goroutine stores data
+	// into the cache asynchronously after waitForBytes returns, so we may
+	// need to retry briefly until the cache is populated.
+	var cached [5]byte
+	var cn int
+	var hit bool
+	for i := 0; i < 100; i++ {
+		cn, hit = rc.CopyTo("f1", 0, cached[:])
+		if hit {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
 	if !hit {
 		t.Fatal("expected data to be cached after CDN fetch")
 	}
