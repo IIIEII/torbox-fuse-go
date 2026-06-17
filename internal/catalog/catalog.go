@@ -84,8 +84,17 @@ func (c *Catalog) Refresh(ctx context.Context) error {
 	}
 	defer c.refreshing.Store(false)
 
-	c.metrics.RefreshCount.Add(1)
+	if c.metrics != nil {
+		c.metrics.RefreshCount.Add(1)
+	}
 	slog.Info("catalog refresh started")
+
+	// If the catalog was created from a static tree (no API client),
+	// Refresh is a no-op — there is nothing to refresh from.
+	if c.client == nil {
+		slog.Warn("catalog refresh skipped: no API client configured")
+		return nil
+	}
 
 	var allDownloads []Download
 	kinds := []DownloadKind{KindTorrent, KindUsenet, KindWebDL}
@@ -95,7 +104,9 @@ func (c *Catalog) Refresh(ctx context.Context) error {
 			slog.Error("fetch downloads", "kind", kind, "err", err)
 			return fmt.Errorf("upsert file records: %w", err)
 		}
-		c.metrics.APICallCount.Add(1)
+		if c.metrics != nil {
+			c.metrics.APICallCount.Add(1)
+		}
 		slog.Info("fetched downloads", "kind", kind, "count", len(downloads))
 		allDownloads = append(allDownloads, downloads...)
 	}
@@ -164,7 +175,9 @@ func (c *Catalog) Refresh(ctx context.Context) error {
 	}
 
 	// Update metrics.
-	c.metrics.CatalogItems.Store(int64(len(files)))
+	if c.metrics != nil {
+		c.metrics.CatalogItems.Store(int64(len(files)))
+	}
 	slog.Info("catalog refresh complete", "files", len(files))
 
 	return nil
@@ -201,7 +214,9 @@ func (c *Catalog) LoadFromDB(ctx context.Context) error {
 		c.onRefresh()
 	}
 
-	c.metrics.CatalogItems.Store(int64(len(records)))
+	if c.metrics != nil {
+		c.metrics.CatalogItems.Store(int64(len(records)))
+	}
 	slog.Info("loaded catalog from db cache", "files", len(records))
 	return nil
 }

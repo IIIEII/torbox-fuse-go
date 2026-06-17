@@ -326,7 +326,13 @@ func (d *DirNode) Unlink(ctx context.Context, name string) syscall.Errno {
 
 	// Remove the inode from the FUSE tree.
 	d.RmChild(name)
-	_ = d.NotifyEntry(name)
+	// NOTE: Do NOT call d.NotifyEntry(name) here. NotifyEntry sends a
+	// FUSE_NOTIFY_INVAL_ENTRY to the kernel, which does a synchronous write
+	// to /dev/fuse. When called from inside a FUSE handler (Unlink), this
+	// deadlocks on macOS: the kernel is waiting for the Unlink reply, and
+	// NotifyEntry blocks trying to write to the same FUSE connection.
+	// RmChild already removes the entry from go-fuse's Inode tree, and the
+	// kernel will invalidate its dentry cache when Unlink returns errno=0.
 
 	// Parse content key to get download kind and ID.
 	kind, downloadID, _ := parseContentKey(contentKey)
@@ -380,10 +386,8 @@ func (d *DirNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 		return syscall.ENOTDIR
 	}
 
-	// Collect all file nodes under this directory.
+	// Collect all file nodes under this directory BEFORE modifying the tree.
 	var fileNodes []*FileNode
-	child.RmAllChildren() // we'll re-add the remaining ones after hiding
-	// Walk all children of the directory and collect FileNodes.
 	for childName, ch := range child.Children() {
 		if fn, ok := ch.Operations().(*FileNode); ok {
 			fileNodes = append(fileNodes, fn)
@@ -394,7 +398,6 @@ func (d *DirNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 	if len(fileNodes) == 0 {
 		// Empty directory — just remove it from the tree.
 		d.RmChild(name)
-		_ = d.NotifyEntry(name)
 		return 0
 	}
 

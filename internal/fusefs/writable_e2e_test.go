@@ -91,6 +91,14 @@ func TestUnlink_HidesFile(t *testing.T) {
 	}
 	defer db.Close()
 
+	// Seed the files table so IsDownloadFullyHidden can count them.
+	if err := db.UpsertFiles([]state.FileRecord{
+		{ContentKey: "torrent:100:200", DownloadKind: "torrent", DownloadID: "100", FileID: "200", Path: "Test.Show.S01/Test.Show.S01E01.mkv", Size: 1024},
+		{ContentKey: "torrent:100:201", DownloadKind: "torrent", DownloadID: "100", FileID: "201", Path: "Test.Show.S01/Test.Show.S01E02.mkv", Size: 2048},
+	}); err != nil {
+		t.Fatalf("UpsertFiles: %v", err)
+	}
+
 	// ── Stream reader (unused, but needed by RootNode) ──────────────
 	rc := cache.NewRangeCache(256*1024*1024, nil)
 	cdnClient := stream.NewCDNClient(8, nil, 0)
@@ -217,17 +225,10 @@ func TestUnlink_HidesFile(t *testing.T) {
 		t.Fatalf("expected 0 files after both unlinked, got %d: %v", len(entries), dirEntryNamesFs(entries))
 	}
 
-	// ── Verify: both files hidden in DB ────────────────────────────────
-	hidden, err = db.IsHidden("torrent:100:201")
-	if err != nil {
-		t.Fatalf("IsHidden(second file): %v", err)
-	}
-	if !hidden {
-		t.Error("second file should be hidden in DB after unlink")
-	}
-
 	// ── Verify: TorBox delete was called (download fully hidden) ───────
-	// Allow a brief moment for the async TorBox call.
+	// After both files are hidden, Unlink deletes the download from TorBox
+	// and calls UnhideDownload to clean up hidden-file records.
+	// We verify the TorBox delete request was made.
 	time.Sleep(500 * time.Millisecond)
 	if len(deleteRequests) == 0 {
 		t.Error("expected TorBox delete call after all files hidden, got none")
@@ -242,6 +243,16 @@ func TestUnlink_HidesFile(t *testing.T) {
 		if !found {
 			t.Errorf("expected delete request for torrent:100, got %v", deleteRequests)
 		}
+	}
+
+	// ── Verify: hidden records cleaned up after TorBox deletion ────────
+	// UnhideDownload removes all hidden-file entries for the download.
+	hidden, err = db.IsHidden("torrent:100:200")
+	if err != nil {
+		t.Fatalf("IsHidden(after cleanup): %v", err)
+	}
+	if hidden {
+		t.Error("hidden records should be cleaned up after TorBox deletion")
 	}
 }
 
@@ -379,5 +390,191 @@ func TestUnlink_ReadOnly_ReturnsEROFS(t *testing.T) {
 	}
 	if hidden {
 		t.Error("file should NOT be hidden in DB after failed unlink")
+	}
+}
+
+// TestRmdir_HidesAllFilesAndDeletesDownload verifies that removing a directory
+// via FUSE Rmdir (Writable mode) hides all files in that directory and, when
+// all files of a download are hidden, triggers a TorBox delete call.
+//
+// This is a regression test for two bugs:
+//  1. Rmdir called RmAllChildren() before collecting fileNodes, so fileNodes
+//     was always empty and no files were hidden.
+//  2. NotifyEntry inside Unlink/Rmdir caused a FUSE deadlock on macOS because
+//     the kernel is waiting for the handler to return while NotifyEntry tries
+//     to write to /dev/fuse.
+func TestRmdir_HidesAllFilesAndDeletesDownload(t *testing.T) {
+	requireFUSE(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// ── Mock CDN server (not read, but needed by StreamReader) ────────
+	cdnServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not needed", http.StatusNotFound)
+	}))
+	defer cdnServer.Close()
+
+	// ── Mock TorBox API server (records delete requests) ──────────────
+	var deleteRequests []string
+	tbServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			deleteRequests = append(deleteRequests, r.URL.Path+"?"+r.URL.Query().Encode())
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprint(w, `{"success": true}`)
+	}))
+	defer tbServer.Close()
+
+	// ── Build catalog: one download with three files in Season 1 ──────
+	tree := catalog.BuildTree([]catalog.Download{
+		{
+			Kind: catalog.KindTorrent,
+			ID:   "500",
+			Name: "My.Series.S02",
+			Hash: "xyz789",
+			Files: []catalog.File{
+				{
+					DownloadKind: catalog.KindTorrent,
+					DownloadID:   "500",
+					FileID:       "501",
+					Name:         "My.Series.S02/My.Series.S02E01.mkv",
+					Size:         1024,
+					MimeType:     "video/x-matroska",
+					MediaType:    catalog.MediaSeries,
+				},
+				{
+					DownloadKind: catalog.KindTorrent,
+					DownloadID:   "500",
+					FileID:       "502",
+					Name:         "My.Series.S02/My.Series.S02E02.mkv",
+					Size:         2048,
+					MimeType:     "video/x-matroska",
+					MediaType:    catalog.MediaSeries,
+				},
+				{
+					DownloadKind: catalog.KindTorrent,
+					DownloadID:   "500",
+					FileID:       "503",
+					Name:         "My.Series.S02/My.Series.S02E03.mkv",
+					Size:         3072,
+					MimeType:     "video/x-matroska",
+					MediaType:    catalog.MediaSeries,
+				},
+			},
+		},
+	}, false)
+
+	// ── State DB ─────────────────────────────────────────────────────
+	stateDir := t.TempDir()
+	db, err := state.Open(filepath.Join(stateDir, "state.db"))
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+	defer db.Close()
+
+	// Seed the files table so IsDownloadFullyHidden can count them.
+	if err := db.UpsertFiles([]state.FileRecord{
+		{ContentKey: "torrent:500:501", DownloadKind: "torrent", DownloadID: "500", FileID: "501", Path: "My.Series.S02/My.Series.S02E01.mkv", Size: 1024},
+		{ContentKey: "torrent:500:502", DownloadKind: "torrent", DownloadID: "500", FileID: "502", Path: "My.Series.S02/My.Series.S02E02.mkv", Size: 2048},
+		{ContentKey: "torrent:500:503", DownloadKind: "torrent", DownloadID: "500", FileID: "503", Path: "My.Series.S02/My.Series.S02E03.mkv", Size: 3072},
+	}); err != nil {
+		t.Fatalf("UpsertFiles: %v", err)
+	}
+
+	// ── Stream reader (unused, but needed by RootNode) ──────────────
+	rc := cache.NewRangeCache(256*1024*1024, nil)
+	cdnClient := stream.NewCDNClient(8, nil, 0)
+	permalinkBuilder := func(fileKey string) string { return cdnServer.URL }
+	streamer := stream.NewStreamReader(rc, cdnClient, 2, 100, int64(16*1024*1024), permalinkBuilder, nil)
+
+	// ── Config with Writable = true ────────────────────────────────────
+	cfg := &config.Config{
+		APIKey:            "test-api-key",
+		APIBaseURL:        tbServer.URL,
+		CacheBudgetMB:     256,
+		PrefetchWindowMB:  16,
+		StreamMaxInflight: 2,
+		StreamConcurrency: 8,
+		AttrTimeoutSec:    1,
+		EntryTimeoutSec:   1,
+		UID:               uint32(os.Getuid()),
+		GID:               uint32(os.Getgid()),
+		Writable:          true,
+	}
+
+	tbClient := torbox.NewClient(&e2eTorboxConfig{apiKey: "test", baseURL: tbServer.URL})
+
+	// ── Create FUSE root and mount ─────────────────────────────────────
+	cat := catalog.NewCatalogFromTree(tree)
+	root := NewRootNode(cat, db, streamer, cfg, tbClient)
+	cat.SetOnRefresh(func() { root.SyncTree(context.Background()) })
+
+	mountDir := t.TempDir()
+	cfg.MountPath = mountDir
+
+	attrTimeout := time.Duration(cfg.AttrTimeoutSec) * time.Second
+	entryTimeout := time.Duration(cfg.EntryTimeoutSec) * time.Second
+	server, err := fs.Mount(mountDir, root, &fs.Options{
+		AttrTimeout:  &attrTimeout,
+		EntryTimeout: &entryTimeout,
+		MountOptions: fuse.MountOptions{
+			FsName: "torbox-media-center",
+			Debug:  false,
+		},
+	})
+	if err != nil {
+		t.Fatalf("fs.Mount: %v", err)
+	}
+	defer func() {
+		server.Unmount()
+		done := make(chan struct{})
+		go func() { server.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Log("timeout waiting for server.Wait after unmount")
+		}
+	}()
+
+	if err := waitForMount(t, ctx, mountDir); err != nil {
+		t.Fatalf("mount did not become ready: %v", err)
+	}
+
+	// ── Verify initial state: 3 files in Season 2 directory ──────────
+	seasonDir := filepath.Join(mountDir, "series", "My.Series.S02", "Season 2")
+	entries, err := os.ReadDir(seasonDir)
+	if err != nil {
+		t.Fatalf("ReadDir(season dir): %v", err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("expected 3 files initially, got %d: %v", len(entries), dirEntryNamesFs(entries))
+	}
+	t.Logf("initial files: %v", dirEntryNamesFs(entries))
+
+	// ── Remove the Season 2 directory (Rmdir) ──────────────────────────
+	// Plex deletes entire season directories this way.
+	if err := os.Remove(seasonDir); err != nil {
+		t.Fatalf("os.Remove(season dir): %v", err)
+	}
+
+	// ── Verify: TorBox delete was called (download fully hidden) ───────
+	// After Unlink/Rmdir successfully deletes from TorBox, it calls
+	// UnhideDownload which clears the hidden entries. So we verify the
+	// delete request was made rather than checking IsHidden.
+	time.Sleep(500 * time.Millisecond)
+	if len(deleteRequests) == 0 {
+		t.Error("expected TorBox delete call after all files hidden via rmdir, got none")
+	} else {
+		t.Logf("TorBox delete requests: %v", deleteRequests)
+		found := false
+		for _, req := range deleteRequests {
+			if req == "/torrents/deletetorrent?id=500" {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("expected delete request for torrent:500, got %v", deleteRequests)
+		}
 	}
 }
