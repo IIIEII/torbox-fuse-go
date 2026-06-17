@@ -66,7 +66,8 @@ func initSchema(conn *sql.DB) error {
 	CREATE TABLE IF NOT EXISTS inodes (
 		content_key TEXT PRIMARY KEY,
 		inode       INTEGER NOT NULL,
-		path        TEXT NOT NULL
+		path        TEXT NOT NULL,
+		updated_at  TEXT NOT NULL
 	);
 	CREATE TABLE IF NOT EXISTS files (
 		content_key   TEXT PRIMARY KEY,
@@ -124,7 +125,7 @@ func (db *DB) AssignInode(contentKey, path string) (uint64, error) {
 	ino = db.nextInode
 	db.nextInode++
 	_, err = db.conn.Exec(
-		`INSERT INTO inodes (content_key, inode, path) VALUES (?, ?, ?)`,
+		`INSERT INTO inodes (content_key, inode, path, updated_at) VALUES (?, ?, ?, strftime('%Y-%m-%dT%H:%M:%SZ', 'now'))`,
 		contentKey, ino, path,
 	)
 	if err != nil {
