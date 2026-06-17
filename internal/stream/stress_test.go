@@ -37,21 +37,21 @@ type stressFile struct {
 // stressConfig controls the behavior of the mock CDN and StreamReader.
 type stressConfig struct {
 	// CDN behavior
-	rateLimitAfter     int           // return 429 after this many requests (0 = never)
-	rateLimitStatus    int           // HTTP status for rate limiting (default: 429)
-	serverErrorsAfter  int           // return 5xx after this many requests (0 = never)
-	serverErrorStatus  int           // HTTP status for server errors (default: 500)
-	cdnLatency         time.Duration // artificial delay per CDN response (0 = none)
-	cdnChunkDelay      time.Duration // delay between chunks when sending response body (0 = send instantly)
-	redirectCDN         bool          // if true, API URL redirects to a CDN URL
+	rateLimitAfter    int           // return 429 after this many requests (0 = never)
+	rateLimitStatus   int           // HTTP status for rate limiting (default: 429)
+	serverErrorsAfter int           // return 5xx after this many requests (0 = never)
+	serverErrorStatus int           // HTTP status for server errors (default: 500)
+	cdnLatency        time.Duration // artificial delay per CDN response (0 = none)
+	cdnChunkDelay     time.Duration // delay between chunks when sending response body (0 = send instantly)
+	redirectCDN       bool          // if true, API URL redirects to a CDN URL
 
 	// StreamReader configuration
-	windowSize       int64 // bytes per inflight window (default: 4 MiB)
-	maxInflight     int   // per-file max inflight windows (default: 2)
-	maxGlobalWindows int   // global max inflight windows (default: 100)
-	cacheBudgetMB   int   // cache budget in MiB (default: 256)
-	urlCacheTTL     time.Duration // CDN URL cache TTL (default: 5m)
-	concurrency     int   // per-CDN-host max concurrent requests (default: 8)
+	windowSize       int64         // bytes per inflight window (default: 4 MiB)
+	maxInflight      int           // per-file max inflight windows (default: 2)
+	maxGlobalWindows int           // global max inflight windows (default: 100)
+	cacheBudgetMB    int           // cache budget in MiB (default: 256)
+	urlCacheTTL      time.Duration // CDN URL cache TTL (default: 5m)
+	concurrency      int           // per-CDN-host max concurrent requests (default: 8)
 }
 
 func (c *stressConfig) defaults() *stressConfig {
@@ -84,14 +84,14 @@ func (c *stressConfig) defaults() *stressConfig {
 
 // stressTestEnv holds all the pieces needed for a stress test.
 type stressTestEnv struct {
-	sr        *StreamReader
-	cdn       *CDNClient
-	rc        *cache.RangeCache
-	server    *httptest.Server
-	cfg       *stressConfig
-	files     []stressFile
-	requests  atomic.Int32 // total CDN requests
-	resolves  atomic.Int32 // total resolve requests (for redirect mode)
+	sr          *StreamReader
+	cdn         *CDNClient
+	rc          *cache.RangeCache
+	server      *httptest.Server
+	cfg         *stressConfig
+	files       []stressFile
+	requests    atomic.Int32 // total CDN requests
+	resolves    atomic.Int32 // total resolve requests (for redirect mode)
 	rateLimited atomic.Int32 // total 429 responses returned
 }
 
@@ -519,10 +519,9 @@ func TestStress_PlaybackDuringScan(t *testing.T) {
 // ============================================================
 // Test 4: Rate-limited URL resolution
 // ============================================================
-// Simulates 429 on URL resolution. 30 concurrent ResolveURL calls
-// when the CDN returns 429. Verifies:
+// Simulates 429 on URL resolution. Verifies:
 // - Only 1 actual resolution attempt (singleflight dedup)
-// - Subsequent calls during backoff return API URL directly
+// - Subsequent calls during backoff return an error (not a fallback URL)
 // - After backoff expires, resolution succeeds
 
 func TestStress_RateLimitedResolution(t *testing.T) {
@@ -562,23 +561,22 @@ func TestStress_RateLimitedResolution(t *testing.T) {
 	ctx := context.Background()
 	apiURL := apiServer.URL + "/test_file"
 
-	// Phase 1: API returns 429. ResolveURL should cache the failure and
-	// fall back to the API URL.
+	// Phase 1: API returns 429. ResolveURL should return an error.
 	return429.Store(true)
-	result := cdn.ResolveURL(ctx, apiURL)
-	if result != apiURL {
-		t.Errorf("phase 1: expected fallback to API URL on 429, got %q", result)
+	_, err := cdn.ResolveURL(ctx, apiURL)
+	if err == nil {
+		t.Fatal("phase 1: expected error on 429, got nil")
 	}
 	if resolveAttempts.Load() != 1 {
 		t.Errorf("phase 1: expected 1 resolve attempt, got %d", resolveAttempts.Load())
 	}
 
-	// Phase 2: Subsequent calls during the backoff period should return
-	// the API URL immediately without making additional resolution attempts.
+	// Phase 2: Subsequent calls during the backoff period should also return
+	// errors without making additional resolution attempts.
 	for i := 0; i < 10; i++ {
-		result = cdn.ResolveURL(ctx, apiURL)
-		if result != apiURL {
-			t.Errorf("phase 2 call %d: expected API URL fallback during backoff, got %q", i+1, result)
+		_, err := cdn.ResolveURL(ctx, apiURL)
+		if err == nil {
+			t.Errorf("phase 2 call %d: expected error during backoff, got nil", i+1)
 		}
 	}
 	// No additional resolve attempts — all calls hit the cached 429 entry.
@@ -586,19 +584,16 @@ func TestStress_RateLimitedResolution(t *testing.T) {
 		t.Errorf("phase 2: expected 1 resolve attempt (all others cached), got %d", resolveAttempts.Load())
 	}
 
-	// Phase 3: Simultaneous concurrent calls during backoff — singleflight
-	// should dedup them so only 1 resolve attempt is made even if the
-	// backoff expires mid-call. We don't test this here because the backoff
-	// is 10s and we'd need precise timing; instead we test that concurrent
-	// calls during active backoff all return the API URL.
+	// Phase 3: Concurrent calls during backoff should all return errors
+	// and singleflight should dedup them.
 	var wg sync.WaitGroup
 	for i := 0; i < 30; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			r := cdn.ResolveURL(ctx, apiURL)
-			if r != apiURL {
-				t.Errorf("phase 3: expected API URL fallback, got %q", r)
+			_, err := cdn.ResolveURL(ctx, apiURL)
+			if err == nil {
+				t.Errorf("phase 3: expected error during backoff, got nil")
 			}
 		}()
 	}
@@ -612,14 +607,20 @@ func TestStress_RateLimitedResolution(t *testing.T) {
 	return429.Store(false)
 	time.Sleep(cdn.rateLimitCooldown + 100*time.Millisecond)
 
-	result = cdn.ResolveURL(ctx, apiURL)
+	result, err := cdn.ResolveURL(ctx, apiURL)
+	if err != nil {
+		t.Fatalf("phase 4: expected success after backoff expiry, got error: %v", err)
+	}
 	if result != cdnServer.URL+"/test_file" {
 		t.Errorf("phase 4: expected CDN URL after backoff expiry, got %q", result)
 	}
 
 	// Phase 5: Successful resolution should be cached — no more resolve attempts.
 	finalAttempts := resolveAttempts.Load()
-	result2 := cdn.ResolveURL(ctx, apiURL)
+	result2, err := cdn.ResolveURL(ctx, apiURL)
+	if err != nil {
+		t.Fatalf("phase 5: expected cached success, got error: %v", err)
+	}
 	if result2 != cdnServer.URL+"/test_file" {
 		t.Errorf("phase 5: expected cached CDN URL, got %q", result2)
 	}
@@ -641,24 +642,34 @@ func TestStress_RateLimitedCDNRequests(t *testing.T) {
 	const fileSize int64 = 4 * 1024 * 1024 // 4 MiB
 	files := makeStressFiles(1, fileSize)
 
-	// Rate limit after 2 requests, then recover after 10 total requests
-	// (allowing retries to succeed).
-	var requestCount atomic.Int32
+	// Use redirectCDN mode so that ResolveURL (API server) and CDN data
+	// requests go to separate servers. This lets us rate-limit only CDN
+	// data requests while keeping URL resolution working — matching the
+	// real-world scenario where the CDN returns 429 but the API is fine.
 	env := newStressEnv(t, &stressConfig{
-		// Custom CDN handler: rate limit first 2 requests, then succeed.
+		redirectCDN: true,
 	}, files)
 
-	// Override the server handler with rate-limiting logic.
-	origHandler := env.server.Config.Handler
+	// Override the CDN server handler to rate-limit the first 2 DATA requests
+	// only (not resolution probes). resolveRedirect sends Range: bytes=0-0
+	// probes to verify the CDN URL — those must succeed so the URL resolves.
+	// Once resolved, the actual data requests (with larger ranges) get 429'd
+	// first, then succeed on retry.
+	origCDNHandler := env.server.Config.Handler
+	var cdnDataRequestCount atomic.Int32
 	env.server.Config.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		reqNum := requestCount.Add(1)
-		// First 2 requests: 429
+		// Skip rate-limiting for resolution probes (Range: bytes=0-0).
+		if r.Header.Get("Range") == "bytes=0-0" {
+			origCDNHandler.ServeHTTP(w, r)
+			return
+		}
+		reqNum := cdnDataRequestCount.Add(1)
 		if reqNum <= 2 {
 			env.rateLimited.Add(1)
 			w.WriteHeader(http.StatusTooManyRequests)
 			return
 		}
-		origHandler.ServeHTTP(w, r)
+		origCDNHandler.ServeHTTP(w, r)
 	})
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -684,7 +695,7 @@ func TestStress_RateLimitedCDNRequests(t *testing.T) {
 
 func TestStress_CacheEvictionPriority(t *testing.T) {
 	const fileSize int64 = 4 * 1024 * 1024 // 4 MiB (1 window each)
-	files := makeStressFiles(8, fileSize) // 8 files = 32 MiB total
+	files := makeStressFiles(8, fileSize)  // 8 files = 32 MiB total
 
 	env := newStressEnv(t, &stressConfig{
 		cacheBudgetMB: 16, // Only 4 windows fit — forces eviction
@@ -1123,4 +1134,5 @@ func TestStress_ConcurrentPlaybackDifferentFiles(t *testing.T) {
 
 	t.Logf("concurrent playback: %d files, %d CDN requests", fileCount, env.requests.Load())
 }
+
 // ============================================================

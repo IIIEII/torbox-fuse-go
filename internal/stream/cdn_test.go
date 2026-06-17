@@ -143,7 +143,7 @@ func TestFetchRange_ConcurrencyLimit(t *testing.T) {
 	errCh := make(chan error, totalReqs)
 	for i := 0; i < totalReqs; i++ {
 		go func() {
-				resp, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0, 0)
+			resp, err := cdn.FetchRange(context.Background(), ts.URL, 0, 0, 0)
 			if err != nil {
 				errCh <- err
 				return
@@ -348,7 +348,10 @@ func TestResolveURL_CacheHit(t *testing.T) {
 	c := NewCDNClient(4, nil, 5*time.Minute)
 
 	// First resolution — should hit the CDN.
-	got := c.ResolveURL(context.Background(), cdn.URL)
+	got, err := c.ResolveURL(context.Background(), cdn.URL)
+	if err != nil {
+		t.Fatalf("ResolveURL first call error: %v", err)
+	}
 	if got != cdn.URL {
 		t.Errorf("ResolveURL first call = %q, want %q", got, cdn.URL)
 	}
@@ -357,7 +360,10 @@ func TestResolveURL_CacheHit(t *testing.T) {
 	}
 
 	// Second resolution — should be cached, no new request.
-	got2 := c.ResolveURL(context.Background(), cdn.URL)
+	got2, err := c.ResolveURL(context.Background(), cdn.URL)
+	if err != nil {
+		t.Fatalf("ResolveURL cached call error: %v", err)
+	}
 	if got2 != cdn.URL {
 		t.Errorf("ResolveURL cached call = %q, want %q", got2, cdn.URL)
 	}
@@ -409,13 +415,19 @@ func TestResolveURL_FollowsRedirect(t *testing.T) {
 
 	c := NewCDNClient(4, nil, 5*time.Minute)
 
-	got := c.ResolveURL(context.Background(), redirectServer.URL)
+	got, err := c.ResolveURL(context.Background(), redirectServer.URL)
+	if err != nil {
+		t.Fatalf("ResolveURL error: %v", err)
+	}
 	if got != cdnServer.URL {
 		t.Errorf("ResolveURL = %q, want %q (should follow redirect to CDN)", got, cdnServer.URL)
 	}
 
 	// Verify cached — no new redirect request.
-	got2 := c.ResolveURL(context.Background(), redirectServer.URL)
+	got2, err := c.ResolveURL(context.Background(), redirectServer.URL)
+	if err != nil {
+		t.Fatalf("ResolveURL cached call error: %v", err)
+	}
 	if got2 != cdnServer.URL {
 		t.Errorf("ResolveURL cached = %q, want %q", got2, cdnServer.URL)
 	}
@@ -431,7 +443,10 @@ func TestResolveURL_ZeroTTL(t *testing.T) {
 
 	c := NewCDNClient(4, nil, 0) // TTL=0 disables caching
 
-	got := c.ResolveURL(context.Background(), cdn.URL)
+	got, err := c.ResolveURL(context.Background(), cdn.URL)
+	if err != nil {
+		t.Fatalf("ResolveURL with TTL=0 error: %v", err)
+	}
 	if got != cdn.URL {
 		t.Errorf("ResolveURL with TTL=0 = %q, want %q (pass-through)", got, cdn.URL)
 	}
@@ -489,7 +504,10 @@ func TestFetchRange_ExpiredCDNURLRetry(t *testing.T) {
 	c := NewCDNClient(4, nil, 5*time.Minute)
 
 	// First, resolve the URL through the API.
-	resolved := c.ResolveURL(context.Background(), apiServer.URL)
+	resolved, err := c.ResolveURL(context.Background(), apiServer.URL)
+	if err != nil {
+		t.Fatalf("ResolveURL error: %v", err)
+	}
 	if resolved != cdnServer.URL {
 		t.Fatalf("ResolveURL = %q, want %q", resolved, cdnServer.URL)
 	}

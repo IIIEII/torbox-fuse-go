@@ -26,8 +26,8 @@ import (
 type hostSem struct {
 	mu      sync.Mutex
 	cond    *sync.Cond
-	limit   int  // max concurrent holders
-	holding int  // current number of holders
+	limit   int // max concurrent holders
+	holding int // current number of holders
 	waiters []*semWaiter
 }
 
@@ -165,11 +165,11 @@ const defaultRateLimitCooldown = 10 * time.Second
 type CDNClient struct {
 	client            *http.Client
 	maxConnsPerHost   int
-	hostSems          sync.Map          // string -> *hostSem - per-CDN-host semaphore
+	hostSems          sync.Map // string -> *hostSem - per-CDN-host semaphore
 	metrics           *metrics.Metrics
-	urlCache          sync.Map          // apiURL string -> *cdnURLCacheEntry
+	urlCache          sync.Map // apiURL string -> *cdnURLCacheEntry
 	urlCacheTTL       time.Duration
-	rateLimitCooldown time.Duration     // backoff for 429/5xx URL resolution failures
+	rateLimitCooldown time.Duration      // backoff for 429/5xx URL resolution failures
 	resolveGroup      singleflight.Group // dedup parallel URL resolution requests
 }
 
@@ -193,7 +193,7 @@ func NewCDNClient(maxConns int, m *metrics.Metrics, urlCacheTTL time.Duration) *
 				MaxIdleConnsPerHost: 16,
 				MaxConnsPerHost:     16,
 				IdleConnTimeout:     90 * time.Second,
-				DisableCompression: true,
+				DisableCompression:  true,
 			},
 		},
 		maxConnsPerHost:   maxConns,
@@ -201,6 +201,12 @@ func NewCDNClient(maxConns int, m *metrics.Metrics, urlCacheTTL time.Duration) *
 		urlCacheTTL:       urlCacheTTL,
 		rateLimitCooldown: defaultRateLimitCooldown,
 	}
+}
+
+// SetRateLimitCooldown sets the backoff duration for failed URL resolution
+// (429/5xx). Intended for tests; production code uses the default.
+func (c *CDNClient) SetRateLimitCooldown(d time.Duration) {
+	c.rateLimitCooldown = d
 }
 
 // getHostSem returns the per-host semaphore for the given host, creating one
@@ -230,17 +236,18 @@ func hostFromURL(rawURL string) string {
 // for rateLimitBackoff. This prevents thundering-herd API requests when the
 // container starts and Plex opens 30+ files simultaneously — the first 429
 // is cached as a negative result, and subsequent requests for the same URL
-// fall back to the API URL without hammering the API again until the backoff
-// expires.
+// fail fast without hammering the API until the backoff expires.
 //
 // Uses singleflight to dedup concurrent resolution requests for the same
 // API URL, preventing parallel requests from all hitting the API at once.
 //
-// Falls back to the API URL on resolution failure, so streaming still works
-// (just slower - the request goes through the API redirect each time).
-func (c *CDNClient) ResolveURL(ctx context.Context, apiURL string) string {
+// Returns an error when resolution fails (429, 5xx, network error). The
+// caller must retry — no fallback to the raw API URL because it does not
+// support Range requests correctly (the API endpoint returns a redirect that
+// drops the Range header, making streaming impossible).
+func (c *CDNClient) ResolveURL(ctx context.Context, apiURL string) (string, error) {
 	if c.urlCacheTTL <= 0 {
-		return apiURL
+		return apiURL, nil
 	}
 
 	// Check cache first — covers both successful and failed resolutions.
@@ -249,13 +256,14 @@ func (c *CDNClient) ResolveURL(ctx context.Context, apiURL string) string {
 		if entry.failed {
 			// Failed resolution (429/5xx) — check if backoff period has elapsed.
 			if time.Since(entry.resolvedAt) < c.rateLimitCooldown {
-				// Still in backoff — fall back to API URL without retrying.
-				return apiURL
+				// Still in backoff — return error without retrying.
+				return "", fmt.Errorf("cdn url resolution rate limited (backoff expires in %v): %w",
+					c.rateLimitCooldown-time.Since(entry.resolvedAt), fmt.Errorf("rate limited"))
 			}
 			// Backoff expired — fall through to re-resolve.
 		} else if time.Since(entry.resolvedAt) < c.urlCacheTTL {
 			// Successful resolution still valid.
-			return entry.resolvedURL
+			return entry.resolvedURL, nil
 		}
 	}
 
@@ -280,11 +288,11 @@ func (c *CDNClient) ResolveURL(ctx context.Context, apiURL string) string {
 	})
 
 	if err != nil {
-		slog.Warn("cdn url resolution failed, using api url directly", "url", apiURL, "err", err)
-		return apiURL
+		slog.Warn("cdn url resolution failed", "url", apiURL, "err", err)
+		return "", fmt.Errorf("cdn url resolution: %w", err)
 	}
 
-	return result.(string)
+	return result.(string), nil
 }
 
 // InvalidateURL removes the cached CDN URL for the given API URL. Call this
@@ -386,7 +394,13 @@ func (c *CDNClient) resolveRedirect(ctx context.Context, rawURL string) (string,
 func (c *CDNClient) FetchRange(ctx context.Context, rawURL string, start, end int64, priority uint8) (*http.Response, error) {
 	// Resolve API URL to direct CDN URL first - we need the host for per-host
 	// rate limiting, and we need the resolved URL for the request anyway.
-	resolvedURL := c.ResolveURL(ctx, rawURL)
+	// If resolution fails (e.g. rate-limited or server error), propagate the error
+	// so the caller can retry — no fallback to the raw API URL since it doesn't
+	// support Range requests.
+	resolvedURL, err := c.ResolveURL(ctx, rawURL)
+	if err != nil {
+		return nil, fmt.Errorf("resolve CDN URL: %w", err)
+	}
 
 	// Acquire per-host semaphore: limits concurrent requests to each CDN host.
 	// Priority-aware: high-priority requests (playback) jump ahead of
@@ -414,7 +428,10 @@ func (c *CDNClient) FetchRange(ctx context.Context, rawURL string, start, end in
 		resp.Body.Close()
 		slog.Warn("cdn url expired, re-resolving", "url", resolvedURL, "status", resp.StatusCode)
 		c.InvalidateURL(rawURL)
-		newResolved := c.ResolveURL(ctx, rawURL)
+		newResolved, reResolveErr := c.ResolveURL(ctx, rawURL)
+		if reResolveErr != nil {
+			return nil, fmt.Errorf("re-resolve CDN URL after %d: %w", resp.StatusCode, reResolveErr)
+		}
 		if newResolved != resolvedURL {
 			slog.Debug("cdn re-resolved url", "apiURL", rawURL, "newURL", newResolved)
 			return c.doRangeRequest(ctx, newResolved, start, end)

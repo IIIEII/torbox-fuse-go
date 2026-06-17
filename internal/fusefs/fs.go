@@ -74,7 +74,10 @@ func (r *RootNode) addCategoryDir(ctx context.Context, name, catalogPath string)
 	}
 
 	dirNode := &DirNode{
-		cfg: r.cfg,
+		cfg:      r.cfg,
+		stateDB:  r.stateDB,
+		cat:      r.cat,
+		tbClient: r.tbClient,
 	}
 	child := r.NewPersistentInode(ctx, dirNode, fs.StableAttr{
 		Mode: syscall.S_IFDIR | 0755,
@@ -112,7 +115,10 @@ func (r *RootNode) addSubDirNode(ctx context.Context, parent *fs.Inode, name, ca
 	}
 
 	dirNode := &DirNode{
-		cfg: r.cfg,
+		cfg:      r.cfg,
+		stateDB:  r.stateDB,
+		cat:      r.cat,
+		tbClient: r.tbClient,
 	}
 	child := parent.NewPersistentInode(ctx, dirNode, fs.StableAttr{
 		Mode: syscall.S_IFDIR | 0755,
