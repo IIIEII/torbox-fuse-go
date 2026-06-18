@@ -965,6 +965,124 @@ func TestBuildTree_AllDirRootListed(t *testing.T) {
 	}
 }
 
+// TestApplyHides_RemovesEmptyParentDirs verifies that when all files in a series
+// are hidden, the empty Season directory and its parent Show directory are also
+// removed from the tree. This is a regression test for a bug where empty directories
+// would reappear after restart because ApplyHides left dangling subdirectory entries.
+func TestApplyHides_RemovesEmptyParentDirs(t *testing.T) {
+	downloads := []Download{
+		{
+			Kind: KindTorrent,
+			ID:   "100",
+			Name: "My.Show.S01",
+			Files: []File{
+				{
+					DownloadKind: KindTorrent,
+					DownloadID:   "100",
+					FileID:       "1",
+					Name:         "My.Show.S01/My.Show.S01E01.mkv",
+					Size:         1024,
+					MimeType:     "video/x-matroska",
+					MediaType:    MediaSeries,
+				},
+				{
+					DownloadKind: KindTorrent,
+					DownloadID:   "100",
+					FileID:       "2",
+					Name:         "My.Show.S01/My.Show.S01E02.mkv",
+					Size:         2048,
+					MimeType:     "video/x-matroska",
+					MediaType:    MediaSeries,
+				},
+			},
+		},
+	}
+
+	tree := BuildTree(downloads, false)
+
+	// Before hiding: /series/My.Show.S01/Season 1/ should have 2 files.
+	seasonEntries := tree.ListDir("/series/My.Show.S01/Season 1")
+	if len(seasonEntries) != 2 {
+		t.Fatalf("before hide: Season 1 has %d entries, want 2", len(seasonEntries))
+	}
+
+	// Hide all files in this download.
+	hidden := map[string]bool{
+		"torrent:100:1": true,
+		"torrent:100:2": true,
+	}
+	filtered := ApplyHides(tree, hidden)
+
+	// After hiding: /series/My.Show.S01/Season 1 should not exist at all.
+	seasonDir := filtered.ListDir("/series/My.Show.S01/Season 1")
+	if seasonDir != nil {
+		t.Errorf("Season 1 dir should not exist after hiding all files, got %d entries", len(seasonDir))
+	}
+
+	// /series/My.Show.S01 should also not exist (it's empty).
+	showDir := filtered.ListDir("/series/My.Show.S01")
+	if showDir != nil {
+		t.Errorf("Show dir should not exist after hiding all files, got %d entries", len(showDir))
+	}
+
+	// /series should still exist but be empty.
+	seriesDir := filtered.ListDir("/series")
+	if seriesDir != nil {
+		t.Errorf("series root should be nil (empty), got %d entries", len(seriesDir))
+	}
+}
+
+// TestApplyHides_HidesFromAllDir verifies that hiding a file also removes it from
+// the /all directory, not just from /series or /movies.
+func TestApplyHides_HidesFromAllDir(t *testing.T) {
+	downloads := []Download{
+		{
+			Kind: KindTorrent,
+			ID:   "100",
+			Name: "My.Show.S01",
+			Files: []File{
+				{
+					DownloadKind: KindTorrent,
+					DownloadID:   "100",
+					FileID:       "1",
+					Name:         "My.Show.S01/My.Show.S01E01.mkv",
+					Size:         1024,
+					MimeType:     "video/x-matroska",
+					MediaType:    MediaSeries,
+				},
+			},
+		},
+	}
+
+	tree := BuildTree(downloads, true) // allDir = true
+
+	// Before hiding: file exists in both /series and /all.
+	seriesFile := tree.Lookup("/series/My.Show.S01/Season 1/My.Show.S01E01.mkv")
+	if seriesFile == nil {
+		t.Fatal("file should exist in /series before hiding")
+	}
+	allFile := tree.Lookup("/all/My.Show.S01/My.Show.S01E01.mkv")
+	if allFile == nil {
+		t.Fatal("file should exist in /all before hiding")
+	}
+
+	// Hide the file.
+	hidden := map[string]bool{
+		"torrent:100:1": true,
+	}
+	filtered := ApplyHides(tree, hidden)
+
+	// After hiding: file should be gone from both /series and /all.
+	seriesFile = filtered.Lookup("/series/My.Show.S01/Season 1/My.Show.S01E01.mkv")
+	if seriesFile != nil {
+		t.Error("file should be hidden from /series")
+	}
+	allFile = filtered.Lookup("/all/My.Show.S01/My.Show.S01E01.mkv")
+	if allFile != nil {
+		t.Error("file should be hidden from /all")
+	}
+}
+
 func TestBuildTree_DirEntryHasNoFileForDirectories(t *testing.T) {
 	downloads := []Download{
 		{

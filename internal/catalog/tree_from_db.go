@@ -142,6 +142,34 @@ func ApplyHides(tree *Tree, hidden map[string]bool) *Tree {
 	// Rebuild parent dirs since removing files may have emptied directories.
 	filtered.buildParentDirs()
 
+	// Remove subdirectory entries whose target path doesn't exist in the
+	// filtered tree (i.e., directories that became empty after hiding their files).
+	// Without this step, buildParentDirs would create entries like
+	//   /series/Show → [{Name: "Season 1", File: nil}]
+	// even though /series/Show/Season 1 has no kept entries, causing empty
+	// directories to appear after restart.
+	for dirPath, entries := range filtered.dirs {
+		var valid []DirEntry
+		for _, e := range entries {
+			if e.File == nil {
+				// Subdirectory entry — only keep it if the subdirectory exists
+				// in the filtered tree (i.e., it has kept entries).
+				childPath := dirPath + "/" + e.Name
+				if _, ok := filtered.dirs[childPath]; ok {
+					valid = append(valid, e)
+				}
+				// Otherwise, skip this subdirectory entry — it's empty.
+			} else {
+				valid = append(valid, e)
+			}
+		}
+		if len(valid) > 0 {
+			filtered.dirs[dirPath] = valid
+		} else {
+			delete(filtered.dirs, dirPath)
+		}
+	}
+
 	// Sort entries.
 	for p := range filtered.dirs {
 		sort.Slice(filtered.dirs[p], func(i, j int) bool {
