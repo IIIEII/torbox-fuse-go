@@ -346,22 +346,7 @@ func (d *DirNode) Unlink(ctx context.Context, name string) syscall.Errno {
 	}
 
 	if fullyHidden {
-		slog.Info("all files hidden for download, deleting from TorBox", "kind", kind, "downloadID", downloadID)
-		if err := d.tbClient.DeleteDownload(ctx, catalog.DownloadKind(kind), downloadID); err != nil {
-			slog.Error("delete download from TorBox", "kind", kind, "downloadID", downloadID, "err", err)
-			// Non-fatal: file is hidden locally, TorBox deletion will be retried on next refresh.
-			return 0
-		}
-		slog.Info("deleted download from TorBox", "kind", kind, "downloadID", downloadID)
-
-		// Clean up hidden files for this download since the download is gone.
-		if err := d.stateDB.UnhideDownload(string(kind), downloadID); err != nil {
-			slog.Error("unhide download after deletion", "kind", kind, "downloadID", downloadID, "err", err)
-		}
-		// Trigger a catalog refresh to update the tree.
-		if err := d.cat.Refresh(ctx); err != nil && err != catalog.ErrRefreshInProgress {
-			slog.Warn("catalog refresh after delete", "err", err)
-		}
+		slog.Info("all files hidden for download, ready for manual deletion via dashboard", "kind", kind, "downloadID", downloadID)
 	}
 
 	return 0
@@ -410,8 +395,7 @@ func (d *DirNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 		slog.Info("fuse rmdir: hiding file", "key", fn.fileKey)
 	}
 
-	// Check downloads that may now be fully hidden.
-	// Group hidden files by download.
+	// Check downloads that may now be fully hidden, log for dashboard visibility.
 	downloadChecked := make(map[string]bool)
 	for _, fn := range fileNodes {
 		kind, downloadID, _ := parseContentKey(fn.fileKey)
@@ -427,20 +411,8 @@ func (d *DirNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 			continue
 		}
 		if fullyHidden {
-			slog.Info("all files hidden for download (rmdir), deleting from TorBox", "kind", kind, "downloadID", downloadID)
-			if err := d.tbClient.DeleteDownload(ctx, catalog.DownloadKind(kind), downloadID); err != nil {
-				slog.Error("delete download from TorBox (rmdir)", "kind", kind, "downloadID", downloadID, "err", err)
-				continue
-			}
-			if err := d.stateDB.UnhideDownload(string(kind), downloadID); err != nil {
-				slog.Error("unhide download after deletion (rmdir)", "err", err)
-			}
+			slog.Info("all files hidden for download (rmdir), ready for manual deletion via dashboard", "kind", kind, "downloadID", downloadID)
 		}
-	}
-
-	// Trigger a catalog refresh to update the tree.
-	if err := d.cat.Refresh(ctx); err != nil && err != catalog.ErrRefreshInProgress {
-		slog.Warn("catalog refresh after rmdir", "err", err)
 	}
 
 	return 0
