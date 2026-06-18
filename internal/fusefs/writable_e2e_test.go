@@ -205,9 +205,9 @@ func TestUnlink_HidesFile(t *testing.T) {
 		t.Error("other file should NOT be hidden")
 	}
 
-	// ── Verify: no TorBox delete call yet (download not fully hidden) ──
+	// ── Verify: no TorBox delete call (deletion is manual via dashboard) ──
 	if len(deleteRequests) != 0 {
-		t.Errorf("expected no TorBox delete calls, got %d: %v", len(deleteRequests), deleteRequests)
+		t.Errorf("expected no TorBox delete calls (deletion is manual), got %d: %v", len(deleteRequests), deleteRequests)
 	}
 
 	// ── Delete the second file ────────────────────────────────────────
@@ -225,34 +225,18 @@ func TestUnlink_HidesFile(t *testing.T) {
 		t.Fatalf("expected 0 files after both unlinked, got %d: %v", len(entries), dirEntryNamesFs(entries))
 	}
 
-	// ── Verify: TorBox delete was called (download fully hidden) ───────
-	// After both files are hidden, Unlink deletes the download from TorBox
-	// and calls UnhideDownload to clean up hidden-file records.
-	// We verify the TorBox delete request was made.
-	time.Sleep(500 * time.Millisecond)
-	if len(deleteRequests) == 0 {
-		t.Error("expected TorBox delete call after all files hidden, got none")
-	} else {
-		t.Logf("TorBox delete requests: %v", deleteRequests)
-		found := false
-		for _, req := range deleteRequests {
-			if req == "/torrents/deletetorrent?id=100" {
-				found = true
-			}
-		}
-		if !found {
-			t.Errorf("expected delete request for torrent:100, got %v", deleteRequests)
-		}
+	// ── Verify: both files are now hidden in DB ───────────────────────
+	hidden, err = db.IsHidden("torrent:100:201")
+	if err != nil {
+		t.Fatalf("IsHidden(second file): %v", err)
+	}
+	if !hidden {
+		t.Error("second file should be hidden in DB after unlink")
 	}
 
-	// ── Verify: hidden records cleaned up after TorBox deletion ────────
-	// UnhideDownload removes all hidden-file entries for the download.
-	hidden, err = db.IsHidden("torrent:100:200")
-	if err != nil {
-		t.Fatalf("IsHidden(after cleanup): %v", err)
-	}
-	if hidden {
-		t.Error("hidden records should be cleaned up after TorBox deletion")
+	// ── Verify: still no TorBox delete call (deletion is manual) ──────
+	if len(deleteRequests) != 0 {
+		t.Errorf("expected no TorBox delete calls (deletion is manual), got %d: %v", len(deleteRequests), deleteRequests)
 	}
 }
 
@@ -393,9 +377,10 @@ func TestUnlink_ReadOnly_ReturnsEROFS(t *testing.T) {
 	}
 }
 
-// TestRmdir_HidesAllFilesAndDeletesDownload verifies that removing a directory
-// via FUSE Rmdir (Writable mode) hides all files in that directory and, when
-// all files of a download are hidden, triggers a TorBox delete call.
+// TestRmdir_HidesAllFiles verifies that removing a directory via FUSE Rmdir
+// (Writable mode) hides all files in that directory. When all files of a
+// download are hidden, the download is logged as ready for manual deletion
+// via the dashboard — no automatic TorBox deletion is performed.
 //
 // This is a regression test for two bugs:
 //  1. Rmdir called RmAllChildren() before collecting fileNodes, so fileNodes
@@ -403,7 +388,7 @@ func TestUnlink_ReadOnly_ReturnsEROFS(t *testing.T) {
 //  2. NotifyEntry inside Unlink/Rmdir caused a FUSE deadlock on macOS because
 //     the kernel is waiting for the handler to return while NotifyEntry tries
 //     to write to /dev/fuse.
-func TestRmdir_HidesAllFilesAndDeletesDownload(t *testing.T) {
+func TestRmdir_HidesAllFiles(t *testing.T) {
 	requireFUSE(t)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -558,23 +543,33 @@ func TestRmdir_HidesAllFilesAndDeletesDownload(t *testing.T) {
 		t.Fatalf("os.Remove(season dir): %v", err)
 	}
 
-	// ── Verify: TorBox delete was called (download fully hidden) ───────
-	// After Unlink/Rmdir successfully deletes from TorBox, it calls
-	// UnhideDownload which clears the hidden entries. So we verify the
-	// delete request was made rather than checking IsHidden.
-	time.Sleep(500 * time.Millisecond)
-	if len(deleteRequests) == 0 {
-		t.Error("expected TorBox delete call after all files hidden via rmdir, got none")
-	} else {
-		t.Logf("TorBox delete requests: %v", deleteRequests)
-		found := false
-		for _, req := range deleteRequests {
-			if req == "/torrents/deletetorrent?id=500" {
-				found = true
-			}
+	// ── Verify: all three files are hidden in DB ─────────────────────────
+	// Unlink/Rmdir only hides files; deletion from TorBox is manual via dashboard.
+	for _, key := range []string{
+		"torrent:500:501",
+		"torrent:500:502",
+		"torrent:500:503",
+	} {
+		hidden, err := db.IsHidden(key)
+		if err != nil {
+			t.Fatalf("IsHidden(%s): %v", key, err)
 		}
-		if !found {
-			t.Errorf("expected delete request for torrent:500, got %v", deleteRequests)
+		if !hidden {
+			t.Errorf("file %s should be hidden after rmdir", key)
 		}
+	}
+
+	// ── Verify: download is marked as fully hidden ──────────────────────
+	fullyHidden, err := db.IsDownloadFullyHidden("torrent", "500")
+	if err != nil {
+		t.Fatalf("IsDownloadFullyHidden: %v", err)
+	}
+	if !fullyHidden {
+		t.Error("download should be fully hidden after all files removed")
+	}
+
+	// ── Verify: NO TorBox delete call (deletion is manual via dashboard) ──
+	if len(deleteRequests) != 0 {
+		t.Errorf("expected no TorBox delete calls (deletion is manual), got %d: %v", len(deleteRequests), deleteRequests)
 	}
 }
