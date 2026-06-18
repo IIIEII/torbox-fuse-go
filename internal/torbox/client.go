@@ -347,40 +347,6 @@ func (c *Client) apiDelete(ctx context.Context, path string) ([]byte, error) {
 	return body, nil
 }
 
-// apiPost sends a POST request with the given parameters and returns the response body.
-func (c *Client) apiPost(ctx context.Context, path string, params map[string]string) ([]byte, error) {
-	c.apiSem <- struct{}{}
-	defer func() { <-c.apiSem }()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-	q := req.URL.Query()
-	for k, v := range params {
-		q.Set(k, v)
-	}
-	req.URL.RawQuery = q.Encode()
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxAPIResponseSize))
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("client error: %s (%s)", resp.Status, string(body))
-	}
-
-	return body, nil
-}
-
 // RedactToken returns a URL string with any "token=" query parameter
 // value replaced by "***" to avoid leaking the API key in logs.
 func RedactToken(rawURL string) string {
