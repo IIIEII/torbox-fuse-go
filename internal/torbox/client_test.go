@@ -210,17 +210,17 @@ func TestDeleteDownload(t *testing.T) {
 		kind     catalog.DownloadKind
 		wantPath string
 	}{
-		{catalog.KindTorrent, "/torrents/deletetorrent"},
-		{catalog.KindUsenet, "/usenet/deleteusenet"},
-		{catalog.KindWebDL, "/webdl/deletewebdownload"},
+		{catalog.KindTorrent, "/torrents/12345"},
+		{catalog.KindUsenet, "/usenet/12345"},
+		{catalog.KindWebDL, "/webdl/12345"},
 	}
 	for _, tt := range tests {
 		t.Run(string(tt.kind), func(t *testing.T) {
 			var gotPath string
-			var gotID string
+			var gotMethod string
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				gotPath = r.URL.Path
-				gotID = r.URL.Query().Get("id")
+				gotMethod = r.Method
 				w.WriteHeader(http.StatusOK)
 				json.NewEncoder(w).Encode(map[string]interface{}{
 					"success": true,
@@ -238,8 +238,8 @@ func TestDeleteDownload(t *testing.T) {
 			if gotPath != tt.wantPath {
 				t.Errorf("path = %q, want %q", gotPath, tt.wantPath)
 			}
-			if gotID != "12345" {
-				t.Errorf("id = %q, want %q", gotID, "12345")
+			if gotMethod != http.MethodDelete {
+				t.Errorf("method = %q, want %q", gotMethod, http.MethodDelete)
 			}
 		})
 	}
