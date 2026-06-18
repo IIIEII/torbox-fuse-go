@@ -81,7 +81,9 @@ All settings are environment variables:
 | `DASHBOARD_ENABLED` | `true` | Enable the built-in web dashboard |
 | `STATE_DB_PATH` | `/config/state.db` | Path to the SQLite state database |
 | `FUSE_ALL_DIR_ENABLED` | `false` | Add a `/all` directory combining all movies and series |
-| `FUSE_WRITABLE` | `false` | Enable write support: deleting files hides them locally and can remove downloads from TorBox via dashboard |
+| `FUSE_WRITABLE` | `false` | Enable write support: deleting files hides them locally (deletion from TorBox is always available via dashboard) |
+| `DASHBOARD_USERNAME` | *(none)* | Basic Auth username for the web dashboard. If set with `DASHBOARD_PASSWORD`, all dashboard endpoints require authentication |
+| `DASHBOARD_PASSWORD` | *(none)* | Basic Auth password for the web dashboard. If set with `DASHBOARD_USERNAME`, all dashboard endpoints require authentication |
 | `LOG_LEVEL` | `info` | Log level: `debug`, `info`, `warn`, `error` |
 
 ## How it works
@@ -129,6 +131,22 @@ TorBox can call this endpoint automatically when a download finishes. Setup requ
 When a download completes, TorBox sends a POST request that triggers a catalog refresh — new files appear in the mount within seconds, without waiting for the next scheduled refresh.
 
 > **Note:** If the metrics server is bound to `127.0.0.1` (default), you'll need to change `METRICS_LISTEN_ADDR` to `0.0.0.0:9080` so TorBox can reach it, or set up a reverse proxy.
+
+## Dashboard authentication
+
+When the dashboard is accessible over the network (e.g., running in Docker with a published port), you should protect it with a username and password. Set `DASHBOARD_USERNAME` and `DASHBOARD_PASSWORD` to enable HTTP Basic Auth for **all** dashboard endpoints (including the UI, API, and SSE stream).
+
+When auth is configured:
+- Opening the dashboard in a browser prompts for credentials
+- API calls require an `Authorization: Basic <base64>` header
+- The `/metrics` and `/healthz` endpoints remain **unauthenticated** (for Prometheus scraping)
+
+```bash
+# Example: Docker with auth
+docker run -e TORBOX_API_KEY=... -e DASHBOARD_USERNAME=admin -e DASHBOARD_PASSWORD=secret ...
+```
+
+If `DASHBOARD_USERNAME` or `DASHBOARD_PASSWORD` is empty, no authentication is required.
 
 ## Read-write mode (file hiding)
 

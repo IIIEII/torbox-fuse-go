@@ -573,3 +573,332 @@ func TestRmdir_HidesAllFiles(t *testing.T) {
 		t.Errorf("expected no TorBox delete calls (deletion is manual), got %d: %v", len(deleteRequests), deleteRequests)
 	}
 }
+
+// TestUnlink_HidesFromAllDir verifies that when a file is unlinked in /series/,
+// it also disappears from /all/. This is a regression test for a bug where
+// HideFile only removed the file from the directory where Unlink was called,
+// leaving stale entries in /all/ until restart.
+func TestUnlink_HidesFromAllDir(t *testing.T) {
+	requireFUSE(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// ── Mock CDN server (not read, but needed by StreamReader) ────────
+	cdnServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not needed", http.StatusNotFound)
+	}))
+	defer cdnServer.Close()
+
+	// ── Build catalog: one series with two episodes, /all enabled ──────
+	tree := catalog.BuildTree([]catalog.Download{
+		{
+			Kind: catalog.KindTorrent,
+			ID:   "100",
+			Name: "Test.Show.S01",
+			Hash: "abc123",
+			Files: []catalog.File{
+				{
+					DownloadKind: catalog.KindTorrent,
+					DownloadID:   "100",
+					FileID:       "200",
+					Name:         "Test.Show.S01/Test.Show.S01E01.mkv",
+					Size:         1024,
+					MimeType:     "video/x-matroska",
+					MediaType:    catalog.MediaSeries,
+				},
+				{
+					DownloadKind: catalog.KindTorrent,
+					DownloadID:   "100",
+					FileID:       "201",
+					Name:         "Test.Show.S01/Test.Show.S01E02.mkv",
+					Size:         2048,
+					MimeType:     "video/x-matroska",
+					MediaType:    catalog.MediaSeries,
+				},
+			},
+		},
+	}, true) // allDir = true
+
+	// ── State DB ─────────────────────────────────────────────────────
+	stateDir := t.TempDir()
+	db, err := state.Open(filepath.Join(stateDir, "state.db"))
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.UpsertFiles([]state.FileRecord{
+		{ContentKey: "torrent:100:200", DownloadKind: "torrent", DownloadID: "100", FileID: "200", Path: "/series/Test.Show.S01/Season 1/Test.Show.S01E01.mkv", Size: 1024},
+		{ContentKey: "torrent:100:201", DownloadKind: "torrent", DownloadID: "100", FileID: "201", Path: "/series/Test.Show.S01/Season 1/Test.Show.S01E02.mkv", Size: 2048},
+	}); err != nil {
+		t.Fatalf("UpsertFiles: %v", err)
+	}
+
+	// ── Stream reader (unused, but needed by RootNode) ──────────────
+	rc := cache.NewRangeCache(256*1024*1024, nil)
+	cdnClient := stream.NewCDNClient(8, nil, 0)
+	permalinkBuilder := func(fileKey string) string { return cdnServer.URL }
+	streamer := stream.NewStreamReader(rc, cdnClient, 2, 100, int64(16*1024*1024), permalinkBuilder, nil)
+
+	// ── Config with Writable = true and AllDir = true ───────────────
+	cfg := &config.Config{
+		APIKey:            "test-api-key",
+		APIBaseURL:        "http://localhost:0",
+		CacheBudgetMB:     256,
+		PrefetchWindowMB:  16,
+		StreamMaxInflight: 2,
+		StreamConcurrency: 8,
+		AttrTimeoutSec:    1,
+		EntryTimeoutSec:   1,
+		UID:               uint32(os.Getuid()),
+		GID:               uint32(os.Getgid()),
+		Writable:          true,
+		AllDirEnabled:     true,
+	}
+
+	tbClient := torbox.NewClient(&e2eTorboxConfig{apiKey: "test", baseURL: "http://localhost:0"})
+
+	// ── Create FUSE root and mount ─────────────────────────────────────
+	cat := catalog.NewCatalogFromTree(tree)
+	root := NewRootNode(cat, db, streamer, cfg, tbClient)
+	cat.SetOnRefresh(func() { root.SyncTree(context.Background()) })
+
+	mountDir := t.TempDir()
+	cfg.MountPath = mountDir
+
+	attrTimeout := time.Duration(cfg.AttrTimeoutSec) * time.Second
+	entryTimeout := time.Duration(cfg.EntryTimeoutSec) * time.Second
+	server, err := fs.Mount(mountDir, root, &fs.Options{
+		AttrTimeout:  &attrTimeout,
+		EntryTimeout: &entryTimeout,
+		MountOptions: fuse.MountOptions{
+			FsName: "torbox-media-center",
+			Debug:  false,
+		},
+	})
+	if err != nil {
+		t.Fatalf("fs.Mount: %v", err)
+	}
+	defer func() {
+		server.Unmount()
+		done := make(chan struct{})
+		go func() { server.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Log("timeout waiting for server.Wait after unmount")
+		}
+	}()
+
+	if err := waitForMount(t, ctx, mountDir); err != nil {
+		t.Fatalf("mount did not become ready: %v", err)
+	}
+
+	// ── Verify initial state: file exists in both /series/ and /all/ ──
+	seriesFile := filepath.Join(mountDir, "series", "Test.Show.S01", "Season 1", "Test.Show.S01E01.mkv")
+	allFile := filepath.Join(mountDir, "all", "Test.Show.S01", "Test.Show.S01E01.mkv")
+
+	if _, err := os.Stat(seriesFile); err != nil {
+		t.Fatalf("series file should exist initially: %v", err)
+	}
+	if _, err := os.Stat(allFile); err != nil {
+		t.Fatalf("all file should exist initially: %v", err)
+	}
+
+	// ── Delete (unlink) the file from /series/ ────────────────────────
+	if err := os.Remove(seriesFile); err != nil {
+		t.Fatalf("os.Remove(series file): %v", err)
+	}
+
+	// ── Verify: file is gone from /series/ ────────────────────────────
+	if _, err := os.Stat(seriesFile); !os.IsNotExist(err) {
+		t.Errorf("series file should be gone after unlink, got err=%v", err)
+	}
+
+	// ── Verify: file is ALSO gone from /all/ (the bug being fixed) ────
+	if _, err := os.Stat(allFile); !os.IsNotExist(err) {
+		t.Errorf("all file should be gone after unlink (cross-directory hide), got err=%v", err)
+	}
+
+	// ── Verify: file is marked as hidden in DB ────────────────────────
+	hidden, err := db.IsHidden("torrent:100:200")
+	if err != nil {
+		t.Fatalf("IsHidden: %v", err)
+	}
+	if !hidden {
+		t.Error("file should be hidden in DB after unlink")
+	}
+}
+
+// TestRmdir_RemovesDirectory verifies that when a directory is removed via Rmdir,
+// the directory itself is removed from the FUSE tree (not just its files hidden).
+// This is a regression test for a bug where empty directories would reappear
+// after restart because Rmdir hid the files but left the directory in place.
+func TestRmdir_RemovesDirectory(t *testing.T) {
+	requireFUSE(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// ── Mock CDN server (not read, but needed by StreamReader) ────────
+	cdnServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		http.Error(w, "not needed", http.StatusNotFound)
+	}))
+	defer cdnServer.Close()
+
+	// ── Build catalog: one series with two episodes ────────────────────
+	tree := catalog.BuildTree([]catalog.Download{
+		{
+			Kind: catalog.KindTorrent,
+			ID:   "600",
+			Name: "My.Show.S03",
+			Hash: "zzz999",
+			Files: []catalog.File{
+				{
+					DownloadKind: catalog.KindTorrent,
+					DownloadID:   "600",
+					FileID:       "601",
+					Name:         "My.Show.S03/My.Show.S03E01.mkv",
+					Size:         1024,
+					MimeType:     "video/x-matroska",
+					MediaType:    catalog.MediaSeries,
+				},
+				{
+					DownloadKind: catalog.KindTorrent,
+					DownloadID:   "600",
+					FileID:       "602",
+					Name:         "My.Show.S03/My.Show.S03E02.mkv",
+					Size:         2048,
+					MimeType:     "video/x-matroska",
+					MediaType:    catalog.MediaSeries,
+				},
+			},
+		},
+	}, true) // allDir = true
+
+	// ── State DB ─────────────────────────────────────────────────────
+	stateDir := t.TempDir()
+	db, err := state.Open(filepath.Join(stateDir, "state.db"))
+	if err != nil {
+		t.Fatalf("state.Open: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.UpsertFiles([]state.FileRecord{
+		{ContentKey: "torrent:600:601", DownloadKind: "torrent", DownloadID: "600", FileID: "601", Path: "/series/My.Show.S03/Season 3/My.Show.S03E01.mkv", Size: 1024},
+		{ContentKey: "torrent:600:602", DownloadKind: "torrent", DownloadID: "600", FileID: "602", Path: "/series/My.Show.S03/Season 3/My.Show.S03E02.mkv", Size: 2048},
+	}); err != nil {
+		t.Fatalf("UpsertFiles: %v", err)
+	}
+
+	// ── Stream reader ────────────────────────────────────────────────
+	rc := cache.NewRangeCache(256*1024*1024, nil)
+	cdnClient := stream.NewCDNClient(8, nil, 0)
+	permalinkBuilder := func(fileKey string) string { return cdnServer.URL }
+	streamer := stream.NewStreamReader(rc, cdnClient, 2, 100, int64(16*1024*1024), permalinkBuilder, nil)
+
+	// ── Config with Writable = true and AllDir = true ───────────────
+	cfg := &config.Config{
+		APIKey:            "test-api-key",
+		APIBaseURL:        "http://localhost:0",
+		CacheBudgetMB:     256,
+		PrefetchWindowMB:  16,
+		StreamMaxInflight: 2,
+		StreamConcurrency: 8,
+		AttrTimeoutSec:    1,
+		EntryTimeoutSec:   1,
+		UID:               uint32(os.Getuid()),
+		GID:               uint32(os.Getgid()),
+		Writable:          true,
+		AllDirEnabled:     true,
+	}
+
+	tbClient := torbox.NewClient(&e2eTorboxConfig{apiKey: "test", baseURL: "http://localhost:0"})
+
+	// ── Create FUSE root and mount ─────────────────────────────────────
+	cat := catalog.NewCatalogFromTree(tree)
+	root := NewRootNode(cat, db, streamer, cfg, tbClient)
+	cat.SetOnRefresh(func() { root.SyncTree(context.Background()) })
+
+	mountDir := t.TempDir()
+	cfg.MountPath = mountDir
+
+	attrTimeout := time.Duration(cfg.AttrTimeoutSec) * time.Second
+	entryTimeout := time.Duration(cfg.EntryTimeoutSec) * time.Second
+	server, err := fs.Mount(mountDir, root, &fs.Options{
+		AttrTimeout:  &attrTimeout,
+		EntryTimeout: &entryTimeout,
+		MountOptions: fuse.MountOptions{
+			FsName: "torbox-media-center",
+			Debug:  false,
+		},
+	})
+	if err != nil {
+		t.Fatalf("fs.Mount: %v", err)
+	}
+	defer func() {
+		server.Unmount()
+		done := make(chan struct{})
+		go func() { server.Wait(); close(done) }()
+		select {
+		case <-done:
+		case <-time.After(10 * time.Second):
+			t.Log("timeout waiting for server.Wait after unmount")
+		}
+	}()
+
+	if err := waitForMount(t, ctx, mountDir); err != nil {
+		t.Fatalf("mount did not become ready: %v", err)
+	}
+
+	// ── Verify initial state: Season 3 directory exists ──────────────
+	seasonDir := filepath.Join(mountDir, "series", "My.Show.S03", "Season 3")
+	entries, err := os.ReadDir(seasonDir)
+	if err != nil {
+		t.Fatalf("ReadDir(season dir): %v", err)
+	}
+	if len(entries) != 2 {
+		t.Fatalf("expected 2 files initially, got %d: %v", len(entries), dirEntryNamesFs(entries))
+	}
+	t.Logf("initial files: %v", dirEntryNamesFs(entries))
+
+	// ── Verify /all/ directory also has the show ─────────────────────
+	allShowDir := filepath.Join(mountDir, "all", "My.Show.S03")
+	allEntries, err := os.ReadDir(allShowDir)
+	if err != nil {
+		t.Fatalf("ReadDir(all show dir): %v", err)
+	}
+	if len(allEntries) != 2 {
+		t.Fatalf("expected 2 files in /all/ initially, got %d: %v", len(allEntries), dirEntryNamesFs(allEntries))
+	}
+
+	// ── Remove the Season 3 directory via Rmdir ──────────────────────────
+	if err := os.Remove(seasonDir); err != nil {
+		t.Fatalf("os.Remove(season dir): %v", err)
+	}
+
+	// ── Verify: Season 3 directory is gone from /series/ ─────────────
+	if _, err := os.Stat(seasonDir); !os.IsNotExist(err) {
+		t.Errorf("Season 3 directory should be gone after rmdir, got err=%v", err)
+	}
+
+	// ── Verify: files are also gone from /all/ ────────────────────────
+	for _, fname := range []string{"My.Show.S03E01.mkv", "My.Show.S03E02.mkv"} {
+		p := filepath.Join(allShowDir, fname)
+		if _, err := os.Stat(p); !os.IsNotExist(err) {
+			t.Errorf("file %s should be gone from /all/ after rmdir, got err=%v", fname, err)
+		}
+	}
+
+	// ── Verify: all files are hidden in DB ────────────────────────────
+	for _, key := range []string{"torrent:600:601", "torrent:600:602"} {
+		hidden, err := db.IsHidden(key)
+		if err != nil {
+			t.Fatalf("IsHidden(%s): %v", key, err)
+		}
+		if !hidden {
+			t.Errorf("file %s should be hidden after rmdir", key)
+		}
+	}
+}

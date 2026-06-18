@@ -24,6 +24,8 @@ type Config struct {
 	StateDBPath            string
 	LogLevel               string
 	DashboardEnabled       bool
+	DashboardUsername      string
+	DashboardPassword      string
 	AllDirEnabled          bool
 	Writable               bool // enable delete operations (hide files + delete from TorBox)
 	UID                    uint32
@@ -105,6 +107,8 @@ func Load() (*Config, error) {
 		StateDBPath:            env("STATE_DB_PATH", "/config/state.db"),
 		LogLevel:               env("LOG_LEVEL", "info"),
 		DashboardEnabled:       envBool("DASHBOARD_ENABLED", true),
+		DashboardUsername:      env("DASHBOARD_USERNAME", ""),
+		DashboardPassword:      env("DASHBOARD_PASSWORD", ""),
 		AllDirEnabled:          envBool("FUSE_ALL_DIR_ENABLED", false),
 		Writable:               envBool("FUSE_WRITABLE", false),
 		UID:                    uint32(os.Getuid()),

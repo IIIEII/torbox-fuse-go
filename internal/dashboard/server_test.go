@@ -3,7 +3,10 @@ package dashboard
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -28,7 +31,7 @@ func newTestDashboard(t *testing.T) *Dashboard {
 
 func TestServerIndex(t *testing.T) {
 	d := newTestDashboard(t)
-	srv := NewServer(d)
+	srv := NewServer(d, "", "")
 
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
@@ -52,7 +55,7 @@ func TestServerIndex(t *testing.T) {
 
 func TestServerCSS(t *testing.T) {
 	d := newTestDashboard(t)
-	srv := NewServer(d)
+	srv := NewServer(d, "", "")
 
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
@@ -72,7 +75,7 @@ func TestServerCSS(t *testing.T) {
 
 func TestServerJS(t *testing.T) {
 	d := newTestDashboard(t)
-	srv := NewServer(d)
+	srv := NewServer(d, "", "")
 
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
@@ -92,7 +95,7 @@ func TestServerJS(t *testing.T) {
 
 func TestServerSnapshot(t *testing.T) {
 	d := newTestDashboard(t)
-	srv := NewServer(d)
+	srv := NewServer(d, "", "")
 
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
@@ -120,7 +123,7 @@ func TestServerSnapshot(t *testing.T) {
 
 func TestServerSnapshotMethodNotAllowed(t *testing.T) {
 	d := newTestDashboard(t)
-	srv := NewServer(d)
+	srv := NewServer(d, "", "")
 
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
@@ -136,7 +139,7 @@ func TestServerSnapshotMethodNotAllowed(t *testing.T) {
 
 func TestServerSSE(t *testing.T) {
 	d := newTestDashboard(t)
-	srv := NewServer(d)
+	srv := NewServer(d, "", "")
 
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
@@ -189,7 +192,7 @@ func TestServerSSE(t *testing.T) {
 
 func TestServerIndexNotFound(t *testing.T) {
 	d := newTestDashboard(t)
-	srv := NewServer(d)
+	srv := NewServer(d, "", "")
 
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
@@ -205,7 +208,7 @@ func TestServerIndexNotFound(t *testing.T) {
 
 func TestServerHiddenEndpoint(t *testing.T) {
 	d := newTestDashboard(t)
-	srv := NewServer(d)
+	srv := NewServer(d, "", "")
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
 
@@ -230,7 +233,7 @@ func TestServerHiddenEndpoint(t *testing.T) {
 
 func TestServerUnhideBadMethod(t *testing.T) {
 	d := newTestDashboard(t)
-	srv := NewServer(d)
+	srv := NewServer(d, "", "")
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
 
@@ -245,7 +248,7 @@ func TestServerUnhideBadMethod(t *testing.T) {
 
 func TestServerDeleteBadMethod(t *testing.T) {
 	d := newTestDashboard(t)
-	srv := NewServer(d)
+	srv := NewServer(d, "", "")
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
 
@@ -260,7 +263,7 @@ func TestServerDeleteBadMethod(t *testing.T) {
 
 func TestServerUnhideMissingFields(t *testing.T) {
 	d := newTestDashboard(t)
-	srv := NewServer(d)
+	srv := NewServer(d, "", "")
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
 
@@ -278,7 +281,7 @@ func TestServerUnhideMissingFields(t *testing.T) {
 
 func TestServerDeleteMissingFields(t *testing.T) {
 	d := newTestDashboard(t)
-	srv := NewServer(d)
+	srv := NewServer(d, "", "")
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
 
@@ -296,7 +299,7 @@ func TestServerDeleteMissingFields(t *testing.T) {
 
 func TestServerUnhideInvalidJSON(t *testing.T) {
 	d := newTestDashboard(t)
-	srv := NewServer(d)
+	srv := NewServer(d, "", "")
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
 
@@ -312,7 +315,7 @@ func TestServerUnhideInvalidJSON(t *testing.T) {
 
 func TestServerSnapshotIncludesHiddenDownloads(t *testing.T) {
 	d := newTestDashboard(t)
-	srv := NewServer(d)
+	srv := NewServer(d, "", "")
 	mux := http.NewServeMux()
 	srv.RegisterRoutes(mux)
 
@@ -335,5 +338,267 @@ func TestServerSnapshotIncludesHiddenDownloads(t *testing.T) {
 	}
 	if _, ok := snap["hidden_downloads"]; !ok {
 		t.Fatal("hidden_downloads key missing from snapshot")
+	}
+}
+
+func TestBasicAuth_NoAuthRequired(t *testing.T) {
+	d := newTestDashboard(t)
+	// No auth configured — empty username/password.
+	srv := NewServer(d, "", "")
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/snapshot", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("GET /api/snapshot without auth: status %d, want 200 (no auth required)", w.Code)
+	}
+}
+
+func TestBasicAuth_RequiredButNotProvided(t *testing.T) {
+	d := newTestDashboard(t)
+	srv := NewServer(d, "admin", "secret123")
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/", nil)
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != 401 {
+		t.Fatalf("GET / without auth: status %d, want 401", w.Code)
+	}
+	if w.Header().Get("WWW-Authenticate") == "" {
+		t.Fatal("expected WWW-Authenticate header")
+	}
+}
+
+func TestBasicAuth_CorrectCredentials(t *testing.T) {
+	d := newTestDashboard(t)
+	srv := NewServer(d, "admin", "secret123")
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/snapshot", nil)
+	req.SetBasicAuth("admin", "secret123")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != 200 {
+		t.Fatalf("GET /api/snapshot with correct auth: status %d, want 200", w.Code)
+	}
+}
+
+func TestBasicAuth_WrongPassword(t *testing.T) {
+	d := newTestDashboard(t)
+	srv := NewServer(d, "admin", "secret123")
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/snapshot", nil)
+	req.SetBasicAuth("admin", "wrong")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != 401 {
+		t.Fatalf("GET /api/snapshot with wrong password: status %d, want 401", w.Code)
+	}
+}
+
+func TestBasicAuth_WrongUsername(t *testing.T) {
+	d := newTestDashboard(t)
+	srv := NewServer(d, "admin", "secret123")
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	req := httptest.NewRequest(http.MethodGet, "/api/snapshot", nil)
+	req.SetBasicAuth("root", "secret123")
+	w := httptest.NewRecorder()
+	mux.ServeHTTP(w, req)
+
+	if w.Code != 401 {
+		t.Fatalf("GET /api/snapshot with wrong username: status %d, want 401", w.Code)
+	}
+}
+
+func TestBasicAuth_ProtectsAllEndpoints(t *testing.T) {
+	d := newTestDashboard(t)
+	srv := NewServer(d, "admin", "secret123")
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	endpoints := []struct {
+		method string
+		path   string
+		body   string
+	}{
+		{"GET", "/", ""},
+		{"GET", "/api/snapshot", ""},
+		{"GET", "/api/hidden", ""},
+		{"POST", "/api/unhide", `{"download_kind":"torrent","download_id":"1"}`},
+		{"POST", "/api/delete", `{"download_kind":"torrent","download_id":"1"}`},
+	}
+
+	for _, ep := range endpoints {
+		var body io.Reader
+		if ep.body != "" {
+			body = strings.NewReader(ep.body)
+		}
+		req := httptest.NewRequest(ep.method, ep.path, body)
+		if ep.body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		if w.Code != 401 {
+			t.Errorf("%s %s without auth: status %d, want 401", ep.method, ep.path, w.Code)
+		}
+	}
+}
+
+func TestBasicAuth_AuthRequiredMethod(t *testing.T) {
+	d := newTestDashboard(t)
+
+	noAuth := NewServer(d, "", "")
+	if noAuth.AuthRequired() {
+		t.Error("AuthRequired() = true for empty username/password, want false")
+	}
+
+	withAuth := NewServer(d, "admin", "secret")
+	if !withAuth.AuthRequired() {
+		t.Error("AuthRequired() = false for non-empty username/password, want true")
+	}
+
+	onlyUser := NewServer(d, "admin", "")
+	if onlyUser.AuthRequired() {
+		t.Error("AuthRequired() = true for only username, want false (both required)")
+	}
+
+	onlyPass := NewServer(d, "", "secret")
+	if onlyPass.AuthRequired() {
+		t.Error("AuthRequired() = true for only password, want false (both required)")
+	}
+}
+
+func TestDownloadKindValidation_UnhideInvalid(t *testing.T) {
+	d := newTestDashboard(t)
+	srv := NewServer(d, "", "")
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	for _, kind := range []string{"invalid", "torrents", "", "TORRENT"} {
+		body := fmt.Sprintf(`{"download_kind": %q, "download_id": "123"}`, kind)
+		req := httptest.NewRequest(http.MethodPost, "/api/unhide", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		if w.Code != 400 {
+			t.Errorf("unhide with kind=%q: status %d, want 400", kind, w.Code)
+		}
+	}
+}
+
+func TestDownloadKindValidation_DeleteInvalid(t *testing.T) {
+	d := newTestDashboard(t)
+	srv := NewServer(d, "", "")
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	for _, kind := range []string{"invalid", "usenets", "", "WEBDL"} {
+		body := fmt.Sprintf(`{"download_kind": %q, "download_id": "456"}`, kind)
+		req := httptest.NewRequest(http.MethodPost, "/api/delete", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		if w.Code != 400 {
+			t.Errorf("delete with kind=%q: status %d, want 400", kind, w.Code)
+		}
+	}
+}
+
+func TestDownloadKindValidation_ValidKinds(t *testing.T) {
+	// Valid kinds should pass validation (they may fail at the TorBox call,
+	// but should get past the kind-check with 500, not 400).
+	d := newTestDashboard(t)
+	srv := NewServer(d, "", "")
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	for _, kind := range []string{"torrent", "usenet", "webdl"} {
+		body := fmt.Sprintf(`{"download_kind": %q, "download_id": "123"}`, kind)
+		req := httptest.NewRequest(http.MethodPost, "/api/unhide", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		mux.ServeHTTP(w, req)
+
+		// Kind passes validation; the call may fail because stateDB is nil,
+		// but it should NOT be a 400 (bad kind).
+		if w.Code == 400 {
+			body := w.Body.String()
+			t.Errorf("unhide with kind=%q: got 400, but kind is valid. Body: %s", kind, body)
+		}
+	}
+}
+
+func TestSSEConnectionLimit(t *testing.T) {
+	d := newTestDashboard(t)
+	srv := NewServer(d, "", "")
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	// Open maxSSEConns+1 concurrent SSE connections.
+	// The first maxSSEConns should succeed (200 OK with event-stream),
+	// the last one should get 503 Service Unavailable.
+	type connResult struct {
+		statusCode int
+		cancel     context.CancelFunc
+	}
+	results := make(chan connResult, maxSSEConns+1)
+
+	for i := 0; i < maxSSEConns+1; i++ {
+		go func() {
+			ctx, cancel := context.WithCancel(context.Background())
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/api/state", nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				results <- connResult{statusCode: 0, cancel: cancel}
+				return
+			}
+			results <- connResult{statusCode: resp.StatusCode, cancel: cancel}
+			// Keep connection alive until caller cancels context.
+			io.ReadAll(resp.Body)
+			resp.Body.Close()
+		}()
+	}
+
+	var accepted, rejected int
+	for i := 0; i < maxSSEConns+1; i++ {
+		r := <-results
+		if r.statusCode == 200 {
+			accepted++
+		} else if r.statusCode == 503 {
+			rejected++
+			r.cancel()
+		}
+		if r.statusCode == 200 {
+			// Let it run a bit before cancelling.
+			time.Sleep(50 * time.Millisecond)
+			r.cancel()
+		}
+	}
+
+	if accepted != maxSSEConns {
+		t.Errorf("accepted %d connections, want %d", accepted, maxSSEConns)
+	}
+	if rejected != 1 {
+		t.Errorf("rejected %d connections, want 1", rejected)
 	}
 }

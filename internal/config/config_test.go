@@ -95,3 +95,62 @@ func TestConfigCustomValues(t *testing.T) {
 		t.Errorf("LogLevel = %q, want debug", cfg.LogLevel)
 	}
 }
+
+func TestConfigDashboardAuth(t *testing.T) {
+	os.Clearenv()
+	os.Setenv("TORBOX_API_KEY", "key")
+
+	t.Run("no auth by default", func(t *testing.T) {
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if cfg.DashboardUsername != "" {
+			t.Errorf("DashboardUsername = %q, want empty", cfg.DashboardUsername)
+		}
+		if cfg.DashboardPassword != "" {
+			t.Errorf("DashboardPassword = %q, want empty", cfg.DashboardPassword)
+		}
+	})
+
+	t.Run("auth configured via env", func(t *testing.T) {
+		os.Setenv("DASHBOARD_USERNAME", "admin")
+		os.Setenv("DASHBOARD_PASSWORD", "secret")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if cfg.DashboardUsername != "admin" {
+			t.Errorf("DashboardUsername = %q, want admin", cfg.DashboardUsername)
+		}
+		if cfg.DashboardPassword != "secret" {
+			t.Errorf("DashboardPassword = %q, want secret", cfg.DashboardPassword)
+		}
+	})
+}
+
+func TestConfigWritable(t *testing.T) {
+	os.Clearenv()
+	os.Setenv("TORBOX_API_KEY", "key")
+
+	t.Run("writable off by default", func(t *testing.T) {
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if cfg.Writable {
+			t.Error("Writable = true, want false by default")
+		}
+	})
+
+	t.Run("writable enabled via env", func(t *testing.T) {
+		os.Setenv("FUSE_WRITABLE", "true")
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() error: %v", err)
+		}
+		if !cfg.Writable {
+			t.Error("Writable = false, want true")
+		}
+	})
+}

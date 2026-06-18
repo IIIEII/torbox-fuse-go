@@ -19,6 +19,10 @@ import (
 // maxCacheEntries limits the number of API response entries cached in memory.
 const maxCacheEntries = 100
 
+// maxAPIResponseSize limits the size of API response bodies read into memory (50 MB).
+// This prevents OOM from a misbehaving API endpoint returning an unbounded stream.
+const maxAPIResponseSize = 50 * 1024 * 1024
+
 type Config interface {
 	APIKey() string
 	APIBaseURL() string
@@ -228,7 +232,7 @@ func (c *Client) apiGet(ctx context.Context, path string, params map[string]stri
 		}
 		defer resp.Body.Close()
 
-		body, err := io.ReadAll(resp.Body)
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxAPIResponseSize))
 		if err != nil {
 			return nil, fmt.Errorf("read response: %w", err)
 		}
@@ -336,7 +340,7 @@ func (c *Client) apiPost(ctx context.Context, path string, params map[string]str
 	}
 	defer resp.Body.Close()
 
-	body, err := io.ReadAll(resp.Body)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxAPIResponseSize))
 	if err != nil {
 		return nil, fmt.Errorf("read response: %w", err)
 	}
@@ -346,6 +350,23 @@ func (c *Client) apiPost(ctx context.Context, path string, params map[string]str
 	}
 
 	return body, nil
+}
+
+// RedactToken returns a URL string with any "token=" query parameter
+// value replaced by "***" to avoid leaking the API key in logs.
+func RedactToken(rawURL string) string {
+	idx := strings.Index(rawURL, "token=")
+	if idx < 0 {
+		return rawURL
+	}
+	// Find the start of the token value (after "token=")
+	valStart := idx + len("token=")
+	// Find the end of the token value (next & or end of string)
+	valEnd := strings.Index(rawURL[valStart:], "&")
+	if valEnd < 0 {
+		return rawURL[:valStart] + "***"
+	}
+	return rawURL[:valStart] + "***" + rawURL[valStart+valEnd:]
 }
 
 func (c *Client) backoff(ctx context.Context, attempt int) {
