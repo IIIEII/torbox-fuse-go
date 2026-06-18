@@ -78,6 +78,7 @@ func (r *RootNode) addCategoryDir(ctx context.Context, name, catalogPath string)
 		stateDB:  r.stateDB,
 		cat:      r.cat,
 		tbClient: r.tbClient,
+		root:     r,
 	}
 	child := r.NewPersistentInode(ctx, dirNode, fs.StableAttr{
 		Mode: syscall.S_IFDIR | 0755,
@@ -119,6 +120,7 @@ func (r *RootNode) addSubDirNode(ctx context.Context, parent *fs.Inode, name, ca
 		stateDB:  r.stateDB,
 		cat:      r.cat,
 		tbClient: r.tbClient,
+		root:     r,
 	}
 	child := parent.NewPersistentInode(ctx, dirNode, fs.StableAttr{
 		Mode: syscall.S_IFDIR | 0755,
@@ -160,6 +162,65 @@ func (r *RootNode) addFileNode(ctx context.Context, parent *fs.Inode, name, cata
 		Ino:  ino,
 	})
 	parent.AddChild(name, child, false)
+}
+
+// removeContentKeys removes file inodes matching the given content keys from
+// ALL category directories (movies, series, all), then prunes any directories
+// that have become empty. This ensures that hiding a file in /series/ also
+// removes it from /all/, and that empty parent directories are cleaned up.
+func (r *RootNode) removeContentKeys(contentKeys map[string]bool) {
+	catPaths := []string{"/movies", "/series"}
+	if r.cfg.AllDirEnabled {
+		catPaths = append(catPaths, "/all")
+	}
+	for _, catPath := range catPaths {
+		name := path.Base(catPath)
+		child := r.GetChild(name)
+		if child == nil {
+			continue
+		}
+		r.removeKeysFromDir(child, contentKeys)
+	}
+	// Second pass: prune empty directories bottom-up.
+	for _, catPath := range catPaths {
+		name := path.Base(catPath)
+		child := r.GetChild(name)
+		if child == nil {
+			continue
+		}
+		r.pruneEmptyDirs(child)
+	}
+}
+
+// removeKeysFromDir recursively walks a FUSE directory inode and removes
+// file inodes whose content keys match any key in the set.
+func (r *RootNode) removeKeysFromDir(dir *fs.Inode, contentKeys map[string]bool) {
+	for name, ch := range dir.Children() {
+		if fn, ok := ch.Operations().(*FileNode); ok {
+			if contentKeys[fn.fileKey] {
+				dir.RmChild(name)
+			}
+		} else {
+			// Subdirectory — recurse.
+			r.removeKeysFromDir(ch, contentKeys)
+		}
+	}
+}
+
+// pruneEmptyDirs recursively removes directories that have no children.
+// It walks bottom-up, so a chain of empty directories is fully removed.
+// The root category directories (movies, series, all) are never pruned.
+func (r *RootNode) pruneEmptyDirs(dir *fs.Inode) {
+	for name, ch := range dir.Children() {
+		// Only recurse into subdirectories (not files).
+		if _, ok := ch.Operations().(*DirNode); ok {
+			r.pruneEmptyDirs(ch)
+			// After recursing, check if the child directory is now empty.
+			if len(ch.Children()) == 0 {
+				dir.RmChild(name)
+			}
+		}
+	}
 }
 
 // SyncTree incrementally updates the FUSE inode tree to match the latest
@@ -280,6 +341,7 @@ type DirNode struct {
 	stateDB  *state.DB
 	cat      *catalog.Catalog
 	tbClient *torbox.Client
+	root     *RootNode // back-reference for cross-directory hide propagation
 }
 
 // Getattr returns directory attributes.
@@ -324,15 +386,11 @@ func (d *DirNode) Unlink(ctx context.Context, name string) syscall.Errno {
 		return syscall.EIO
 	}
 
-	// Remove the inode from the FUSE tree.
-	d.RmChild(name)
-	// NOTE: Do NOT call d.NotifyEntry(name) here. NotifyEntry sends a
-	// FUSE_NOTIFY_INVAL_ENTRY to the kernel, which does a synchronous write
-	// to /dev/fuse. When called from inside a FUSE handler (Unlink), this
-	// deadlocks on macOS: the kernel is waiting for the Unlink reply, and
-	// NotifyEntry blocks trying to write to the same FUSE connection.
-	// RmChild already removes the entry from go-fuse's Inode tree, and the
-	// kernel will invalidate its dentry cache when Unlink returns errno=0.
+	// Remove the file from ALL FUSE directories where it appears (e.g. both
+	// /series/Show/Season 1/ and /all/Show/). If we only remove it from the
+	// directory where Unlink was called, the file remains visible in other
+	// directories until restart.
+	d.root.removeContentKeys(map[string]bool{contentKey: true})
 
 	// Parse content key to get download kind and ID.
 	kind, downloadID, _ := parseContentKey(contentKey)
@@ -353,8 +411,9 @@ func (d *DirNode) Unlink(ctx context.Context, name string) syscall.Errno {
 }
 
 // Rmdir handles directory removal. When writable mode is enabled, it hides
-// all files in the directory. When all files of a download are hidden, the
-// download is deleted from TorBox. When writable mode is disabled, returns EROFS.
+// all files in the directory and removes them from ALL FUSE directories (not
+// just the one where Rmdir was called). It also prunes any parent directories
+// that become empty as a result. When writable mode is disabled, returns EROFS.
 func (d *DirNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 	if !d.cfg.Writable {
 		return syscall.EROFS
@@ -371,34 +430,36 @@ func (d *DirNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 		return syscall.ENOTDIR
 	}
 
-	// Collect all file nodes under this directory BEFORE modifying the tree.
-	var fileNodes []*FileNode
-	for childName, ch := range child.Children() {
-		if fn, ok := ch.Operations().(*FileNode); ok {
-			fileNodes = append(fileNodes, fn)
-			_ = childName // suppress unused warning
-		}
-	}
+	// Collect all file content keys under this directory (recursively) BEFORE
+	// modifying the tree. This handles nested directories like /series/Show/
+	// where Rmdir is called on the show folder containing Season subdirectories.
+	contentKeys := make(map[string]bool)
+	collectFileKeys(child, contentKeys)
 
-	if len(fileNodes) == 0 {
+	if len(contentKeys) == 0 {
 		// Empty directory — just remove it from the tree.
 		d.RmChild(name)
 		return 0
 	}
 
-	// Hide each file.
-	for _, fn := range fileNodes {
-		if err := d.stateDB.HideFile(fn.fileKey); err != nil {
-			slog.Error("hide file in rmdir", "key", fn.fileKey, "err", err)
+	// Hide each file in the database.
+	for key := range contentKeys {
+		if err := d.stateDB.HideFile(key); err != nil {
+			slog.Error("hide file in rmdir", "key", key, "err", err)
 			continue
 		}
-		slog.Info("fuse rmdir: hiding file", "key", fn.fileKey)
+		slog.Info("fuse rmdir: hiding file", "key", key)
 	}
+
+	// Remove the files from ALL FUSE directories where they appear (e.g. both
+	// /series/Show/Season 1/ and /all/Show/). This also prunes any directories
+	// that become empty as a result.
+	d.root.removeContentKeys(contentKeys)
 
 	// Check downloads that may now be fully hidden, log for dashboard visibility.
 	downloadChecked := make(map[string]bool)
-	for _, fn := range fileNodes {
-		kind, downloadID, _ := parseContentKey(fn.fileKey)
+	for key := range contentKeys {
+		kind, downloadID, _ := parseContentKey(key)
 		dlKey := string(kind) + ":" + downloadID
 		if downloadChecked[dlKey] {
 			continue
@@ -616,6 +677,18 @@ func PermalinkBuilderFromClient(cfg *config.Config, tbClient *torbox.Client) str
 		// fileKey is "kind:downloadID:fileID" — parse it.
 		kind, downloadID, fileID := parseContentKey(fileKey)
 		return torbox.PermalinkURL(cfg.TorboxConfig().APIBaseURL(), cfg.APIKey, kind, downloadID, fileID)
+	}
+}
+
+// collectFileKeys recursively collects all file content keys under a FUSE inode.
+func collectFileKeys(inode *fs.Inode, keys map[string]bool) {
+	for _, ch := range inode.Children() {
+		if fn, ok := ch.Operations().(*FileNode); ok {
+			keys[fn.fileKey] = true
+		} else {
+			// Subdirectory — recurse.
+			collectFileKeys(ch, keys)
+		}
 	}
 }
 
