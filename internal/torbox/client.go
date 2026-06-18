@@ -292,30 +292,59 @@ func (c *Client) apiGet(ctx context.Context, path string, params map[string]stri
 }
 
 // DeleteDownload removes a download from TorBox by its kind and ID.
-// It calls the appropriate TorBox API endpoint based on the download kind:
-//   - torrent:  POST /torrents/deletetorrent?id={downloadID}
-//   - usenet:   POST /usenet/deleteusenet?id={downloadID}
-//   - webdl:    POST /webdl/deletewebdownload?id={downloadID}
+// It calls the appropriate TorBox API endpoint using the DELETE method:
+//   - torrent:  DELETE /torrents/{downloadID}
+//   - usenet:   DELETE /usenet/{downloadID}
+//   - webdl:    DELETE /webdl/{downloadID}
 func (c *Client) DeleteDownload(ctx context.Context, kind catalog.DownloadKind, downloadID string) error {
-	var apiPath string
+	var apiKind string
 	switch kind {
 	case catalog.KindTorrent:
-		apiPath = "/torrents/deletetorrent"
+		apiKind = "torrents"
 	case catalog.KindUsenet:
-		apiPath = "/usenet/deleteusenet"
+		apiKind = "usenet"
 	case catalog.KindWebDL:
-		apiPath = "/webdl/deletewebdownload"
+		apiKind = "webdl"
 	default:
 		return fmt.Errorf("unknown download kind: %s", kind)
 	}
 
-	_, err := c.apiPost(ctx, apiPath, map[string]string{"id": downloadID})
-	if err != nil {
+	apiPath := "/" + apiKind + "/" + downloadID
+	if _, err := c.apiDelete(ctx, apiPath); err != nil {
 		return fmt.Errorf("delete %s %s: %w", kind, downloadID, err)
 	}
 
 	slog.Info("deleted download from torbox", "kind", kind, "download_id", downloadID)
 	return nil
+}
+
+// apiDelete sends a DELETE request to the given path and returns the response body.
+func (c *Client) apiDelete(ctx context.Context, path string) ([]byte, error) {
+	c.apiSem <- struct{}{}
+	defer func() { <-c.apiSem }()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+path, nil)
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(io.LimitReader(resp.Body, maxAPIResponseSize))
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("client error: %s (%s)", resp.Status, string(body))
+	}
+
+	return body, nil
 }
 
 // apiPost sends a POST request with the given parameters and returns the response body.
