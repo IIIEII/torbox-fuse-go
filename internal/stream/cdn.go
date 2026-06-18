@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/iiieii/torbox-fuse-go/internal/metrics"
+	"github.com/iiieii/torbox-fuse-go/internal/torbox"
 	"golang.org/x/sync/singleflight"
 )
 
@@ -279,7 +280,7 @@ func (c *CDNClient) ResolveURL(ctx context.Context, apiURL string) (string, erro
 			return nil, resolveErr
 		}
 
-		slog.Debug("cdn url resolved", "apiURL", apiURL, "cdnURL", resolved)
+		slog.Debug("cdn url resolved", "apiURL", torbox.RedactToken(apiURL), "cdnURL", resolved)
 		c.urlCache.Store(apiURL, &cdnURLCacheEntry{
 			resolvedURL: resolved,
 			resolvedAt:  time.Now(),
@@ -288,7 +289,7 @@ func (c *CDNClient) ResolveURL(ctx context.Context, apiURL string) (string, erro
 	})
 
 	if err != nil {
-		slog.Warn("cdn url resolution failed", "url", apiURL, "err", err)
+		slog.Warn("cdn url resolution failed", "url", torbox.RedactToken(apiURL), "err", err)
 		return "", fmt.Errorf("cdn url resolution: %w", err)
 	}
 
@@ -345,7 +346,7 @@ func (c *CDNClient) resolveRedirect(ctx context.Context, rawURL string) (string,
 		// Returning an error prevents ResolveURL from caching the bad URL.
 		if resp.StatusCode == http.StatusTooManyRequests {
 			resp.Body.Close()
-			slog.Warn("cdn url resolution rate limited", "url", rawURL, "status", resp.StatusCode)
+			slog.Warn("cdn url resolution rate limited", "url", torbox.RedactToken(rawURL), "status", resp.StatusCode)
 			return "", fmt.Errorf("rate limited: status %d", resp.StatusCode)
 		}
 
@@ -433,7 +434,7 @@ func (c *CDNClient) FetchRange(ctx context.Context, rawURL string, start, end in
 			return nil, fmt.Errorf("re-resolve CDN URL after %d: %w", resp.StatusCode, reResolveErr)
 		}
 		if newResolved != resolvedURL {
-			slog.Debug("cdn re-resolved url", "apiURL", rawURL, "newURL", newResolved)
+			slog.Debug("cdn re-resolved url", "apiURL", torbox.RedactToken(rawURL), "newURL", newResolved)
 			return c.doRangeRequest(ctx, newResolved, start, end)
 		}
 		return nil, &HTTPStatusError{StatusCode: resp.StatusCode}

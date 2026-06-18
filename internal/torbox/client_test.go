@@ -17,8 +17,8 @@ type testConfig struct {
 	baseURL string
 }
 
-func (c *testConfig) APIKey() string     { return "testkey" }
-func (c *testConfig) APIBaseURL() string { return c.baseURL }
+func (c *testConfig) APIKey() string            { return "testkey" }
+func (c *testConfig) APIBaseURL() string        { return c.baseURL }
 func (c *testConfig) APITimeout() time.Duration { return 30 * time.Second }
 
 func TestListTorrents(t *testing.T) {
@@ -137,10 +137,10 @@ func TestRetryOn429(t *testing.T) {
 func TestPermalinkURL(t *testing.T) {
 	baseURL := "https://api.torbox.app/v1/api"
 	tests := []struct {
-		kind     catalog.DownloadKind
-		id       string
-		fileID   string
-		wantURL  string
+		kind    catalog.DownloadKind
+		id      string
+		fileID  string
+		wantURL string
 	}{
 		{catalog.KindTorrent, "100", "200", "https://api.torbox.app/v1/api/torrents/requestdl?token=testkey&torrent_id=100&file_id=200&redirect=true"},
 		{catalog.KindUsenet, "100", "200", "https://api.torbox.app/v1/api/usenet/requestdl?token=testkey&usenet_id=100&file_id=200&redirect=true"},
@@ -240,6 +240,43 @@ func TestDeleteDownload(t *testing.T) {
 			}
 			if gotID != "12345" {
 				t.Errorf("id = %q, want %q", gotID, "12345")
+			}
+		})
+	}
+}
+
+func TestRedactToken(t *testing.T) {
+	tests := []struct {
+		name string
+		url  string
+		want string
+	}{
+		{
+			name: "token parameter redacted",
+			url:  "https://api.torbox.app/v1/api/torrents/requestdl?token=secretkey123&torrent_id=100&file_id=200&redirect=true",
+			want: "https://api.torbox.app/v1/api/torrents/requestdl?token=***&torrent_id=100&file_id=200&redirect=true",
+		},
+		{
+			name: "no token parameter",
+			url:  "https://api.torbox.app/v1/api/torrents/mylist",
+			want: "https://api.torbox.app/v1/api/torrents/mylist",
+		},
+		{
+			name: "empty token value",
+			url:  "https://example.com/path?token=&id=1",
+			want: "https://example.com/path?token=***&id=1",
+		},
+		{
+			name: "unparseable URL returned as-is",
+			url:  "://invalid",
+			want: "://invalid",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got := RedactToken(tt.url)
+			if got != tt.want {
+				t.Errorf("RedactToken(%q) = %q, want %q", tt.url, got, tt.want)
 			}
 		})
 	}

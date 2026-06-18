@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"sync/atomic"
 	"time"
 )
 
@@ -39,11 +40,16 @@ func validDownloadKind(kind string) bool {
 	}
 }
 
+// maxSSEConns limits the number of concurrent SSE connections to prevent
+// goroutine exhaustion from buggy or malicious clients.
+const maxSSEConns = 10
+
 // Server handles HTTP requests for the dashboard UI and API endpoints.
 type Server struct {
 	dashboard *Dashboard
-	username  string // Basic auth username (empty = no auth required)
-	password  string // Basic auth password
+	username  string       // Basic auth username (empty = no auth required)
+	password  string       // Basic auth password
+	sseConns  atomic.Int32 // current number of active SSE connections
 }
 
 // NewServer creates a dashboard server backed by the given Dashboard.
@@ -153,6 +159,15 @@ func (s *Server) handleSSE(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
+
+	// Limit concurrent SSE connections to prevent resource exhaustion.
+	current := s.sseConns.Add(1)
+	if current > maxSSEConns {
+		s.sseConns.Add(-1)
+		http.Error(w, "too many SSE connections", http.StatusServiceUnavailable)
+		return
+	}
+	defer s.sseConns.Add(-1)
 
 	flusher, ok := w.(http.Flusher)
 	if !ok {

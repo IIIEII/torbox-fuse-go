@@ -3,6 +3,7 @@ package dashboard
 import (
 	"bufio"
 	"bytes"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -541,5 +542,63 @@ func TestDownloadKindValidation_ValidKinds(t *testing.T) {
 			body := w.Body.String()
 			t.Errorf("unhide with kind=%q: got 400, but kind is valid. Body: %s", kind, body)
 		}
+	}
+}
+
+func TestSSEConnectionLimit(t *testing.T) {
+	d := newTestDashboard(t)
+	srv := NewServer(d, "", "")
+	mux := http.NewServeMux()
+	srv.RegisterRoutes(mux)
+
+	server := httptest.NewServer(mux)
+	defer server.Close()
+
+	// Open maxSSEConns+1 concurrent SSE connections.
+	// The first maxSSEConns should succeed (200 OK with event-stream),
+	// the last one should get 503 Service Unavailable.
+	type connResult struct {
+		statusCode int
+		cancel     context.CancelFunc
+	}
+	results := make(chan connResult, maxSSEConns+1)
+
+	for i := 0; i < maxSSEConns+1; i++ {
+		go func() {
+			ctx, cancel := context.WithCancel(context.Background())
+			req, _ := http.NewRequestWithContext(ctx, http.MethodGet, server.URL+"/api/state", nil)
+			resp, err := http.DefaultClient.Do(req)
+			if err != nil {
+				results <- connResult{statusCode: 0, cancel: cancel}
+				return
+			}
+			results <- connResult{statusCode: resp.StatusCode, cancel: cancel}
+			// Keep connection alive until caller cancels context.
+			io.ReadAll(resp.Body)
+			resp.Body.Close()
+		}()
+	}
+
+	var accepted, rejected int
+	for i := 0; i < maxSSEConns+1; i++ {
+		r := <-results
+		if r.statusCode == 200 {
+			accepted++
+		} else if r.statusCode == 503 {
+			rejected++
+			r.cancel()
+		}
+		if r.statusCode == 200 {
+			// Let it run a bit before cancelling.
+			time.Sleep(50 * time.Millisecond)
+			r.cancel()
+		}
+	}
+
+	if accepted != maxSSEConns {
+		t.Errorf("accepted %d connections, want %d", accepted, maxSSEConns)
+	}
+	if rejected != 1 {
+		t.Errorf("rejected %d connections, want 1", rejected)
 	}
 }
