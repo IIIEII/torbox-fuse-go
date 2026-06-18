@@ -29,14 +29,55 @@ func mustReadStatic(name string) []byte {
 	return data
 }
 
+// validDownloadKind checks that the given kind is a valid TorBox download type.
+func validDownloadKind(kind string) bool {
+	switch kind {
+	case "torrent", "usenet", "webdl":
+		return true
+	default:
+		return false
+	}
+}
+
 // Server handles HTTP requests for the dashboard UI and API endpoints.
 type Server struct {
 	dashboard *Dashboard
+	username  string // Basic auth username (empty = no auth required)
+	password  string // Basic auth password
 }
 
 // NewServer creates a dashboard server backed by the given Dashboard.
-func NewServer(d *Dashboard) *Server {
-	return &Server{dashboard: d}
+// If username and password are both non-empty, all dashboard endpoints
+// require Basic Auth. If either is empty, no auth is required.
+func NewServer(d *Dashboard, username, password string) *Server {
+	return &Server{
+		dashboard: d,
+		username:  username,
+		password:  password,
+	}
+}
+
+// AuthRequired returns true if Basic Auth is configured.
+func (s *Server) AuthRequired() bool {
+	return s.username != "" && s.password != ""
+}
+
+// basicAuth is middleware that requires Basic Auth if configured.
+// If auth is not configured, the request passes through immediately.
+func (s *Server) basicAuth(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !s.AuthRequired() {
+			next(w, r)
+			return
+		}
+		user, pass, ok := r.BasicAuth()
+		if !ok || user != s.username || pass != s.password {
+			w.Header().Set("WWW-Authenticate", `Basic realm="torbox-media-center"`)
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+		next(w, r)
+	}
 }
 
 // RegisterRoutes registers dashboard routes on the given ServeMux.
@@ -48,14 +89,14 @@ func NewServer(d *Dashboard) *Server {
 //   - POST /api/unhide   → unhide a download's files {download_kind, download_id}
 //   - POST /api/delete   → force-delete a download from TorBox {download_kind, download_id}
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
-	mux.HandleFunc("/", s.handleIndex)
-	mux.HandleFunc("/style.css", s.handleCSS)
-	mux.HandleFunc("/app.js", s.handleJS)
-	mux.HandleFunc("/api/state", s.handleSSE)
-	mux.HandleFunc("/api/snapshot", s.handleSnapshot)
-	mux.HandleFunc("/api/hidden", s.handleHidden)
-	mux.HandleFunc("/api/unhide", s.handleUnhide)
-	mux.HandleFunc("/api/delete", s.handleDelete)
+	mux.HandleFunc("/", s.basicAuth(s.handleIndex))
+	mux.HandleFunc("/style.css", s.basicAuth(s.handleCSS))
+	mux.HandleFunc("/app.js", s.basicAuth(s.handleJS))
+	mux.HandleFunc("/api/state", s.basicAuth(s.handleSSE))
+	mux.HandleFunc("/api/snapshot", s.basicAuth(s.handleSnapshot))
+	mux.HandleFunc("/api/hidden", s.basicAuth(s.handleHidden))
+	mux.HandleFunc("/api/unhide", s.basicAuth(s.handleUnhide))
+	mux.HandleFunc("/api/delete", s.basicAuth(s.handleDelete))
 }
 
 // handleIndex serves the embedded dashboard HTML page.
@@ -179,6 +220,10 @@ func (s *Server) handleUnhide(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, "download_kind and download_id are required", http.StatusBadRequest)
 		return
 	}
+	if !validDownloadKind(req.DownloadKind) {
+		http.Error(w, "download_kind must be one of: torrent, usenet, webdl", http.StatusBadRequest)
+		return
+	}
 	if err := s.dashboard.UnhideDownload(r.Context(), req.DownloadKind, req.DownloadID); err != nil {
 		slog.Error("dashboard: unhide download", "kind", req.DownloadKind, "id", req.DownloadID, "err", err)
 		http.Error(w, err.Error(), http.StatusInternalServerError)
@@ -207,6 +252,10 @@ func (s *Server) handleDelete(w http.ResponseWriter, r *http.Request) {
 	}
 	if req.DownloadKind == "" || req.DownloadID == "" {
 		http.Error(w, "download_kind and download_id are required", http.StatusBadRequest)
+		return
+	}
+	if !validDownloadKind(req.DownloadKind) {
+		http.Error(w, "download_kind must be one of: torrent, usenet, webdl", http.StatusBadRequest)
 		return
 	}
 	if err := s.dashboard.DeleteDownload(r.Context(), req.DownloadKind, req.DownloadID); err != nil {

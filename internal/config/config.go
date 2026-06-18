@@ -24,6 +24,8 @@ type Config struct {
 	StateDBPath            string
 	LogLevel               string
 	DashboardEnabled       bool
+	DashboardUsername      string
+	DashboardPassword      string
 	AllDirEnabled          bool
 	Writable               bool // enable delete operations (hide files + delete from TorBox)
 	UID                    uint32
