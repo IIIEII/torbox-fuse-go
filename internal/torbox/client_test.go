@@ -207,20 +207,24 @@ func TestSkipsUncached(t *testing.T) {
 
 func TestDeleteDownload(t *testing.T) {
 	tests := []struct {
-		kind     catalog.DownloadKind
-		wantPath string
+		kind        catalog.DownloadKind
+		wantPath    string
+		wantParam   string
+		wantParamID string
 	}{
-		{catalog.KindTorrent, "/torrents/12345"},
-		{catalog.KindUsenet, "/usenet/12345"},
-		{catalog.KindWebDL, "/webdl/12345"},
+		{catalog.KindTorrent, "/torrents/deletetorrent", "torrent_id", "12345"},
+		{catalog.KindUsenet, "/usenet/deleteusenet", "id", "12345"},
+		{catalog.KindWebDL, "/webdl/deletewebdownload", "id", "12345"},
 	}
 	for _, tt := range tests {
 		t.Run(string(tt.kind), func(t *testing.T) {
 			var gotPath string
 			var gotMethod string
+			var gotParamID string
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				gotPath = r.URL.Path
 				gotMethod = r.Method
+				gotParamID = r.URL.Query().Get(tt.wantParam)
 				w.WriteHeader(http.StatusOK)
 				json.NewEncoder(w).Encode(map[string]interface{}{
 					"success": true,
@@ -238,8 +242,11 @@ func TestDeleteDownload(t *testing.T) {
 			if gotPath != tt.wantPath {
 				t.Errorf("path = %q, want %q", gotPath, tt.wantPath)
 			}
-			if gotMethod != http.MethodDelete {
-				t.Errorf("method = %q, want %q", gotMethod, http.MethodDelete)
+			if gotMethod != http.MethodGet {
+				t.Errorf("method = %q, want %q", gotMethod, http.MethodGet)
+			}
+			if gotParamID != tt.wantParamID {
+				t.Errorf("param %s = %q, want %q", tt.wantParam, gotParamID, tt.wantParamID)
 			}
 		})
 	}
