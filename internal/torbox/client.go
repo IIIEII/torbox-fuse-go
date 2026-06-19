@@ -292,59 +292,36 @@ func (c *Client) apiGet(ctx context.Context, path string, params map[string]stri
 }
 
 // DeleteDownload removes a download from TorBox by its kind and ID.
-// It calls the appropriate TorBox API endpoint using the DELETE method:
-//   - torrent:  DELETE /torrents/{downloadID}
-//   - usenet:   DELETE /usenet/{downloadID}
-//   - webdl:    DELETE /webdl/{downloadID}
+// It calls the appropriate TorBox API endpoint:
+//
+//   - torrent:  GET /torrents/deletetorrent?torrent_id={id}
+//   - usenet:   GET /usenet/deleteusenet?id={id}
+//   - webdl:    GET /webdl/deletewebdownload?id={id}
+//
+// These endpoints use GET with query parameters as documented by the TorBox API.
 func (c *Client) DeleteDownload(ctx context.Context, kind catalog.DownloadKind, downloadID string) error {
-	var apiKind string
+	var apiPath string
+	var params map[string]string
 	switch kind {
 	case catalog.KindTorrent:
-		apiKind = "torrents"
+		apiPath = "/torrents/deletetorrent"
+		params = map[string]string{"torrent_id": downloadID}
 	case catalog.KindUsenet:
-		apiKind = "usenet"
+		apiPath = "/usenet/deleteusenet"
+		params = map[string]string{"id": downloadID}
 	case catalog.KindWebDL:
-		apiKind = "webdl"
+		apiPath = "/webdl/deletewebdownload"
+		params = map[string]string{"id": downloadID}
 	default:
 		return fmt.Errorf("unknown download kind: %s", kind)
 	}
 
-	apiPath := "/" + apiKind + "/" + downloadID
-	if _, err := c.apiDelete(ctx, apiPath); err != nil {
+	if _, err := c.apiGet(ctx, apiPath, params); err != nil {
 		return fmt.Errorf("delete %s %s: %w", kind, downloadID, err)
 	}
 
 	slog.Info("deleted download from torbox", "kind", kind, "download_id", downloadID)
 	return nil
-}
-
-// apiDelete sends a DELETE request to the given path and returns the response body.
-func (c *Client) apiDelete(ctx context.Context, path string) ([]byte, error) {
-	c.apiSem <- struct{}{}
-	defer func() { <-c.apiSem }()
-
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+path, nil)
-	if err != nil {
-		return nil, fmt.Errorf("create request: %w", err)
-	}
-	req.Header.Set("Authorization", "Bearer "+c.apiKey)
-
-	resp, err := c.httpClient.Do(req)
-	if err != nil {
-		return nil, fmt.Errorf("request failed: %w", err)
-	}
-	defer resp.Body.Close()
-
-	body, err := io.ReadAll(io.LimitReader(resp.Body, maxAPIResponseSize))
-	if err != nil {
-		return nil, fmt.Errorf("read response: %w", err)
-	}
-
-	if resp.StatusCode >= 400 {
-		return nil, fmt.Errorf("client error: %s (%s)", resp.Status, string(body))
-	}
-
-	return body, nil
 }
 
 // RedactToken returns a URL string with any "token=" query parameter
