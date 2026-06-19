@@ -6,6 +6,7 @@ package state
 import (
 	"database/sql"
 	"fmt"
+	"log/slog"
 	"strings"
 	"sync"
 
@@ -189,9 +190,15 @@ func (db *DB) UpsertFiles(files []FileRecord) error {
 }
 
 // ReplaceFiles atomically replaces the entire file set: it upserts the
-// provided records and deletes any stale records from files and hidden_files
-// tables. Inodes are preserved so that stable inode numbers survive across
-// API refreshes. Returns the number of stale file records removed.
+// provided records and deletes stale records from the files table.
+// Inodes are preserved so that stable inode numbers survive across API
+// refreshes. Returns the number of stale file records removed.
+//
+// NOTE: hidden_files entries are NOT deleted here. Hidden state is user
+// intent and must persist across API refreshes. If TorBox changes file_id
+// for a file, deleting the hidden entry would cause the file to reappear.
+// Stale hidden entries (whose content_key no longer exists in files) are
+// harmless — ApplyHides simply won't find a match in the tree.
 func (db *DB) ReplaceFiles(files []FileRecord) (int, error) {
 	db.mu.Lock()
 	defer db.mu.Unlock()
@@ -238,10 +245,12 @@ func (db *DB) ReplaceFiles(files []FileRecord) (int, error) {
 		}
 	}
 
-	// Delete stale hidden_files first (so files JOIN still works if needed).
-	if _, err := tx.Exec(`DELETE FROM hidden_files WHERE content_key NOT IN (SELECT content_key FROM _current_keys)`); err != nil {
-		return 0, fmt.Errorf("state: delete stale hidden: %w", err)
-	}
+	// NOTE: We intentionally do NOT delete stale hidden_files entries here.
+	// Hidden state is user intent and must persist across API refreshes.
+	// If TorBox changes file_id for a file (e.g., re-caching), deleting the
+	// hidden entry would cause the file to reappear. Stale hidden entries
+	// (whose content_key no longer exists in files) are harmless — ApplyHides
+	// simply won't find a match in the tree.
 
 	// Delete stale file records and capture the count.
 	result, err := tx.Exec(`DELETE FROM files WHERE content_key NOT IN (SELECT content_key FROM _current_keys)`)
@@ -321,6 +330,7 @@ func (db *DB) HideFile(contentKey string) error {
 	if err != nil {
 		return fmt.Errorf("state: hide file %q: %w", contentKey, err)
 	}
+	slog.Debug("hide file", "content_key", contentKey)
 	return nil
 }
 
