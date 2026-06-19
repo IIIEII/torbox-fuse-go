@@ -548,7 +548,7 @@ func TestReplaceFiles_RemovesStale(t *testing.T) {
 		t.Fatalf("AssignInode: %v", err)
 	}
 
-	// Hide one file to check it's cleaned up too.
+	// Hide one file — hidden state must survive ReplaceFiles (user intent).
 	if err := db.HideFile("torrent:1:20"); err != nil {
 		t.Fatalf("HideFile: %v", err)
 	}
@@ -574,19 +574,78 @@ func TestReplaceFiles_RemovesStale(t *testing.T) {
 		t.Errorf("expected 2 files after ReplaceFiles, got %d", len(files))
 	}
 
-	// Verify hidden_files was also cleaned up.
+	// Verify hidden_files entry is preserved even though its content_key
+	// no longer exists in the files table. Hidden state is user intent and
+	// must survive API refreshes; if TorBox changes file_id for a file,
+	// deleting the hidden entry would cause the file to reappear.
 	hidden, err := db.HiddenSet()
 	if err != nil {
 		t.Fatalf("HiddenSet: %v", err)
 	}
-	if len(hidden) != 0 {
-		t.Errorf("expected 0 hidden files after ReplaceFiles, got %d", len(hidden))
+	if len(hidden) != 1 {
+		t.Errorf("expected 1 hidden file preserved after ReplaceFiles, got %d", len(hidden))
+	}
+	if !hidden["torrent:1:20"] {
+		t.Error("expected torrent:1:20 to remain in hidden set")
 	}
 
 	// Verify inode for removed file still exists (it's kept for stability).
 	_, err = db.LookupInode("torrent:1:20")
 	if err != nil {
 		t.Logf("inode for removed file: %v (kept for path stability)", err)
+	}
+}
+
+// TestReplaceFiles_PreservesHiddenAcrossFileIDChange verifies that hidden state
+// survives even when a download's file_id changes (e.g., TorBox re-caching).
+// This is the exact bug that caused hidden files to reappear after restart:
+// TorBox changed file_id for a file, ReplaceFiles deleted the old hidden entry
+// because its content_key was no longer in the files table, and the new file_id
+// had no hidden entry — causing the file to reappear.
+func TestReplaceFiles_PreservesHiddenAcrossFileIDChange(t *testing.T) {
+	db := openTestDB(t)
+	defer db.Close()
+
+	// Insert files for a download with file_id=10.
+	err := db.UpsertFiles([]FileRecord{
+		{ContentKey: "torrent:1:10", DownloadKind: "torrent", DownloadID: "1", FileID: "10", Path: "/series/Show/Season 1/ep.mkv", Size: 1000},
+	})
+	if err != nil {
+		t.Fatalf("UpsertFiles: %v", err)
+	}
+
+	// Hide the file.
+	if err := db.HideFile("torrent:1:10"); err != nil {
+		t.Fatalf("HideFile: %v", err)
+	}
+
+	// Simulate TorBox re-caching: same download, but file_id changed from 10 to 99.
+	// The old content_key "torrent:1:10" no longer exists in the API response.
+	_, err = db.ReplaceFiles([]FileRecord{
+		{ContentKey: "torrent:1:99", DownloadKind: "torrent", DownloadID: "1", FileID: "99", Path: "/series/Show/Season 1/ep.mkv", Size: 1000},
+	})
+	if err != nil {
+		t.Fatalf("ReplaceFiles: %v", err)
+	}
+
+	// The old hidden entry should be preserved — hidden state is user intent.
+	hidden, err := db.HiddenSet()
+	if err != nil {
+		t.Fatalf("HiddenSet: %v", err)
+	}
+	// The old key stays (it's stale but harmless).
+	// The new key is NOT hidden (it's a different file_id that the user never hid).
+	if !hidden["torrent:1:10"] {
+		t.Error("expected torrent:1:10 to remain in hidden set (user intent must survive file_id changes)")
+	}
+
+	// Verify the new file exists in the files table.
+	rec, err := db.LookupFile("torrent:1:99")
+	if err != nil {
+		t.Fatalf("LookupFile: %v", err)
+	}
+	if rec == nil {
+		t.Fatal("expected torrent:1:99 to exist in files table")
 	}
 }
 

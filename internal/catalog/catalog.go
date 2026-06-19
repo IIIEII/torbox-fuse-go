@@ -162,8 +162,11 @@ func (c *Catalog) Refresh(ctx context.Context) error {
 	hiddenSet, err := c.stateDB.HiddenSet()
 	if err != nil {
 		slog.Warn("load hidden set", "err", err)
-	} else if len(hiddenSet) > 0 {
-		tree = ApplyHides(tree, hiddenSet)
+	} else {
+		slog.Info("hidden files after refresh", "count", len(hiddenSet))
+		if len(hiddenSet) > 0 {
+			tree = ApplyHides(tree, hiddenSet)
+		}
 	}
 
 	// Swap tree atomically.
@@ -204,6 +207,7 @@ func (c *Catalog) LoadFromDB(ctx context.Context) error {
 	if err != nil {
 		slog.Warn("load hidden set", "err", err)
 	}
+	slog.Info("loaded hidden set from db", "hidden_count", len(hiddenSet))
 	if len(hiddenSet) > 0 {
 		tree = ApplyHides(tree, hiddenSet)
 	}

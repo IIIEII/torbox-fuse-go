@@ -148,14 +148,35 @@ func ApplyHides(tree *Tree, hidden map[string]bool) *Tree {
 	//   /series/Show → [{Name: "Season 1", File: nil}]
 	// even though /series/Show/Season 1 has no kept entries, causing empty
 	// directories to appear after restart.
-	for dirPath, entries := range filtered.dirs {
+	//
+	// We iterate bottom-up (deepest paths first) so that empty leaf directories
+	// are removed before their parents are checked. This avoids the need for
+	// repeated passes.
+	paths := make([]string, 0, len(filtered.dirs))
+	for p := range filtered.dirs {
+		paths = append(paths, p)
+	}
+	// Sort by depth descending so deeper paths are processed first.
+	sort.Slice(paths, func(i, j int) bool {
+		ni := strings.Count(paths[i], "/")
+		nj := strings.Count(paths[j], "/")
+		if ni != nj {
+			return ni > nj
+		}
+		return paths[i] < paths[j]
+	})
+	for _, dirPath := range paths {
+		entries, ok := filtered.dirs[dirPath]
+		if !ok {
+			continue // already deleted by a child pass
+		}
 		var valid []DirEntry
 		for _, e := range entries {
 			if e.File == nil {
 				// Subdirectory entry — only keep it if the subdirectory exists
 				// in the filtered tree (i.e., it has kept entries).
 				childPath := dirPath + "/" + e.Name
-				if _, ok := filtered.dirs[childPath]; ok {
+				if _, childOk := filtered.dirs[childPath]; childOk {
 					valid = append(valid, e)
 				}
 				// Otherwise, skip this subdirectory entry — it's empty.
