@@ -245,13 +245,6 @@ func (db *DB) ReplaceFiles(files []FileRecord) (int, error) {
 		}
 	}
 
-	// NOTE: We intentionally do NOT delete stale hidden_files entries here.
-	// Hidden state is user intent and must persist across API refreshes.
-	// If TorBox changes file_id for a file (e.g., re-caching), deleting the
-	// hidden entry would cause the file to reappear. Stale hidden entries
-	// (whose content_key no longer exists in files) are harmless — ApplyHides
-	// simply won't find a match in the tree.
-
 	// Delete stale file records and capture the count.
 	result, err := tx.Exec(`DELETE FROM files WHERE content_key NOT IN (SELECT content_key FROM _current_keys)`)
 	if err != nil {
@@ -260,6 +253,24 @@ func (db *DB) ReplaceFiles(files []FileRecord) (int, error) {
 	staleCount, err := result.RowsAffected()
 	if err != nil {
 		return 0, fmt.Errorf("state: rows affected: %w", err)
+	}
+
+	// Clean up stale hidden_files entries whose content_key is no longer in
+	// the files table. This happens when TorBox has fully processed a deletion
+	// and the files are gone from the API response. These entries serve no
+	// purpose (ApplyHides won't find a match in the tree) and would accumulate
+	// forever without this cleanup.
+	//
+	// Note: we intentionally preserve hidden entries whose content_key IS still
+	// in the files table. Hidden state is user intent and must survive API
+	// refreshes — e.g., after dashboard delete, TorBox may still return the
+	// download briefly, and the hidden entry ensures files stay hidden.
+	staleHidden, err := tx.Exec(`DELETE FROM hidden_files WHERE content_key NOT IN (SELECT content_key FROM files)`)
+	if err != nil {
+		return 0, fmt.Errorf("state: delete stale hidden: %w", err)
+	}
+	if n, _ := staleHidden.RowsAffected(); n > 0 {
+		slog.Info("cleaned up stale hidden entries", "count", n)
 	}
 
 	// Keep inodes for removed files — they provide stable inode numbers
