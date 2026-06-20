@@ -227,12 +227,12 @@ func (d *Dashboard) DeleteDownload(ctx context.Context, kind, downloadID string)
 	if err := d.deleter.DeleteDownload(ctx, downloadKind, downloadID); err != nil {
 		return fmt.Errorf("delete download from torbox: %w", err)
 	}
-	// After successful deletion, remove hidden file records for this download.
-	if d.stateDB != nil {
-		if err := d.stateDB.UnhideDownload(kind, downloadID); err != nil {
-			slog.Warn("dashboard: cleanup hidden records after delete", "err", err)
-		}
-	}
+	// NOTE: We intentionally do NOT unhide files after deletion.
+	// TorBox may still return the download in the next API refresh
+	// (eventual consistency), so hidden records act as a safety net.
+	// Once TorBox stops returning the download, the content_keys
+	// disappear from the files table and stale hidden entries are
+	// cleaned up automatically by ReplaceFiles.
 	if d.refresher != nil {
 		if err := d.refresher.Refresh(ctx); err != nil {
 			slog.Warn("dashboard: refresh after delete", "err", err)
