@@ -1,6 +1,7 @@
 package torbox
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"math/rand"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -292,36 +294,78 @@ func (c *Client) apiGet(ctx context.Context, path string, params map[string]stri
 }
 
 // DeleteDownload removes a download from TorBox by its kind and ID.
-// It calls the appropriate TorBox API endpoint:
+// It calls the appropriate TorBox control endpoint:
 //
-//   - torrent:  GET /torrents/deletetorrent?torrent_id={id}
-//   - usenet:   GET /usenet/deleteusenet?id={id}
-//   - webdl:    GET /webdl/deletewebdownload?id={id}
+//   - torrent:  POST /torrents/controltorrent         {"torrent_id": id, "operation": "delete"}
+//   - usenet:   POST /usenet/controlusenetdownload     {"usenet_id": id, "operation": "delete"}
+//   - webdl:    POST /webdl/controlwebdownload         {"webdl_id": id, "operation": "delete"}
 //
-// These endpoints use GET with query parameters as documented by the TorBox API.
+// These use POST with JSON body as documented by the TorBox API.
 func (c *Client) DeleteDownload(ctx context.Context, kind catalog.DownloadKind, downloadID string) error {
 	var apiPath string
-	var params map[string]string
+	var body map[string]interface{}
+	id, err := strconv.Atoi(downloadID)
+	if err != nil {
+		return fmt.Errorf("invalid download id %q: %w", downloadID, err)
+	}
 	switch kind {
 	case catalog.KindTorrent:
-		apiPath = "/torrents/deletetorrent"
-		params = map[string]string{"torrent_id": downloadID}
+		apiPath = "/torrents/controltorrent"
+		body = map[string]interface{}{"torrent_id": id, "operation": "delete"}
 	case catalog.KindUsenet:
-		apiPath = "/usenet/deleteusenet"
-		params = map[string]string{"id": downloadID}
+		apiPath = "/usenet/controlusenetdownload"
+		body = map[string]interface{}{"usenet_id": downloadID, "operation": "delete"}
 	case catalog.KindWebDL:
-		apiPath = "/webdl/deletewebdownload"
-		params = map[string]string{"id": downloadID}
+		apiPath = "/webdl/controlwebdownload"
+		body = map[string]interface{}{"webdl_id": id, "operation": "delete"}
 	default:
 		return fmt.Errorf("unknown download kind: %s", kind)
 	}
 
-	if _, err := c.apiGet(ctx, apiPath, params); err != nil {
+	if _, err := c.apiPost(ctx, apiPath, body); err != nil {
 		return fmt.Errorf("delete %s %s: %w", kind, downloadID, err)
 	}
 
 	slog.Info("deleted download from torbox", "kind", kind, "download_id", downloadID)
 	return nil
+}
+
+// apiPost sends a POST request with a JSON body to the TorBox API.
+// It does NOT use the cache (mutations should not be cached).
+// It does NOT retry on 429 or 5xx — deletion is idempotent but we don't
+// want to accidentally delete something twice.
+func (c *Client) apiPost(ctx context.Context, path string, body interface{}) ([]byte, error) {
+	jsonBody, err := json.Marshal(body)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request body: %w", err)
+	}
+
+	c.apiSem <- struct{}{}
+	defer func() { <-c.apiSem }()
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+path, bytes.NewReader(jsonBody))
+	if err != nil {
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := c.httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer resp.Body.Close()
+
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxAPIResponseSize))
+	if err != nil {
+		return nil, fmt.Errorf("read response: %w", err)
+	}
+
+	if resp.StatusCode >= 400 {
+		return nil, fmt.Errorf("client error: %s (%s)", resp.Status, strings.TrimSpace(string(respBody)))
+	}
+
+	return respBody, nil
 }
 
 // RedactToken returns a URL string with any "token=" query parameter

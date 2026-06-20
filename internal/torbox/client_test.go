@@ -207,24 +207,25 @@ func TestSkipsUncached(t *testing.T) {
 
 func TestDeleteDownload(t *testing.T) {
 	tests := []struct {
-		kind        catalog.DownloadKind
-		wantPath    string
-		wantParam   string
-		wantParamID string
+		kind     catalog.DownloadKind
+		wantPath string
+		wantBody map[string]interface{}
 	}{
-		{catalog.KindTorrent, "/torrents/deletetorrent", "torrent_id", "12345"},
-		{catalog.KindUsenet, "/usenet/deleteusenet", "id", "12345"},
-		{catalog.KindWebDL, "/webdl/deletewebdownload", "id", "12345"},
+		{catalog.KindTorrent, "/torrents/controltorrent", map[string]interface{}{"torrent_id": float64(12345), "operation": "delete"}},
+		{catalog.KindUsenet, "/usenet/controlusenetdownload", map[string]interface{}{"usenet_id": "12345", "operation": "delete"}},
+		{catalog.KindWebDL, "/webdl/controlwebdownload", map[string]interface{}{"webdl_id": float64(12345), "operation": "delete"}},
 	}
 	for _, tt := range tests {
 		t.Run(string(tt.kind), func(t *testing.T) {
 			var gotPath string
 			var gotMethod string
-			var gotParamID string
+			var gotBody map[string]interface{}
 			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				gotPath = r.URL.Path
 				gotMethod = r.Method
-				gotParamID = r.URL.Query().Get(tt.wantParam)
+				var body map[string]interface{}
+				json.NewDecoder(r.Body).Decode(&body)
+				gotBody = body
 				w.WriteHeader(http.StatusOK)
 				json.NewEncoder(w).Encode(map[string]interface{}{
 					"success": true,
@@ -242,11 +243,13 @@ func TestDeleteDownload(t *testing.T) {
 			if gotPath != tt.wantPath {
 				t.Errorf("path = %q, want %q", gotPath, tt.wantPath)
 			}
-			if gotMethod != http.MethodGet {
-				t.Errorf("method = %q, want %q", gotMethod, http.MethodGet)
+			if gotMethod != http.MethodPost {
+				t.Errorf("method = %q, want %q", gotMethod, http.MethodPost)
 			}
-			if gotParamID != tt.wantParamID {
-				t.Errorf("param %s = %q, want %q", tt.wantParam, gotParamID, tt.wantParamID)
+			for k, v := range tt.wantBody {
+				if gotBody[k] != v {
+					t.Errorf("body[%q] = %v, want %v", k, gotBody[k], v)
+				}
 			}
 		})
 	}
