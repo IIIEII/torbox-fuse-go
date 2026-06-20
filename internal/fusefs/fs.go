@@ -164,11 +164,28 @@ func (r *RootNode) addFileNode(ctx context.Context, parent *fs.Inode, name, cata
 	parent.AddChild(name, child, false)
 }
 
+// notifyEntry is a pending kernel cache invalidation collected during
+// removeContentKeys. We cannot call NotifyEntry from inside a FUSE request
+// handler (Unlink/Rmdir) because the /dev/fuse connection is busy serving
+// that request — sending another notification on the same fd would deadlock.
+// Instead, we collect the (parent, name) pairs and fire them in a goroutine
+// after the handler returns.
+type notifyEntry struct {
+	parent *fs.Inode
+	name   string
+}
+
 // removeContentKeys removes file inodes matching the given content keys from
 // ALL category directories (movies, series, all), then prunes any directories
 // that have become empty. This ensures that hiding a file in /series/ also
 // removes it from /all/, and that empty parent directories are cleaned up.
-func (r *RootNode) removeContentKeys(contentKeys map[string]bool) {
+//
+// It returns a slice of pending kernel notification entries that must be
+// dispatched in a separate goroutine (not from inside a FUSE handler) to
+// avoid deadlocking on /dev/fuse.
+func (r *RootNode) removeContentKeys(contentKeys map[string]bool) []notifyEntry {
+	var pending []notifyEntry
+
 	catPaths := []string{"/movies", "/series"}
 	if r.cfg.AllDirEnabled {
 		catPaths = append(catPaths, "/all")
@@ -179,7 +196,7 @@ func (r *RootNode) removeContentKeys(contentKeys map[string]bool) {
 		if child == nil {
 			continue
 		}
-		r.removeKeysFromDir(child, contentKeys)
+		r.removeKeysFromDir(child, contentKeys, &pending)
 	}
 	// Second pass: prune empty directories bottom-up.
 	for _, catPath := range catPaths {
@@ -188,21 +205,34 @@ func (r *RootNode) removeContentKeys(contentKeys map[string]bool) {
 		if child == nil {
 			continue
 		}
-		r.pruneEmptyDirs(child)
+		r.pruneEmptyDirs(child, &pending)
+	}
+
+	return pending
+}
+
+// notifyPending sends all collected kernel cache invalidation entries.
+// This MUST be called from outside a FUSE handler (e.g. in a goroutine)
+// to avoid deadlocking on /dev/fuse.
+func (r *RootNode) notifyPending(pending []notifyEntry) {
+	for _, n := range pending {
+		n.parent.NotifyEntry(n.name) //nolint:errcheck // kernel notification best-effort
 	}
 }
 
 // removeKeysFromDir recursively walks a FUSE directory inode and removes
 // file inodes whose content keys match any key in the set.
-func (r *RootNode) removeKeysFromDir(dir *fs.Inode, contentKeys map[string]bool) {
+// Removed entries are collected into pending for deferred NotifyEntry.
+func (r *RootNode) removeKeysFromDir(dir *fs.Inode, contentKeys map[string]bool, pending *[]notifyEntry) {
 	for name, ch := range dir.Children() {
 		if fn, ok := ch.Operations().(*FileNode); ok {
 			if contentKeys[fn.fileKey] {
 				dir.RmChild(name)
+				*pending = append(*pending, notifyEntry{parent: dir, name: name})
 			}
 		} else {
 			// Subdirectory — recurse.
-			r.removeKeysFromDir(ch, contentKeys)
+			r.removeKeysFromDir(ch, contentKeys, pending)
 		}
 	}
 }
@@ -210,14 +240,16 @@ func (r *RootNode) removeKeysFromDir(dir *fs.Inode, contentKeys map[string]bool)
 // pruneEmptyDirs recursively removes directories that have no children.
 // It walks bottom-up, so a chain of empty directories is fully removed.
 // The root category directories (movies, series, all) are never pruned.
-func (r *RootNode) pruneEmptyDirs(dir *fs.Inode) {
+// Removed entries are collected into pending for deferred NotifyEntry.
+func (r *RootNode) pruneEmptyDirs(dir *fs.Inode, pending *[]notifyEntry) {
 	for name, ch := range dir.Children() {
 		// Only recurse into subdirectories (not files).
 		if _, ok := ch.Operations().(*DirNode); ok {
-			r.pruneEmptyDirs(ch)
+			r.pruneEmptyDirs(ch, pending)
 			// After recursing, check if the child directory is now empty.
 			if len(ch.Children()) == 0 {
 				dir.RmChild(name)
+				*pending = append(*pending, notifyEntry{parent: dir, name: name})
 			}
 		}
 	}
@@ -390,7 +422,12 @@ func (d *DirNode) Unlink(ctx context.Context, name string) syscall.Errno {
 	// /series/Show/Season 1/ and /all/Show/). If we only remove it from the
 	// directory where Unlink was called, the file remains visible in other
 	// directories until restart.
-	d.root.removeContentKeys(map[string]bool{contentKey: true})
+	//
+	// We collect kernel notification entries and dispatch them in a goroutine
+	// because NotifyEntry cannot be called from inside a FUSE handler — the
+	// /dev/fuse connection is busy serving this request and would deadlock.
+	pending := d.root.removeContentKeys(map[string]bool{contentKey: true})
+	go d.root.notifyPending(pending)
 
 	// Parse content key to get download kind and ID.
 	kind, downloadID, _ := parseContentKey(contentKey)
@@ -438,7 +475,9 @@ func (d *DirNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 
 	if len(contentKeys) == 0 {
 		// Empty directory — just remove it from the tree.
+		// Dispatch kernel notification in a goroutine to avoid FUSE deadlock.
 		d.RmChild(name)
+		go d.NotifyEntry(name) //nolint:errcheck // kernel notification best-effort
 		return 0
 	}
 
@@ -453,8 +492,10 @@ func (d *DirNode) Rmdir(ctx context.Context, name string) syscall.Errno {
 
 	// Remove the files from ALL FUSE directories where they appear (e.g. both
 	// /series/Show/Season 1/ and /all/Show/). This also prunes any directories
-	// that become empty as a result.
-	d.root.removeContentKeys(contentKeys)
+	// that become empty as a result. Kernel cache invalidation entries are
+	// collected and dispatched in a goroutine to avoid FUSE /dev/fuse deadlock.
+	pending := d.root.removeContentKeys(contentKeys)
+	go d.root.notifyPending(pending)
 
 	// Check downloads that may now be fully hidden, log for dashboard visibility.
 	downloadChecked := make(map[string]bool)
