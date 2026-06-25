@@ -78,6 +78,31 @@ func waitForMount(t *testing.T, ctx context.Context, mountDir string) error {
 	}
 }
 
+// waitForGone polls until the given path no longer exists (os.Stat returns
+// ENOENT) or the context expires. This is the correct way to assert
+// cross-directory disappearance after Unlink/Rmdir: FUSE dentry cache
+// invalidation for entries in *other* directories (e.g. /all/ when the file
+// was unlinked from /series/) is dispatched asynchronously from the handler
+// to avoid deadlocking on /dev/fuse, so it is eventually-consistent rather
+// than instantaneous. The entry where the operation was performed is gone
+// immediately (the kernel drops its dentry on the Unlink reply itself); only
+// sibling-directory mirrors need this poll.
+func waitForGone(t *testing.T, ctx context.Context, path string) error {
+	t.Helper()
+	for {
+		if _, err := os.Stat(path); os.IsNotExist(err) {
+			return nil
+		} else if err != nil {
+			t.Fatalf("waitForGone: unexpected error for %s: %v", path, err)
+		}
+		select {
+		case <-ctx.Done():
+			return fmt.Errorf("%s still exists after timeout (cross-directory cache invalidation did not complete)", path)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+}
+
 // dirEntryNames returns the names of catalog DirEntry slices for logging.
 func dirEntryNames(entries []catalog.DirEntry) []string {
 	names := make([]string, len(entries))

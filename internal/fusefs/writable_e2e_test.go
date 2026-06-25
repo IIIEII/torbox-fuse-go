@@ -216,13 +216,27 @@ func TestUnlink_HidesFile(t *testing.T) {
 		t.Fatalf("os.Remove(%s): %v", fileToDelete2, err)
 	}
 
-	// ── Verify: directory is now empty ──────────────────────────────────
-	entries, err = os.ReadDir(seasonDir)
-	if err != nil {
-		t.Fatalf("ReadDir(season dir) after second unlink: %v", err)
-	}
-	if len(entries) != 0 {
-		t.Fatalf("expected 0 files after both unlinked, got %d: %v", len(entries), dirEntryNamesFs(entries))
+	// ── Verify: directory is now empty (or pruned) ─────────────────────
+	// After both files are unlinked, pruneEmptyDirs may remove the now-empty
+	// Season directory from the tree (correct production behavior). The prune
+	// notification is async, so we poll: either ReadDir returns 0 entries, or
+	// the directory is gone (ENOENT) — both confirm no files remain.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		entries, err = os.ReadDir(seasonDir)
+		if err == nil && len(entries) == 0 {
+			break
+		}
+		if os.IsNotExist(err) {
+			break // directory was pruned — acceptable
+		}
+		if time.Now().After(deadline) {
+			if err != nil {
+				t.Fatalf("ReadDir(season dir) after second unlink: %v", err)
+			}
+			t.Fatalf("expected 0 files after both unlinked, got %d: %v", len(entries), dirEntryNamesFs(entries))
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 
 	// ── Verify: both files are now hidden in DB ───────────────────────
@@ -712,13 +726,19 @@ func TestUnlink_HidesFromAllDir(t *testing.T) {
 	}
 
 	// ── Verify: file is gone from /series/ ────────────────────────────
+	// The kernel drops the dentry for the unlinked entry automatically as
+	// part of the Unlink reply, so this is deterministic.
 	if _, err := os.Stat(seriesFile); !os.IsNotExist(err) {
 		t.Errorf("series file should be gone after unlink, got err=%v", err)
 	}
 
 	// ── Verify: file is ALSO gone from /all/ (the bug being fixed) ────
-	if _, err := os.Stat(allFile); !os.IsNotExist(err) {
-		t.Errorf("all file should be gone after unlink (cross-directory hide), got err=%v", err)
+	// Cross-directory cache invalidation (NotifyEntry on /all/) is dispatched
+	// asynchronously from the Unlink handler to avoid deadlocking on /dev/fuse,
+	// so the kernel dentry cache for /all/ is invalidated eventually rather than
+	// synchronously. Poll until the file disappears.
+	if err := waitForGone(t, ctx, allFile); err != nil {
+		t.Errorf("all file should be gone after unlink (cross-directory hide): %v", err)
 	}
 
 	// ── Verify: file is marked as hidden in DB ────────────────────────
@@ -884,10 +904,13 @@ func TestRmdir_RemovesDirectory(t *testing.T) {
 	}
 
 	// ── Verify: files are also gone from /all/ ────────────────────────
+	// Cross-directory cache invalidation (NotifyEntry on /all/) is dispatched
+	// asynchronously from the Rmdir handler to avoid deadlocking on /dev/fuse,
+	// so poll until the files disappear from the kernel dentry cache.
 	for _, fname := range []string{"My.Show.S03E01.mkv", "My.Show.S03E02.mkv"} {
 		p := filepath.Join(allShowDir, fname)
-		if _, err := os.Stat(p); !os.IsNotExist(err) {
-			t.Errorf("file %s should be gone from /all/ after rmdir, got err=%v", fname, err)
+		if err := waitForGone(t, ctx, p); err != nil {
+			t.Errorf("file %s should be gone from /all/ after rmdir: %v", fname, err)
 		}
 	}
 
